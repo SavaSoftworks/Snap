@@ -438,10 +438,17 @@ void LayerTreeHost::didRenderFrame()
 void LayerTreeHost::requestCompositionForRenderingUpdate()
 {
     m_isWaitingForRenderer = true;
-    m_compositor->requestCompositionForRenderingUpdate([this] {
+
+    static bool earlyCompletion = [] {
+        const char* value = getenv("WEBKIT_SNAP_EARLY_SCENE_COMPLETION");
+        return !value || strcmp(value, "0");
+    }();
+    const bool notifyAfterSceneFlush = earlyCompletion && !m_pendingForceRepaint && !m_forcedRepaintAsyncCallback;
+
+    m_compositor->requestCompositionForRenderingUpdate([this, notifyAfterSceneFlush] {
         WTFBeginSignpost(this, DidComposite);
 
-        if (!m_pendingForceRepaint && m_forcedRepaintAsyncCallback)
+        if (!notifyAfterSceneFlush && !m_pendingForceRepaint && m_forcedRepaintAsyncCallback)
             m_forcedRepaintAsyncCallback();
 
         m_isWaitingForRenderer = false;
@@ -455,7 +462,7 @@ void LayerTreeHost::requestCompositionForRenderingUpdate()
             scheduleRenderingUpdateRunLoopObserver();
 
         WTFEndSignpost(this, DidComposite);
-    });
+    }, notifyAfterSceneFlush);
     WTFEmitSignpost(this, RequestCompositionForRenderingUpdate);
 }
 

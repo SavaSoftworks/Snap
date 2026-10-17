@@ -87,7 +87,7 @@ public:
     void pendingTilesDidChange();
 
     void setSize(const WebCore::IntSize&, float);
-    void requestCompositionForRenderingUpdate(Function<void()>&&);
+    void requestCompositionForRenderingUpdate(Function<void()>&&, bool notifyAfterSceneFlush = false);
     void requestComposition(WebCore::CompositionReason);
     RunLoop* runLoop();
 
@@ -175,6 +175,7 @@ private:
         bool isWaitingForTiles WTF_GUARDED_BY_LOCK(lock) { false };
         OptionSet<WebCore::CompositionReason> reasons WTF_GUARDED_BY_LOCK(lock);
         Function<void()> didCompositeRenderingUpdateFunction WTF_GUARDED_BY_LOCK(lock);
+        bool notifyAfterSceneFlush WTF_GUARDED_BY_LOCK(lock) { false };
     } m_state;
 
     struct {

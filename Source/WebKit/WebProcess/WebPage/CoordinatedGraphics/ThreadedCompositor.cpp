@@ -535,6 +535,7 @@ void ThreadedCompositor::renderLayerTree()
 
     OptionSet<CompositionReason> reasons;
     bool shouldNotifiyDidComposite = false;
+    bool notifyAfterSceneFlush = false;
     {
         Locker locker { m_state.lock };
 
@@ -553,6 +554,7 @@ void ThreadedCompositor::renderLayerTree()
                 m_state.reasons.add(CompositionReason::RenderingUpdate);
             } else
                 shouldNotifiyDidComposite = !!m_state.didCompositeRenderingUpdateFunction;
+            notifyAfterSceneFlush = shouldNotifiyDidComposite && m_state.notifyAfterSceneFlush;
         }
 
         ASSERT(m_state.state == State::Scheduled);
@@ -587,6 +589,9 @@ void ThreadedCompositor::renderLayerTree()
     WTFBeginSignpost(this, FlushCompositingState);
     flushCompositingState(reasons);
     WTFEndSignpost(this, FlushCompositingState);
+    if (notifyAfterSceneFlush) {
+        m_didCompositeRunLoopObserver->schedule(&RunLoop::mainSingleton());
+    }
 
     WTFBeginSignpost(this, PaintToGLContext);
     const auto targetContents = paintToCurrentGLContext(viewportTransform, viewportSize, reasons);
@@ -594,7 +599,7 @@ void ThreadedCompositor::renderLayerTree()
 
     updateFPSCounter();
 
-    if (shouldNotifiyDidComposite)
+    if (shouldNotifiyDidComposite && !notifyAfterSceneFlush)
         m_didCompositeRunLoopObserver->schedule(&RunLoop::mainSingleton());
 
     WTFEmitSignpost(this, DidRenderFrame, "reasons: %s", reasonsToString(reasons).ascii().data());
@@ -613,13 +618,14 @@ void ThreadedCompositor::renderLayerTree()
     });
 }
 
-void ThreadedCompositor::requestCompositionForRenderingUpdate(Function<void()>&& didCompositeFunction)
+void ThreadedCompositor::requestCompositionForRenderingUpdate(Function<void()>&& didCompositeFunction, bool notifyAfterSceneFlush)
 {
     ASSERT(RunLoop::isMain());
     Locker locker { m_state.lock };
     m_state.reasons.add(CompositionReason::RenderingUpdate);
     ASSERT(!m_state.didCompositeRenderingUpdateFunction);
     m_state.didCompositeRenderingUpdateFunction = WTF::move(didCompositeFunction);
+    m_state.notifyAfterSceneFlush = notifyAfterSceneFlush;
     if (m_sceneState->pendingTiles())
         m_state.isWaitingForTiles = true;
     scheduleUpdateLocked();
