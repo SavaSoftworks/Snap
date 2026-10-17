@@ -53,6 +53,9 @@
 #include <WebCore/VisiblePosition.h>
 #include <WebCore/VisibleUnits.h>
 #include <wtf/text/MakeString.h>
+#include <wtf/text/StringToIntegerConversion.h>
+#include <wtf/SystemTracing.h>
+#include <cstdlib>
 
 #if ENABLE(2022_GLIB_API)
 #include "WebKitWebProcessExtension.h"
@@ -122,6 +125,31 @@ void WebPage::sendMessageToWebProcessExtension(UserMessage&& message)
     sendMessageToWebProcessExtensionWithReply(WTF::move(message), [](UserMessage&&) { });
 }
 
+static SimpleRange snapSurroundingWindow(const SimpleRange& fullRange, const SimpleRange& anchorRange)
+{
+    static unsigned limit = [] {
+        auto value = parseInteger<unsigned>(StringView::fromLatin1(std::getenv("WEBKIT_SNAP_EDITOR_WINDOW")), 10, WTF::ParseIntegerWhitespacePolicy::Disallow);
+        if (!value) {
+            return 1024U;
+        }
+        return *value ? std::clamp(*value, 128U, 16384U) : 0U;
+    }();
+    if (!limit || !contains<ComposedTree>(fullRange, anchorRange)) {
+        return fullRange;
+    }
+    BackwardsCharacterIterator before({ fullRange.start, anchorRange.start });
+    before.advance(limit - 1);
+    if (!before.atEnd() && !before.text().isEmpty() && U16_IS_TRAIL(before.text()[before.text().length() - 1])) {
+        before.advance(1);
+    }
+    CharacterIterator after({ anchorRange.end, fullRange.end });
+    after.advance(limit);
+    if (!after.atEnd() && !after.text().isEmpty() && U16_IS_TRAIL(after.text()[0])) {
+        after.advance(1);
+    }
+    return { before.atEnd() ? fullRange.start : before.range().start, after.atEnd() ? fullRange.end : after.range().start };
+}
+
 void WebPage::getPlatformEditorState(LocalFrame& frame, EditorState& result) const
 {
     if (!result.hasPostLayoutAndVisualData() || !frame.view() || frame.view()->needsLayout())
@@ -163,17 +191,31 @@ void WebPage::getPlatformEditorState(LocalFrame& frame, EditorState& result) con
         auto surroundingStart = startOfEditableContent(selectionStart);
         auto surroundingRange = makeSimpleRange(surroundingStart, endOfEditableContent(selectionStart));
         auto compositionRange = frame.editor().compositionRange();
+
+        WTFBeginSignpost(this, SnapEditorSurroundingText);
+        auto selectedRange = makeSimpleRange(selection.visibleStart(), selection.visibleEnd());
+        if (surroundingRange && selectedRange) {
+            auto anchorRange = compositionRange ? unionRange(*selectedRange, *compositionRange) : *selectedRange;
+            surroundingRange = snapSurroundingWindow(*surroundingRange, anchorRange);
+        }
+
         if (surroundingRange && compositionRange && contains<ComposedTree>(*surroundingRange, *compositionRange)) {
             auto beforeText = plainText({ surroundingRange->start, compositionRange->start });
             postLayoutData.surroundingContext = makeString(beforeText, plainText({ compositionRange->end, surroundingRange->end }));
             postLayoutData.surroundingContextCursorPosition = beforeText.length();
             postLayoutData.surroundingContextSelectionPosition = postLayoutData.surroundingContextCursorPosition;
         } else {
-            auto cursorPositionRange = makeSimpleRange(surroundingStart, selectionStart);
-            auto selectionPositionRange = makeSimpleRange(surroundingStart, selection.visibleEnd());
+            auto cursorPositionRange = surroundingRange ? makeSimpleRange(surroundingRange->start, selectionStart) : std::nullopt;
+            auto selectionPositionRange = surroundingRange ? makeSimpleRange(surroundingRange->start, selection.visibleEnd()) : std::nullopt;
             postLayoutData.surroundingContext = surroundingRange ? plainText(*surroundingRange) : emptyString();
             postLayoutData.surroundingContextCursorPosition = cursorPositionRange ? characterCount(*cursorPositionRange) : 0;
             postLayoutData.surroundingContextSelectionPosition = selectionPositionRange ? characterCount(*selectionPositionRange): 0;
+        }
+
+        WTFEndSignpost(this, SnapEditorSurroundingText);
+        static const bool traceEnabled = std::getenv("WEBKIT_SNAP_EXPERIMENT_TRACE");
+        if (traceEnabled) {
+            WTFLogAlways("Snap editor window: length=%llu cursor=%llu selection=%llu", static_cast<unsigned long long>(postLayoutData.surroundingContext.length()), static_cast<unsigned long long>(postLayoutData.surroundingContextCursorPosition), static_cast<unsigned long long>(postLayoutData.surroundingContextSelectionPosition));
         }
     }
 }
