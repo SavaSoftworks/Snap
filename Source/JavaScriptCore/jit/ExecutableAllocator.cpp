@@ -73,6 +73,10 @@ WTF_ALLOW_UNSAFE_BUFFER_USAGE_END
 WTF_WEAK_LINK_FORCE_IMPORT(be_memory_inline_jit_restrict_with_witness_supported);
 #endif
 
+#if OS(LINUX)
+#include <sys/mman.h>
+#endif
+
 namespace JSC {
 
 using namespace WTF;
@@ -432,6 +436,20 @@ static ALWAYS_INLINE JITReservation initializeJITPageReservation()
         void* reservationEnd = static_cast<uint8_t*>(reservation.base) + reservation.size;
         g_jscConfig.startExecutableMemory = reservation.base;
         g_jscConfig.endExecutableMemory = reservationEnd;
+
+#if OS(LINUX)
+        const char* hugePages = getenv("WEBKIT_SNAP_JIT_HUGE_PAGES");
+        if (!hugePages || strcmp(hugePages, "0")) {
+            constexpr size_t hugePageSize = 2 * 1024 * 1024;
+            auto* begin = roundUpToMultipleOf<hugePageSize>(static_cast<uint8_t*>(reservation.base));
+            auto* end = roundDownToMultipleOf<hugePageSize>(static_cast<uint8_t*>(reservationEnd));
+            if (end > begin) {
+                int result = madvise(begin, end - begin, MADV_HUGEPAGE);
+                if (getenv("WEBKIT_SNAP_EXPERIMENT_TRACE"))
+                    dataLogLn("Snap JIT huge pages: advised ", end - begin, " bytes result=", result);
+            }
+        }
+#endif
 
 #if !USE(SYSTEM_MALLOC)
         static_assert(WebConfig::reservedSlotsForExecutableAllocator >= 2);
