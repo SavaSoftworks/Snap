@@ -26,7 +26,47 @@
 #include "config.h"
 #include "WebProcessMain.h"
 
+#if PLATFORM(WPE) && OS(LINUX)
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <link.h>
+#include <sys/mman.h>
+
+static void snapAdviseTextHugePages()
+{
+    const char* setting = getenv("WEBKIT_SNAP_TEXT_HUGE_PAGES");
+    if (setting && !strcmp(setting, "0"))
+        return;
+
+    dl_iterate_phdr([](dl_phdr_info* info, size_t, void*) -> int {
+        if (!info->dlpi_name || !strstr(info->dlpi_name, "libWPEWebKit-2.0.so"))
+            return 0;
+
+        constexpr uintptr_t hugePageSize = 2 * 1024 * 1024;
+        for (unsigned i = 0; i < info->dlpi_phnum; ++i) {
+            const auto& segment = info->dlpi_phdr[i];
+            if (segment.p_type != PT_LOAD || segment.p_flags != (PF_R | PF_X))
+                continue;
+            uintptr_t segmentStart = info->dlpi_addr + segment.p_vaddr;
+            uintptr_t start = (segmentStart + hugePageSize - 1) & ~(hugePageSize - 1);
+            uintptr_t end = (segmentStart + segment.p_memsz) & ~(hugePageSize - 1);
+            if (end <= start)
+                continue;
+            int result = madvise(reinterpret_cast<void*>(start), end - start, MADV_HUGEPAGE);
+            if (getenv("WEBKIT_SNAP_EXPERIMENT_TRACE"))
+                fprintf(stderr, "Snap text huge pages: advised %zu bytes result=%d\n", static_cast<size_t>(end - start), result);
+        }
+        return 1;
+    }, nullptr);
+}
+#endif
+
 int main(int argc, char** argv)
 {
+#if PLATFORM(WPE) && OS(LINUX)
+    snapAdviseTextHugePages();
+#endif
     return WebKit::WebProcessMain(argc, argv);
 }
