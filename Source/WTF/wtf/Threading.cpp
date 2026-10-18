@@ -38,10 +38,12 @@
 #include <wtf/ThreadingPrimitives.h>
 #include <wtf/WTFConfig.h>
 #include <wtf/text/AtomString.h>
+#include <wtf/text/StringToIntegerConversion.h>
 #include <wtf/threads/Signals.h>
 
 #if OS(LINUX)
 #include <wtf/linux/RealTimeThreads.h>
+#include <sys/resource.h>
 #endif
 
 #if PLATFORM(COCOA)
@@ -246,6 +248,24 @@ void Thread::entryPoint(NewThreadContext* newThreadContext)
 #endif
 
         Thread::initializeCurrentThreadInternal(context->name);
+
+#if OS(LINUX)
+        static int helperNice = [] {
+            auto value = parseInteger<int>(StringView::fromLatin1(getenv("WEBKIT_SNAP_HELPER_NICE")), 10, WTF::ParseIntegerWhitespacePolicy::Disallow);
+            if (!value)
+                return 3;
+            return std::clamp(*value, 0, 19);
+        }();
+        if (helperNice && (context->name == "JITWorker"_s || context->name == "HeapHelper"_s || context->name == "SkiaCPUWorker"_s)) {
+            if (getpriority(PRIO_PROCESS, 0) < helperNice) {
+                int result = setpriority(PRIO_PROCESS, 0, helperNice);
+                static const bool traceEnabled = getenv("WEBKIT_SNAP_EXPERIMENT_TRACE");
+                if (traceEnabled)
+                    WTFLogAlways("Snap helper priority: %s nice=%d result=%d", context->name.characters(), getpriority(PRIO_PROCESS, 0), result);
+            }
+        }
+#endif
+
         function = WTF::move(context->entryPoint);
 
         Ref thread = WTF::move(context->thread);
