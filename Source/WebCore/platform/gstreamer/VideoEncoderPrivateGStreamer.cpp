@@ -28,7 +28,10 @@
 #include "GUniquePtrGStreamer.h"
 #include "IntSize.h"
 #include "NotImplemented.h"
+#include <algorithm>
 #include <gst/video/gstvideoencoder.h>
+#include <wtf/Lock.h>
+#include <wtf/MonotonicTime.h>
 #include <wtf/StdMap.h>
 #include <wtf/TZoneMallocInlines.h>
 #include <wtf/glib/WTFGType.h>
@@ -228,6 +231,12 @@ struct _WebKitVideoEncoderPrivate {
     GRefPtr<GstElement> outputCapsFilter;
     GRefPtr<GstCaps> encodedCaps;
     unsigned bitrate;
+    Lock bitrateLock;
+    unsigned requestedBitrate WTF_GUARDED_BY_LOCK(bitrateLock);
+    unsigned appliedBitrate WTF_GUARDED_BY_LOCK(bitrateLock);
+    MonotonicTime bitrateRequestTime WTF_GUARDED_BY_LOCK(bitrateLock);
+    MonotonicTime bitrateRestartTime WTF_GUARDED_BY_LOCK(bitrateLock);
+    bool encoderIsStreaming WTF_GUARDED_BY_LOCK(bitrateLock);
     BitrateMode bitrateMode;
     LatencyMode latencyMode;
     RefPtr<WebKitVideoEncoderBitRateAllocation> bitRateAllocation;
@@ -281,15 +290,154 @@ static void videoEncoderGetProperty(GObject* object, guint propertyId, GValue* v
     }
 }
 
+static bool encoderUsesVideoAcceleration(EncoderId encoderId)
+{
+    switch (encoderId) {
+    case VaapiH264:
+    case VaapiH264LP:
+    case VaapiH265:
+    case VaapiAv1:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool acceleratedEncoderShouldTakeBitrate(unsigned requested, unsigned applied, Seconds sinceRequest, Seconds sinceRestart)
+{
+    if (requested == applied)
+        return false;
+    if (!applied)
+        return true;
+    double ratio = static_cast<double>(requested) / applied;
+    if (ratio <= 0.5)
+        return true;
+    if (ratio <= 0.85 || ratio >= 1.25)
+        return sinceRestart >= 1_s;
+    return sinceRequest >= 5_s && sinceRestart >= 5_s;
+}
+
+static Vector<std::pair<size_t, size_t>> acceleratedEncoderFillerRanges(EncoderId encoderId, std::span<const uint8_t> data)
+{
+    Vector<std::pair<size_t, size_t>> ranges;
+    if (encoderId == VaapiAv1) {
+        size_t index = 0;
+        while (index < data.size()) {
+            uint8_t header = data[index];
+            size_t position = index + ((header & 0x04) ? 2 : 1);
+            size_t end = data.size();
+            if (header & 0x02) {
+                uint64_t size = 0;
+                for (unsigned shift = 0;; shift += 7) {
+                    if (position >= data.size() || shift > 56)
+                        return {};
+                    uint8_t byte = data[position++];
+                    size |= static_cast<uint64_t>(byte & 0x7f) << shift;
+                    if (!(byte & 0x80))
+                        break;
+                }
+                if (size > data.size() - position)
+                    return {};
+                end = position + size;
+            }
+            if (((header >> 3) & 0x0f) == 15)
+                ranges.append({ index, end });
+            index = end;
+        }
+        return ranges;
+    }
+
+    bool isH265 = encoderId == VaapiH265;
+    Vector<std::pair<size_t, size_t>> units;
+    for (size_t index = 0; index + 3 < data.size(); ++index) {
+        if (data[index] || data[index + 1] || data[index + 2] != 1)
+            continue;
+        units.append({ index && !data[index - 1] ? index - 1 : index, index + 3 });
+        index += 2;
+    }
+    for (size_t unit = 0; unit < units.size(); ++unit) {
+        uint8_t header = data[units[unit].second];
+        if ((isH265 ? (header >> 1) & 0x3f : header & 0x1f) == (isH265 ? 38 : 12))
+            ranges.append({ units[unit].first, unit + 1 < units.size() ? units[unit + 1].first : data.size() });
+    }
+    return ranges;
+}
+
+static GstPadProbeReturn videoEncoderDropFiller(GstPad*, GstPadProbeInfo* info, gpointer encoderId)
+{
+    auto* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    Vector<std::pair<size_t, size_t>> ranges;
+    size_t size = 0;
+    {
+        GstMappedBuffer mapped(buffer, GST_MAP_READ);
+        if (!mapped)
+            return GST_PAD_PROBE_OK;
+        ranges = acceleratedEncoderFillerRanges(static_cast<EncoderId>(GPOINTER_TO_INT(encoderId)), mapped.span<uint8_t>());
+        size = mapped.size();
+    }
+    if (ranges.isEmpty())
+        return GST_PAD_PROBE_OK;
+
+    size_t removed = 0;
+    for (auto& [begin, end] : ranges)
+        removed += end - begin;
+    GRefPtr<GstBuffer> stripped = adoptGRef(gst_buffer_new_allocate(nullptr, size - removed, nullptr));
+    {
+        GstMappedBuffer source(buffer, GST_MAP_READ);
+        GstMappedBuffer destination(stripped.get(), GST_MAP_WRITE);
+        if (!source || !destination)
+            return GST_PAD_PROBE_OK;
+        auto input = source.span<uint8_t>();
+        auto output = destination.mutableSpan<uint8_t>();
+        size_t written = 0;
+        size_t position = 0;
+        for (auto& [begin, end] : ranges) {
+            memcpySpan(output.subspan(written, begin - position), input.subspan(position, begin - position));
+            written += begin - position;
+            position = end;
+        }
+        memcpySpan(output.subspan(written), input.subspan(position));
+    }
+    gst_buffer_copy_into(stripped.get(), buffer, GST_BUFFER_COPY_METADATA, 0, -1);
+    GST_LOG("Dropped %zu bytes of hardware encoder filler from a %zu byte frame", removed, size);
+    GST_PAD_PROBE_INFO_DATA(info) = stripped.leakRef();
+    gst_buffer_unref(buffer);
+    return GST_PAD_PROBE_OK;
+}
+
+static void videoEncoderApplyBitrate(WebKitVideoEncoder* self, GstElement* encoder, bool isStreaming)
+{
+    auto* priv = self->priv;
+    Locker locker { priv->bitrateLock };
+    bool wasStreaming = std::exchange(priv->encoderIsStreaming, priv->encoderIsStreaming || isStreaming);
+    if (isStreaming && !wasStreaming)
+        priv->bitrateRestartTime = MonotonicTime::now();
+    if (!encoder || priv->encoderId == None || priv->requestedBitrate == priv->appliedBitrate)
+        return;
+    if (encoderUsesVideoAcceleration(priv->encoderId) && wasStreaming) {
+        auto now = MonotonicTime::now();
+        if (!acceleratedEncoderShouldTakeBitrate(priv->requestedBitrate, priv->appliedBitrate, now - priv->bitrateRequestTime, now - priv->bitrateRestartTime))
+            return;
+        GST_INFO_OBJECT(self, "Moving the hardware encoder from %u to %u kbps, which restarts its GOP", priv->appliedBitrate, priv->requestedBitrate);
+        priv->bitrateRestartTime = now;
+    }
+    priv->appliedBitrate = priv->requestedBitrate;
+    auto definition = Encoders::definition(priv->encoderId);
+    definition->setBitrate(G_OBJECT(encoder), definition->bitratePropertyName, priv->appliedBitrate);
+}
+
 static void videoEncoderSetBitrate(WebKitVideoEncoder* self, guint bitrate)
 {
     auto* priv = self->priv;
     priv->bitrate = bitrate;
-
-    if (priv->encoderId != None) {
-        auto encoder = Encoders::definition(priv->encoderId);
-        encoder->setBitrate(G_OBJECT(priv->encoder.get()), encoder->bitratePropertyName, priv->bitrate);
+    {
+        Locker locker { priv->bitrateLock };
+        if (priv->requestedBitrate != bitrate) {
+            priv->requestedBitrate = bitrate;
+            priv->bitrateRequestTime = MonotonicTime::now();
+        }
     }
+    videoEncoderApplyBitrate(self, priv->encoder.get(), false);
 }
 
 static bool videoEncoderSetEncoder(WebKitVideoEncoder* self, EncoderId encoderId, GRefPtr<GstCaps>&& inputCaps, GRefPtr<GstCaps>&& encodedCaps, bool useAnnexB)
@@ -412,6 +560,21 @@ static bool videoEncoderSetEncoder(WebKitVideoEncoder* self, EncoderId encoderId
 
     gst_bin_sync_children_states(bin);
     dumpBinToDotFile(bin, "configured-encoder"_s);
+    {
+        Locker locker { priv->bitrateLock };
+        priv->appliedBitrate = 0;
+        priv->encoderIsStreaming = false;
+    }
+    if (encoderUsesVideoAcceleration(encoderId)) {
+        GRefPtr encoderSinkPad = adoptGRef(gst_element_get_static_pad(priv->encoder.get(), "sink"));
+        gst_pad_add_probe(encoderSinkPad.get(), GST_PAD_PROBE_TYPE_BUFFER, reinterpret_cast<GstPadProbeCallback>(+[](GstPad* pad, GstPadProbeInfo*, WebKitVideoEncoder* self) -> GstPadProbeReturn {
+            videoEncoderApplyBitrate(self, GST_ELEMENT_CAST(GST_PAD_PARENT(pad)), true);
+            return GST_PAD_PROBE_OK;
+        }),
+            self, nullptr);
+        GRefPtr encoderSrcPad = adoptGRef(gst_element_get_static_pad(priv->encoder.get(), "src"));
+        gst_pad_add_probe(encoderSrcPad.get(), GST_PAD_PROBE_TYPE_BUFFER, videoEncoderDropFiller, GINT_TO_POINTER(encoderId), nullptr);
+    }
     videoEncoderSetBitrate(self, priv->bitrate);
     return true;
 }
@@ -536,7 +699,17 @@ static void videoEncoderSetProperty(GObject* object, guint propertyId, const GVa
     case PROP_KEYFRAME_INTERVAL:
         if (priv->encoder) {
             auto encoder = Encoders::definition(priv->encoderId);
-            g_object_set(priv->encoder.get(), encoder->keyframeIntervalPropertyName.characters(), g_value_get_uint(value), nullptr);
+            auto interval = g_value_get_uint(value);
+            if (auto* spec = g_object_class_find_property(G_OBJECT_GET_CLASS(priv->encoder.get()), encoder->keyframeIntervalPropertyName.characters())) {
+                auto requested = interval;
+                if (G_IS_PARAM_SPEC_UINT(spec))
+                    interval = std::clamp(interval, G_PARAM_SPEC_UINT(spec)->minimum, G_PARAM_SPEC_UINT(spec)->maximum);
+                else if (G_IS_PARAM_SPEC_INT(spec) && G_PARAM_SPEC_INT(spec)->maximum >= 0)
+                    interval = std::min<guint>(interval, G_PARAM_SPEC_INT(spec)->maximum);
+                if (interval != requested)
+                    GST_DEBUG_OBJECT(self, "%s takes a keyframe interval of at most %u frames, not %u", encoder->name.characters(), interval, requested);
+            }
+            g_object_set(priv->encoder.get(), encoder->keyframeIntervalPropertyName.characters(), interval, nullptr);
         }
         break;
     case PROP_BITRATE_MODE:
@@ -663,11 +836,10 @@ static void setVaLatencyMode(GstElement* encoder, LatencyMode mode)
 {
     switch (mode) {
     case REALTIME_LATENCY_MODE:
-        g_object_set(encoder, "target-usage", 1, nullptr);
+        g_object_set(encoder, "target-usage", 7, nullptr);
         break;
     case QUALITY_LATENCY_MODE:
-        g_object_set(encoder, "target-usage", 7, nullptr);
-        gst_util_set_object_arg(G_OBJECT(encoder), "rate-control", "cqp");
+        g_object_set(encoder, "target-usage", 1, nullptr);
         break;
     };
 }

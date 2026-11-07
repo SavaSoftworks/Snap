@@ -25,6 +25,8 @@
 #include "AV1Utilities.h"
 #include "HEVCUtilities.h"
 #include "VP9Utilities.h"
+#include <algorithm>
+#include <array>
 #include <gst/pbutils/codec-utils.h>
 #include <gst/video/video.h>
 #include <wtf/text/CStringView.h>
@@ -80,10 +82,39 @@ static std::pair<GRefPtr<GstCaps>, GRefPtr<GstCaps>> h264CapsFromCodecString(con
 {
     GRefPtr outputCaps = adoptGRef(gst_caps_new_empty_simple("video/x-h264"));
     auto [profile, level] = GStreamerCodecUtilities::parseH264ProfileAndLevel(codecString);
-    if (profile)
+    if (profile == "baseline"_s) {
+        GValue profiles = G_VALUE_INIT;
+        g_value_init(&profiles, GST_TYPE_LIST);
+        for (const char* name : { "constrained-baseline", "baseline" }) {
+            GValue value = G_VALUE_INIT;
+            g_value_init(&value, G_TYPE_STRING);
+            g_value_set_string(&value, name);
+            gst_value_list_append_and_take_value(&profiles, &value);
+        }
+        gst_caps_set_value(outputCaps.get(), "profile", &profiles);
+        g_value_unset(&profiles);
+    } else if (profile)
         gst_caps_set_simple(outputCaps.get(), "profile", G_TYPE_STRING, profile.utf8(), nullptr);
-    if (!level.isEmpty())
-        gst_caps_set_simple(outputCaps.get(), "level", G_TYPE_STRING, level.ascii().data(), nullptr);
+    if (!level.isEmpty()) {
+        static constexpr std::array h264Levels { "1"_s, "1b"_s, "1.1"_s, "1.2"_s, "1.3"_s, "2"_s, "2.1"_s, "2.2"_s, "3"_s, "3.1"_s, "3.2"_s, "4"_s, "4.1"_s, "4.2"_s, "5"_s, "5.1"_s, "5.2"_s, "6"_s, "6.1"_s, "6.2"_s };
+        auto highest = std::ranges::find_if(h264Levels, [&](auto candidate) { return level == candidate; });
+        if (highest == h264Levels.end() || highest == h264Levels.begin())
+            gst_caps_set_simple(outputCaps.get(), "level", G_TYPE_STRING, level.ascii().data(), nullptr);
+        else {
+            GValue levels = G_VALUE_INIT;
+            g_value_init(&levels, GST_TYPE_LIST);
+            for (auto candidate = highest;; --candidate) {
+                GValue value = G_VALUE_INIT;
+                g_value_init(&value, G_TYPE_STRING);
+                g_value_set_string(&value, candidate->characters());
+                gst_value_list_append_and_take_value(&levels, &value);
+                if (candidate == h264Levels.begin())
+                    break;
+            }
+            gst_caps_set_value(outputCaps.get(), "level", &levels);
+            g_value_unset(&levels);
+        }
+    }
 
     StringBuilder formatBuilder;
     auto isY444TenBits = startsWithLettersIgnoringASCIICase(profile.span(), "high-4:4:4"_s);
