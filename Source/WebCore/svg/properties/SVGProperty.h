@@ -27,7 +27,9 @@
 namespace WebCore {
 
 enum class SVGPropertyAccess : uint8_t { ReadWrite, ReadOnly };
-enum class SVGPropertyState : uint8_t { Clean, Dirty };
+enum class SVGPropertyState : uint8_t { Clean,
+    CleanWithSuccessfulLengthAttributeParse,
+    Dirty };
 
 class SVGProperty : public ThreadSafeRefCounted<SVGProperty> {
 public:
@@ -38,7 +40,8 @@ public:
     virtual void attach(SVGPropertyOwner* owner, SVGPropertyAccess access)
     {
         ASSERT(!m_owner);
-        ASSERT(m_state == SVGPropertyState::Clean);
+        ASSERT(m_state != SVGPropertyState::Dirty);
+        m_state = SVGPropertyState::Clean;
         m_owner = owner;
         m_access = access;
     }
@@ -66,6 +69,7 @@ public:
 
     void commitChange()
     {
+        invalidateLengthAttributeParseSuccess();
         if (!m_owner)
             return;
         m_owner->commitPropertyChange(this);
@@ -77,10 +81,17 @@ public:
 
     // Synchronizing the SVG attribute and its reflection here.
     bool isDirty() const { return m_state == SVGPropertyState::Dirty; }
+    bool hasSuccessfulLengthAttributeParse() const { return m_state == SVGPropertyState::CleanWithSuccessfulLengthAttributeParse; }
+    void setLengthAttributeParseSucceeded(bool succeeded)
+    {
+        if (isDirty())
+            return;
+        m_state = succeeded ? SVGPropertyState::CleanWithSuccessfulLengthAttributeParse : SVGPropertyState::Clean;
+    }
     void setDirty() { m_state = SVGPropertyState::Dirty; }
     std::optional<String> synchronize()
     {
-        if (m_state == SVGPropertyState::Clean)
+        if (m_state != SVGPropertyState::Dirty)
             return std::nullopt;
         m_state = SVGPropertyState::Clean;
         return valueAsString();
@@ -90,6 +101,12 @@ public:
     virtual String valueAsString() const { return emptyString(); }
 
 protected:
+    void invalidateLengthAttributeParseSuccess()
+    {
+        if (m_state == SVGPropertyState::CleanWithSuccessfulLengthAttributeParse)
+            m_state = SVGPropertyState::Clean;
+    }
+
     SVGProperty(SVGPropertyOwner* owner = nullptr, SVGPropertyAccess access = SVGPropertyAccess::ReadWrite)
         : m_owner(owner)
         , m_access(access)

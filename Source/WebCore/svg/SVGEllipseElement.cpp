@@ -21,6 +21,7 @@
 
 #include "config.h"
 #include "SVGEllipseElement.h"
+#include "SnapSVGLengthAttributeParse.h"
 
 #include "LegacyRenderSVGEllipse.h"
 #include "LegacyRenderSVGResource.h"
@@ -62,16 +63,28 @@ void SVGEllipseElement::attributeChanged(const QualifiedName& name, const AtomSt
 
     switch (name.nodeName()) {
     case AttributeNames::cxAttr:
-        Ref { m_cx }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Width, newValue, parseError));
+        if (!snapShouldSkipSVGLengthAttributeParse(oldValue, newValue, m_cx.get())) {
+            Ref { m_cx }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Width, newValue, parseError));
+            m_cx->baseVal()->setLengthAttributeParseSucceeded(parseError == SVGParsingError::None);
+        }
         break;
     case AttributeNames::cyAttr:
-        Ref { m_cy }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Height, newValue, parseError));
+        if (!snapShouldSkipSVGLengthAttributeParse(oldValue, newValue, m_cy.get())) {
+            Ref { m_cy }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Height, newValue, parseError));
+            m_cy->baseVal()->setLengthAttributeParseSucceeded(parseError == SVGParsingError::None);
+        }
         break;
     case AttributeNames::rxAttr:
-        Ref { m_rx }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Width, newValue, parseError, SVGLengthNegativeValuesMode::Forbid));
+        if (!snapShouldSkipSVGLengthAttributeParse(oldValue, newValue, m_rx.get())) {
+            Ref { m_rx }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Width, newValue, parseError, SVGLengthNegativeValuesMode::Forbid));
+            m_rx->baseVal()->setLengthAttributeParseSucceeded(parseError == SVGParsingError::None);
+        }
         break;
     case AttributeNames::ryAttr:
-        Ref { m_ry }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Height, newValue, parseError, SVGLengthNegativeValuesMode::Forbid));
+        if (!snapShouldSkipSVGLengthAttributeParse(oldValue, newValue, m_ry.get())) {
+            Ref { m_ry }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Height, newValue, parseError, SVGLengthNegativeValuesMode::Forbid));
+            m_ry->baseVal()->setLengthAttributeParseSucceeded(parseError == SVGParsingError::None);
+        }
         break;
     default:
         break;

@@ -21,6 +21,7 @@
 
 #include "config.h"
 #include "SVGCircleElement.h"
+#include "SnapSVGLengthAttributeParse.h"
 
 #include "LegacyRenderSVGEllipse.h"
 #include "LegacyRenderSVGResource.h"
@@ -72,13 +73,22 @@ void SVGCircleElement::attributeChanged(const QualifiedName& name, const AtomStr
 
     switch (name.nodeName()) {
     case AttributeNames::cxAttr:
-        m_cx->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Width, newValue, parseError));
+        if (!snapShouldSkipSVGLengthAttributeParse(oldValue, newValue, m_cx.get())) {
+            m_cx->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Width, newValue, parseError));
+            m_cx->baseVal()->setLengthAttributeParseSucceeded(parseError == SVGParsingError::None);
+        }
         break;
     case AttributeNames::cyAttr:
-        m_cy->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Height, newValue, parseError));
+        if (!snapShouldSkipSVGLengthAttributeParse(oldValue, newValue, m_cy.get())) {
+            m_cy->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Height, newValue, parseError));
+            m_cy->baseVal()->setLengthAttributeParseSucceeded(parseError == SVGParsingError::None);
+        }
         break;
     case AttributeNames::rAttr:
-        m_r->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Other, newValue, parseError, SVGLengthNegativeValuesMode::Forbid));
+        if (!snapShouldSkipSVGLengthAttributeParse(oldValue, newValue, m_r.get())) {
+            m_r->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Other, newValue, parseError, SVGLengthNegativeValuesMode::Forbid));
+            m_r->baseVal()->setLengthAttributeParseSucceeded(parseError == SVGParsingError::None);
+        }
         break;
     default:
         break;

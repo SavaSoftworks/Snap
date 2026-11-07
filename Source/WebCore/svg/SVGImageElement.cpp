@@ -23,6 +23,7 @@
 
 #include "config.h"
 #include "SVGImageElement.h"
+#include "SnapSVGLengthAttributeParse.h"
 
 #include "CSSPropertyNames.h"
 #include "ContainerNodeInlines.h"
@@ -99,16 +100,28 @@ void SVGImageElement::attributeChanged(const QualifiedName& name, const AtomStri
         m_preserveAspectRatio->setBaseValInternal(SVGPreserveAspectRatioValue { newValue });
         return;
     case AttributeNames::xAttr:
-        Ref { m_x }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Width, newValue, parseError));
+        if (!snapShouldSkipSVGLengthAttributeParse(oldValue, newValue, m_x.get())) {
+            Ref { m_x }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Width, newValue, parseError));
+            m_x->baseVal()->setLengthAttributeParseSucceeded(parseError == SVGParsingError::None);
+        }
         break;
     case AttributeNames::yAttr:
-        Ref { m_y }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Height, newValue, parseError));
+        if (!snapShouldSkipSVGLengthAttributeParse(oldValue, newValue, m_y.get())) {
+            Ref { m_y }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Height, newValue, parseError));
+            m_y->baseVal()->setLengthAttributeParseSucceeded(parseError == SVGParsingError::None);
+        }
         break;
     case AttributeNames::widthAttr:
-        Ref { m_width }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Width, newValue, parseError, SVGLengthNegativeValuesMode::Forbid));
+        if (!snapShouldSkipSVGLengthAttributeParse(oldValue, newValue, m_width.get())) {
+            Ref { m_width }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Width, newValue, parseError, SVGLengthNegativeValuesMode::Forbid));
+            m_width->baseVal()->setLengthAttributeParseSucceeded(parseError == SVGParsingError::None);
+        }
         break;
     case AttributeNames::heightAttr:
-        Ref { m_height }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Height, newValue, parseError, SVGLengthNegativeValuesMode::Forbid));
+        if (!snapShouldSkipSVGLengthAttributeParse(oldValue, newValue, m_height.get())) {
+            Ref { m_height }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Height, newValue, parseError, SVGLengthNegativeValuesMode::Forbid));
+            m_height->baseVal()->setLengthAttributeParseSucceeded(parseError == SVGParsingError::None);
+        }
         break;
     case AttributeNames::crossoriginAttr:
         if (parseCORSSettingsAttribute(oldValue) != parseCORSSettingsAttribute(newValue))

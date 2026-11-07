@@ -41,7 +41,11 @@ public:
 
     // Getter/Setter for the value.
     const PropertyType& value() const LIFETIME_BOUND { return m_value; }
-    void setValue(const PropertyType& value) { m_value = value; }
+    void setValue(const PropertyType& value)
+    {
+        invalidateLengthAttributeParseSuccess();
+        m_value = value;
+    }
 
     // Used by the SVGAnimatedPropertyAnimator to pass m_value to SVGAnimationFunction.
     PropertyType& value() LIFETIME_BOUND { return m_value; }

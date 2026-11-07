@@ -21,6 +21,7 @@
 
 #include "config.h"
 #include "SVGLineElement.h"
+#include "SnapSVGLengthAttributeParse.h"
 
 #include "ContainerNodeInlines.h"
 #include "LegacyRenderSVGResource.h"
@@ -62,16 +63,28 @@ void SVGLineElement::attributeChanged(const QualifiedName& name, const AtomStrin
 
     switch (name.nodeName()) {
     case AttributeNames::x1Attr:
-        Ref { m_x1 }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Width, newValue, parseError));
+        if (!snapShouldSkipSVGLengthAttributeParse(oldValue, newValue, m_x1.get())) {
+            Ref { m_x1 }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Width, newValue, parseError));
+            m_x1->baseVal()->setLengthAttributeParseSucceeded(parseError == SVGParsingError::None);
+        }
         break;
     case AttributeNames::y1Attr:
-        Ref { m_y1 }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Height, newValue, parseError));
+        if (!snapShouldSkipSVGLengthAttributeParse(oldValue, newValue, m_y1.get())) {
+            Ref { m_y1 }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Height, newValue, parseError));
+            m_y1->baseVal()->setLengthAttributeParseSucceeded(parseError == SVGParsingError::None);
+        }
         break;
     case AttributeNames::x2Attr:
-        Ref { m_x2 }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Width, newValue, parseError));
+        if (!snapShouldSkipSVGLengthAttributeParse(oldValue, newValue, m_x2.get())) {
+            Ref { m_x2 }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Width, newValue, parseError));
+            m_x2->baseVal()->setLengthAttributeParseSucceeded(parseError == SVGParsingError::None);
+        }
         break;
     case AttributeNames::y2Attr:
-        Ref { m_y2 }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Height, newValue, parseError));
+        if (!snapShouldSkipSVGLengthAttributeParse(oldValue, newValue, m_y2.get())) {
+            Ref { m_y2 }->setBaseValInternal(SVGLengthValue::construct(SVGLengthMode::Height, newValue, parseError));
+            m_y2->baseVal()->setLengthAttributeParseSucceeded(parseError == SVGParsingError::None);
+        }
         break;
     default:
         break;
