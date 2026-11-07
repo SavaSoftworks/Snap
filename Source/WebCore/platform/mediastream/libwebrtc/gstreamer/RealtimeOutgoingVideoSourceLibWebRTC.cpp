@@ -88,6 +88,15 @@ void RealtimeOutgoingVideoSourceLibWebRTC::videoFrameAvailable(VideoFrame& video
         return;
 
     frameSize.scale(this->videoFrameScaling());
+    if (gstFrame.memoryType() != VideoFrameGStreamer::MemoryType::System && gstFrame.memoryType() != VideoFrameGStreamer::MemoryType::Unsupported) {
+        GRefPtr nativeSample = adoptGRef(gst_sample_make_writable(GRefPtr(gstFrame.sample()).leakRef()));
+        gst_sample_set_segment(nativeSample.get(), nullptr);
+        if (auto buffer = GStreamerVideoFrameLibWebRTC::createScaled(WTF::move(nativeSample), frameSize)) {
+            GST_TRACE("Sending a GPU-backed %dx%d video frame", frameSize.width(), frameSize.height());
+            sendFrame(WTF::move(buffer), colorSpace);
+            return;
+        }
+    }
     auto sample = gstFrame.convert(GST_VIDEO_FORMAT_I420, frameSize, colorSpace);
     if (!sample)
         return;
@@ -103,19 +112,9 @@ void RealtimeOutgoingVideoSourceLibWebRTC::videoFrameAvailable(VideoFrame& video
 webrtc::scoped_refptr<webrtc::VideoFrameBuffer> RealtimeOutgoingVideoSourceLibWebRTC::createBlackFrame(size_t width, size_t height)
 {
     GST_TRACE("Creating black video frame");
-
-    GstVideoInfo info;
-    gst_video_info_set_format(&info, GST_VIDEO_FORMAT_RGB, width, height);
-
-    GRefPtr<GstBuffer> buffer = adoptGRef(gst_buffer_new_allocate(nullptr, info.size, nullptr));
-    GRefPtr<GstCaps> caps = adoptGRef(gst_video_info_to_caps(&info));
-
-    {
-        GstMappedBuffer map(buffer.get(), GST_MAP_WRITE);
-        memsetSpan(map.mutableSpan<uint8_t>(), 0);
-    }
-
-    return GStreamerVideoFrameLibWebRTC::create(gst_sample_new(buffer.get(), caps.get(), nullptr, nullptr));
+    auto buffer = webrtc::I420Buffer::Create(std::max<int>(width, 2), std::max<int>(height, 2));
+    webrtc::I420Buffer::SetBlack(buffer.get());
+    return buffer;
 }
 
 #undef GST_CAT_DEFAULT

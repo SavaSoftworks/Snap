@@ -59,6 +59,7 @@ IGNORE_CLANG_WARNINGS_BEGIN("thread-safety-reference-return")
 IGNORE_CLANG_WARNINGS_END
 IGNORE_CLANG_WARNINGS_END
 #include <webrtc/pc/peer_connection_factory_proxy.h>
+#include <webrtc/rtc_base/logging.h>
 #include <webrtc/rtc_base/physical_socket_server.h>
 #include <webrtc/rtc_base/task_queue_gcd.h>
 
@@ -186,9 +187,34 @@ void LibWebRTCProvider::setRTCLogging(WTFLogLevel level)
     getRTCLogSink().start(computeLogLevel(level));
 }
 
+static std::optional<webrtc::LoggingSeverity> debugLoggingSeverity()
+{
+    auto value = StringView::fromLatin1(getenv("EDEN_WEBRTC_LOG"));
+    if (equalLettersIgnoringASCIICase(value, "verbose"_s))
+        return webrtc::LS_VERBOSE;
+    if (equalLettersIgnoringASCIICase(value, "info"_s))
+        return webrtc::LS_INFO;
+    if (equalLettersIgnoringASCIICase(value, "warning"_s))
+        return webrtc::LS_WARNING;
+    if (equalLettersIgnoringASCIICase(value, "error"_s))
+        return webrtc::LS_ERROR;
+    return std::nullopt;
+}
+
 static void initializePeerConnectionFactoryAndThreads(PeerConnectionFactoryAndThreads& factoryAndThreads)
 {
     ASSERT(!factoryAndThreads.networkThread);
+
+    if (auto severity = debugLoggingSeverity()) {
+        webrtc::LoggingConfig config;
+        config.set_min_severity(*severity);
+        config.set_debug_severity(*severity);
+        config.set_log_thread(true);
+        config.set_log_timestamp(true);
+        config.set_log_to_stderr(true);
+        if (!webrtc::InitializeLogging(WTF::move(config)))
+            WTFLogAlways("EDEN_WEBRTC_LOG is ignored because libwebrtc logging was already configured");
+    }
 
     factoryAndThreads.networkThread = factoryAndThreads.networkThreadWithSocketServer ? webrtc::Thread::CreateWithSocketServer() : webrtc::Thread::Create();
     factoryAndThreads.networkThread->SetName("WebKitWebRTCNetwork", nullptr);

@@ -32,7 +32,7 @@ namespace WebCore {
 class GStreamerVideoDecoderFactory : public webrtc::VideoDecoderFactory {
     WTF_MAKE_TZONE_ALLOCATED(GStreamerVideoDecoderFactory);
 public:
-    GStreamerVideoDecoderFactory(bool isSupportingVP9Profile0, bool isSupportingVP9Profile2);
+    GStreamerVideoDecoderFactory(bool isSupportingVP9Profile0, bool isSupportingVP9Profile2, bool isSupportingAV1);
 
 private:
     std::unique_ptr<webrtc::VideoDecoder> Create(const webrtc::Environment&, const webrtc::SdpVideoFormat&) final;
@@ -40,6 +40,7 @@ private:
 
     bool m_isSupportingVP9Profile0;
     bool m_isSupportingVP9Profile2;
+    bool m_isSupportingAV1;
 };
 }
 

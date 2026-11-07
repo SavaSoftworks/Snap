@@ -61,12 +61,11 @@ private:
 
     void pullAudioData();
 
-    GUniquePtr<GstAudioConverter> m_sampleConverter;
-    GstAudioInfo m_inputStreamDescription;
-    GstAudioInfo m_outputStreamDescription;
-
-    Lock m_adapterLock;
-    GRefPtr<GstAdapter> m_adapter WTF_GUARDED_BY_LOCK(m_adapterLock);
+    Lock m_conversionLock;
+    GUniquePtr<GstAudioConverter> m_sampleConverter WTF_GUARDED_BY_LOCK(m_conversionLock);
+    GstAudioInfo m_inputStreamDescription WTF_GUARDED_BY_LOCK(m_conversionLock);
+    GstAudioInfo m_outputStreamDescription WTF_GUARDED_BY_LOCK(m_conversionLock);
+    Vector<uint8_t> m_convertedAudio WTF_GUARDED_BY_LOCK(m_conversionLock);
     Vector<uint8_t> m_audioBuffer;
 };
 

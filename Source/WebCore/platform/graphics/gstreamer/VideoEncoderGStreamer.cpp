@@ -66,6 +66,8 @@ public:
     String initialize(const String& codecName);
     bool encode(VideoEncoder::RawFrame&&, bool shouldGenerateKeyFrame);
     void setRates(uint64_t bitRate, double frameRate);
+    void setKeyFrameInterval(unsigned);
+    bool isHardwareAccelerated() const;
     void setBitRateAllocation(RefPtr<WebKitVideoEncoderBitRateAllocation>&&, double frameRate);
     void applyRates();
     void flush();
@@ -153,6 +155,21 @@ Ref<VideoEncoder::EncodePromise> GStreamerVideoEncoder::encode(RawFrame&& frame,
         encoder->harness()->processOutputSamples();
         return EncodePromise::createAndResolve();
     });
+}
+
+void GStreamerVideoEncoder::setRatesSync(uint64_t bitRate, double frameRate)
+{
+    m_internalEncoder->setRates(bitRate, frameRate);
+}
+
+void GStreamerVideoEncoder::setKeyFrameIntervalSync(unsigned interval)
+{
+    m_internalEncoder->setKeyFrameInterval(interval);
+}
+
+bool GStreamerVideoEncoder::isHardwareAccelerated() const
+{
+    return m_internalEncoder->isHardwareAccelerated();
 }
 
 bool GStreamerVideoEncoder::encodeSync(RawFrame&& frame, bool shouldGenerateKeyFrame)
@@ -395,6 +412,20 @@ void GStreamerInternalVideoEncoder::applyRates()
         break;
     }
     setBitRateAllocation(WTF::move(bitRateAllocation), m_config.frameRate);
+}
+
+void GStreamerInternalVideoEncoder::setKeyFrameInterval(unsigned interval)
+{
+    g_object_set(m_harness->element(), "keyframe-interval", interval, nullptr);
+}
+
+bool GStreamerInternalVideoEncoder::isHardwareAccelerated() const
+{
+    GRefPtr<GstElement> encoder;
+    g_object_get(m_harness->element(), "encoder", &encoder.outPtr(), nullptr);
+    auto* factory = encoder ? gst_element_get_factory(encoder.get()) : nullptr;
+    auto* klass = factory ? gst_element_factory_get_metadata(factory, GST_ELEMENT_METADATA_KLASS) : nullptr;
+    return klass && g_strstr_len(klass, -1, "Hardware");
 }
 
 void GStreamerInternalVideoEncoder::flush()

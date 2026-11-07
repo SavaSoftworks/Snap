@@ -734,6 +734,7 @@ list(APPEND webrtc_SOURCES
     Source/webrtc/modules/audio_processing/capture_levels_adjuster/audio_samples_scaler.cc
     Source/webrtc/modules/audio_processing/capture_levels_adjuster/capture_levels_adjuster.cc
     Source/webrtc/modules/audio_processing/capture_mixer/audio_content_analyzer.cc
+    Source/webrtc/modules/audio_processing/capture_mixer/capture_mixer.cc
     Source/webrtc/modules/audio_processing/capture_mixer/channel_content_remixer.cc
     Source/webrtc/modules/audio_processing/capture_mixer/dc_levels_estimator.cc
     Source/webrtc/modules/audio_processing/capture_mixer/energy_estimator.cc
@@ -2448,6 +2449,26 @@ else ()
 endif ()
 
 target_include_directories(webrtc ${webrtc_INCLUDE_DIRECTORIES})
+
+if (USE_LIBWEBRTC_AV1 AND NOT APPLE)
+    set(_libwebrtc_av1_forward "${CMAKE_CURRENT_BINARY_DIR}/eden-av1-forward")
+    file(MAKE_DIRECTORY "${_libwebrtc_av1_forward}/third_party/dav1d/libdav1d" "${_libwebrtc_av1_forward}/third_party/libaom/source")
+    foreach (_libwebrtc_av1_link IN ITEMS "third_party/dav1d/libdav1d/include" "third_party/libaom/source/libaom")
+        if (IS_SYMLINK "${_libwebrtc_av1_forward}/${_libwebrtc_av1_link}")
+            file(REMOVE "${_libwebrtc_av1_forward}/${_libwebrtc_av1_link}")
+        endif ()
+    endforeach ()
+    file(CREATE_LINK "${LIBWEBRTC_DAV1D_INCLUDEDIR}" "${_libwebrtc_av1_forward}/third_party/dav1d/libdav1d/include" SYMBOLIC)
+    file(CREATE_LINK "${LIBWEBRTC_AOM_INCLUDEDIR}" "${_libwebrtc_av1_forward}/third_party/libaom/source/libaom" SYMBOLIC)
+    target_sources(webrtc PRIVATE
+        Source/webrtc/modules/video_coding/codecs/av1/dav1d_decoder.cc
+        Source/webrtc/modules/video_coding/codecs/av1/libaom_av1_encoder.cc
+        Source/webrtc/modules/video_coding/codecs/av1/libaom_speed_config_factory.cc
+    )
+    target_include_directories(webrtc BEFORE PRIVATE "${_libwebrtc_av1_forward}")
+    target_compile_definitions(webrtc PRIVATE RTC_USE_LIBAOM_AV1_ENCODER RTC_DAV1D_IN_INTERNAL_DECODER_FACTORY)
+    target_link_libraries(webrtc PkgConfig::LIBWEBRTC_AOM PkgConfig::LIBWEBRTC_DAV1D)
+endif ()
 WEBKIT_ADD_PREFIX_HEADER(webrtc WebRTCPrefix.h PREFIX_LANGUAGES CXX)
 WEBKIT_ADD_PREFIX_HEADER(webrtc WebRTCObjCPrefix.h PREFIX_LANGUAGES OBJCXX)
 

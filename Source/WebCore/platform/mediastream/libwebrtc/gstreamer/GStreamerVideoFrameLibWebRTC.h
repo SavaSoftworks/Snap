@@ -22,40 +22,55 @@
 
 #if USE(GSTREAMER) && USE(LIBWEBRTC)
 
+#include "FloatRect.h"
 #include "GStreamerCommon.h"
+#include "IntSize.h"
 #include "LibWebRTCMacros.h"
 #include "webrtc/api/video/i420_buffer.h"
 #include "webrtc/api/video/video_frame.h"
 #include "webrtc/common_video/include/video_frame_buffer.h"
 #include "webrtc/rtc_base/ref_counted_object.h"
+#include <optional>
+#include <wtf/Lock.h>
 
 namespace WebCore {
 
-[[nodiscard]] GRefPtr<GstSample> convertLibWebRTCVideoFrameToGStreamerSample(const webrtc::VideoFrame&);
+[[nodiscard]] GRefPtr<GstSample> convertLibWebRTCVideoFrameToGStreamerSample(const webrtc::VideoFrame&, bool acceptsDMABuf = false);
 
-webrtc::VideoFrame convertGStreamerSampleToLibWebRTCVideoFrame(GRefPtr<GstSample>&&, uint32_t rtpTimestamp);
+std::optional<webrtc::VideoFrame> convertGStreamerSampleToLibWebRTCVideoFrame(GRefPtr<GstSample>&&, uint32_t rtpTimestamp);
 
 class GStreamerVideoFrameLibWebRTC : public webrtc::RefCountedObject<webrtc::VideoFrameBuffer> {
 public:
+    enum class MemoryType : uint8_t { System,
+        DMABuf,
+        GL,
+        Other };
+
     static webrtc::scoped_refptr<webrtc::VideoFrameBuffer> create(GRefPtr<GstSample>&&);
+    static webrtc::scoped_refptr<webrtc::VideoFrameBuffer> createScaled(GRefPtr<GstSample>&&, IntSize);
 
     const GRefPtr<GstSample>& sample() const LIFETIME_BOUND { return m_sample; }
+    MemoryType memoryType() const { return m_memoryType; }
+    bool isCropped() const;
+    bool isScaled() const;
 
-    // webrtc::VideoFrameBuffer interface.
     webrtc::scoped_refptr<webrtc::I420BufferInterface> ToI420() final;
-    int width() const final { return GST_VIDEO_INFO_WIDTH(&m_info); }
-    int height() const final { return GST_VIDEO_INFO_HEIGHT(&m_info); }
+    webrtc::scoped_refptr<webrtc::VideoFrameBuffer> CropAndScale(int offsetX, int offsetY, int cropWidth, int cropHeight, int scaledWidth, int scaledHeight) final;
+    int width() const final { return m_scaledSize.width(); }
+    int height() const final { return m_scaledSize.height(); }
 
 private:
-    GStreamerVideoFrameLibWebRTC(GRefPtr<GstSample>&& sample, GstVideoInfo&& info)
-        : m_sample(WTF::move(sample))
-        , m_info(WTF::move(info))
-    {
-    }
+    GStreamerVideoFrameLibWebRTC(GRefPtr<GstSample>&&, MemoryType, IntSize sourceSize, FloatRect visibleRect, IntSize scaledSize);
     webrtc::VideoFrameBuffer::Type type() const final { return Type::kNative; }
+    webrtc::scoped_refptr<webrtc::I420BufferInterface> copyToI420();
 
     GRefPtr<GstSample> m_sample;
-    GstVideoInfo m_info;
+    MemoryType m_memoryType;
+    IntSize m_sourceSize;
+    FloatRect m_visibleRect;
+    IntSize m_scaledSize;
+    Lock m_i420Lock;
+    webrtc::scoped_refptr<webrtc::I420BufferInterface> m_i420Buffer WTF_GUARDED_BY_LOCK(m_i420Lock);
 };
 
 } // namespace WebCore

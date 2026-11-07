@@ -42,12 +42,12 @@ bool WebRTCProvider::webRTCAvailable()
 
 std::unique_ptr<webrtc::VideoDecoderFactory> LibWebRTCProviderGStreamer::createDecoderFactory()
 {
-    return makeUnique<GStreamerVideoDecoderFactory>(isSupportingVP9Profile0(), isSupportingVP9Profile2());
+    return makeUnique<GStreamerVideoDecoderFactory>(isSupportingVP9Profile0(), isSupportingVP9Profile2(), isSupportingAV1());
 }
 
 std::unique_ptr<webrtc::VideoEncoderFactory> LibWebRTCProviderGStreamer::createEncoderFactory()
 {
-    return makeUnique<GStreamerVideoEncoderFactory>(isSupportingVP9Profile0(), isSupportingVP9Profile2());
+    return makeUnique<GStreamerVideoEncoderFactory>(isSupportingVP9Profile0(), isSupportingVP9Profile2(), isSupportingAV1());
 }
 
 } // namespace WebCore

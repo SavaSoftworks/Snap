@@ -78,7 +78,11 @@ void RealtimeIncomingVideoSourceLibWebRTC::OnFrame(const webrtc::VideoFrame& fra
     GST_TRACE("Handling incoming video frame");
 #endif
 
-    auto sample = convertLibWebRTCVideoFrameToGStreamerSample(frame);
+    auto sample = convertLibWebRTCVideoFrameToGStreamerSample(frame, true);
+    if (!sample) [[unlikely]] {
+        GST_WARNING("Dropping an incoming %dx%d frame that could not be wrapped", frame.width(), frame.height());
+        return;
+    }
     VideoFrameGStreamer::CreateOptions options;
     options.timeMetadata = std::make_optional(metadataFromVideoFrame(frame));
     options.presentationTime = MediaTime(frame.timestamp_us(), G_USEC_PER_SEC);

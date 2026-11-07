@@ -50,18 +50,16 @@ int32_t LibWebRTCAudioModule::RegisterAudioCallback(webrtc::AudioTransport* audi
 {
     RELEASE_LOG(WebRTC, "LibWebRTCAudioModule::RegisterAudioCallback %d", !!audioTransport);
 
+    Locker locker { m_audioTransportLock };
     m_audioTransport = audioTransport;
     return 0;
 }
 
 int32_t LibWebRTCAudioModule::StartPlayout()
 {
-    RELEASE_LOG(WebRTC, "LibWebRTCAudioModule::StartPlayout %d", m_isPlaying);
-
-    if (m_isPlaying)
+    RELEASE_LOG(WebRTC, "LibWebRTCAudioModule::StartPlayout %d", m_isPlaying.load());
+    if (m_isPlaying.exchange(true))
         return 0;
-
-    m_isPlaying = true;
     callOnMainThread([this, protectedThis = Ref { *this }] {
         m_logTimer.startRepeating(logTimerInterval);
     });
@@ -78,9 +76,11 @@ int32_t LibWebRTCAudioModule::StartPlayout()
 
 int32_t LibWebRTCAudioModule::StopPlayout()
 {
-    RELEASE_LOG(WebRTC, "LibWebRTCAudioModule::StopPlayout %d", m_isPlaying);
+    RELEASE_LOG(WebRTC, "LibWebRTCAudioModule::StopPlayout %d", m_isPlaying.load());
 
     m_isPlaying = false;
+    if (!m_queue->isCurrent())
+        m_queue->dispatchSync([] { });
     callOnMainThread([this, protectedThis = Ref { *this }] {
         m_logTimer.stop();
     });
@@ -120,9 +120,8 @@ void LibWebRTCAudioModule::pollAudioData()
     };
 
     {
-        // For performance reasons, we forbid heap allocations while doing rendering on the webrtc audio thread.
+        Locker locker { m_audioTransportLock };
         ForbidMallocUseForCurrentThreadScope forbidMallocUse;
-
         pollFromSource();
     }
     m_queue->dispatchAfter(computeDelayUntilNextPolling(), WTF::move(nextPollFunction));

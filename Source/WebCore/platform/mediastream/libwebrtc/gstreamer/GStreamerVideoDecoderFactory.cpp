@@ -30,7 +30,12 @@
 #include "IntSize.h"
 #include "LibWebRTCUtils.h"
 #include "webrtc/modules/video_coding/codecs/vp8/libvpx_vp8_decoder.h"
+#include "webrtc/modules/video_coding/codecs/vp9/include/vp9.h"
+#if USE(LIBWEBRTC_AV1)
+#include "webrtc/api/video_codecs/video_decoder_factory_template_dav1d_adapter.h"
+#endif
 #include "webrtc/modules/video_coding/include/video_error_codes.h"
+#include <atomic>
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/video/video.h>
@@ -48,11 +53,7 @@ WTF_MAKE_TZONE_ALLOCATED_IMPL(GStreamerVideoDecoderFactory);
 
 class GStreamerWebRTCVideoDecoder : public webrtc::VideoDecoder {
 public:
-    GStreamerWebRTCVideoDecoder()
-        : m_requireParse(false)
-        , m_needsKeyframe(true)
-    {
-    }
+    GStreamerWebRTCVideoDecoder() = default;
 
     static void decodebinPadAddedCb(GstElement*, GstPad* srcPad, GstPad* sinkPad)
     {
@@ -153,12 +154,12 @@ public:
         gst_bin_add_many(GST_BIN(pipeline()), m_src.get(), decoder, m_sink.get(), nullptr);
         if (!gst_element_link(m_src.get(), decoder)) {
             GST_ERROR_OBJECT(pipeline(), "Could not link src to decoder.");
-            return WEBRTC_VIDEO_CODEC_ERROR;
+            return false;
         }
 
         if (gst_element_set_state(pipeline(), GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
             GST_ERROR_OBJECT(pipeline(), "Could not set state to PLAYING.");
-            return WEBRTC_VIDEO_CODEC_ERROR;
+            return false;
         }
 
         return true;
@@ -237,7 +238,7 @@ public:
             return WEBRTC_VIDEO_CODEC_ERROR;
         }
 
-        GRefPtr pulledSample = adoptGRef(gst_app_sink_try_pull_sample(GST_APP_SINK_CAST(m_sink.get()), GST_SECOND));
+        GRefPtr pulledSample = adoptGRef(gst_app_sink_try_pull_sample(GST_APP_SINK_CAST(m_sink.get()), 200 * GST_MSECOND));
         if (!pulledSample) {
             GST_WARNING_OBJECT(pipeline(), "No decoded frame within timeout");
             return WEBRTC_VIDEO_CODEC_OK;
@@ -255,8 +256,15 @@ public:
         }
         GST_TRACE_OBJECT(pipeline(), "Pulled video frame with RTP timestamp %u from %" GST_PTR_FORMAT, rtpTimestamp, pulledBuffer);
         auto frame = convertGStreamerSampleToLibWebRTCVideoFrame(WTF::move(pulledSample), rtpTimestamp);
+        if (!frame) {
+            GST_WARNING_OBJECT(pipeline(), "Unable to wrap the decoded frame, requesting a key frame");
+            m_needsKeyframe = true;
+            return WEBRTC_VIDEO_CODEC_ERROR;
+        }
 
-        m_imageReadyCb->Decoded(frame);
+        if (!m_imageReadyCb)
+            return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
+        m_imageReadyCb->Decoded(*frame);
         return WEBRTC_VIDEO_CODEC_OK;
     }
 
@@ -296,7 +304,7 @@ protected:
     GRefPtr<GstCaps> m_caps;
     IntSize m_size;
     bool m_requireParse = false;
-    bool m_needsKeyframe;
+    std::atomic<bool> m_needsKeyframe { true };
 
 private:
     GRefPtr<GstElement> m_pipeline;
@@ -304,7 +312,7 @@ private:
     GRefPtr<GstElement> m_src;
     GRefPtr<GstCaps> m_rtpTimestampCaps;
 
-    webrtc::DecodedImageCallback* m_imageReadyCb;
+    webrtc::DecodedImageCallback* m_imageReadyCb { nullptr };
 };
 
 class H264Decoder : public GStreamerWebRTCVideoDecoder {
@@ -321,7 +329,7 @@ public:
     bool Configure(const webrtc::VideoDecoder::Settings& codecSettings) final
     {
         if (codecSettings.codec_type() != webrtc::kVideoCodecH264)
-            return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
+            return false;
 
         return GStreamerWebRTCVideoDecoder::Configure(codecSettings);
     }
@@ -402,21 +410,25 @@ private:
 std::unique_ptr<webrtc::VideoDecoder> GStreamerVideoDecoderFactory::Create(const webrtc::Environment& environment, const webrtc::SdpVideoFormat& format)
 {
     auto formatName = fromStdString(format.name);
-    // Check format ignoring ascii case, see also: webrtc/video-lowercase-media-subtype.html.
     if (WTF::equalLettersIgnoringASCIICase(formatName, "h264"_s))
         return std::unique_ptr<webrtc::VideoDecoder>(new H264Decoder());
     if (WTF::equalLettersIgnoringASCIICase(formatName, "vp8"_s))
-        return VP8Decoder::Create(environment);
+        return std::make_unique<webrtc::LibvpxVp8Decoder>(environment);
     if (WTF::equalLettersIgnoringASCIICase(formatName, "vp9"_s))
-        return VP9Decoder::Create();
+        return webrtc::VP9Decoder::Create();
+#if USE(LIBWEBRTC_AV1)
+    if (m_isSupportingAV1 && WTF::equalLettersIgnoringASCIICase(formatName, "av1"_s))
+        return webrtc::CreateDav1dDecoder(environment);
+#endif
 
     GST_ERROR("Could not create decoder for %s", formatName.ascii().data());
     return nullptr;
 }
 
-GStreamerVideoDecoderFactory::GStreamerVideoDecoderFactory(bool isSupportingVP9Profile0, bool isSupportingVP9Profile2)
+GStreamerVideoDecoderFactory::GStreamerVideoDecoderFactory(bool isSupportingVP9Profile0, bool isSupportingVP9Profile2, bool isSupportingAV1)
     : m_isSupportingVP9Profile0(isSupportingVP9Profile0)
     , m_isSupportingVP9Profile2(isSupportingVP9Profile2)
+    , m_isSupportingAV1(isSupportingAV1)
 {
     ensureGStreamerInitialized();
 
@@ -425,14 +437,21 @@ GStreamerVideoDecoderFactory::GStreamerVideoDecoderFactory(bool isSupportingVP9P
         GST_DEBUG_CATEGORY_INIT(webkit_webrtcdec_debug, "webkitlibwebrtcvideodecoder", 0, "WebKit WebRTC video decoder");
     });
 }
+
 std::vector<webrtc::SdpVideoFormat> GStreamerVideoDecoderFactory::GetSupportedFormats() const
 {
-    std::vector<webrtc::SdpVideoFormat> formats;
-
-    VP8Decoder().addDecoderIfSupported(formats);
-    VP9Decoder(m_isSupportingVP9Profile0, m_isSupportingVP9Profile2).addDecoderIfSupported(formats);
+    std::vector<webrtc::SdpVideoFormat> formats { webrtc::SdpVideoFormat::VP8() };
     H264Decoder().addDecoderIfSupported(formats);
-
+#if USE(LIBWEBRTC_AV1)
+    if (m_isSupportingAV1) {
+        for (auto& format : webrtc::Dav1dDecoderTemplateAdapter::SupportedFormats())
+            formats.push_back(WTF::move(format));
+    }
+#endif
+    if (m_isSupportingVP9Profile0)
+        formats.push_back(webrtc::SdpVideoFormat::VP9Profile0());
+    if (m_isSupportingVP9Profile2)
+        formats.push_back(webrtc::SdpVideoFormat::VP9Profile2());
     return formats;
 }
 
