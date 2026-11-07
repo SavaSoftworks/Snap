@@ -425,6 +425,20 @@ webkit_web_context_get_use_system_appearance_for_scrollbars (WebKitWebContext   
 WEBKIT_API const gchar*
 webkit_web_context_get_time_zone_override           (WebKitWebContext              *context);
 
+#if ENABLE(2022_GLIB_API)
+WEBKIT_API void
+webkit_web_context_set_automatic_process_warming_enabled(WebKitWebContext*, gboolean);
+
+WEBKIT_API gboolean
+webkit_web_context_get_automatic_process_warming_enabled(WebKitWebContext*);
+
+WEBKIT_API gboolean
+webkit_web_context_prewarm_web_process(WebKitWebContext*, WebKitNetworkSession*);
+
+WEBKIT_API guint64
+webkit_web_context_get_prewarmed_web_process_identifier(WebKitWebContext*);
+#endif
+
 G_END_DECLS
 
 #endif

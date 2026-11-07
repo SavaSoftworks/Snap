@@ -438,6 +438,7 @@ static void webkitWebContextConstructed(GObject* object)
     Ref configuration = API::ProcessPoolConfiguration::create();
     configuration->setInjectedBundlePath(FileSystem::stringFromFileSystemRepresentation(bundleFilename.get()));
     configuration->setUsesWebProcessCache(true);
+    configuration->setIsAutomaticProcessWarmingEnabled(true);
 #if PLATFORM(GTK) && !USE(GTK4)
     configuration->setProcessSwapsOnNavigation(priv->psonEnabled);
 #else
@@ -2049,3 +2050,39 @@ WebKitWebView* webkitWebContextGetWebViewForPage(WebKitWebContext* context, WebP
 {
     return page ? context->priv->webViews.get(page->identifier()) : nullptr;
 }
+
+#if ENABLE(2022_GLIB_API)
+void webkit_web_context_set_automatic_process_warming_enabled(WebKitWebContext* context, gboolean enabled)
+{
+    g_return_if_fail(WEBKIT_IS_WEB_CONTEXT(context));
+    auto& pool = *context->priv->processPool;
+    pool.configuration().setIsAutomaticProcessWarmingEnabled(enabled);
+    if (!enabled) {
+        pool.clearPrewarmedProcesses();
+    }
+}
+
+gboolean webkit_web_context_get_automatic_process_warming_enabled(WebKitWebContext* context)
+{
+    g_return_val_if_fail(WEBKIT_IS_WEB_CONTEXT(context), FALSE);
+    return context->priv->processPool->configuration().isAutomaticProcessWarmingEnabled();
+}
+
+gboolean webkit_web_context_prewarm_web_process(WebKitWebContext* context, WebKitNetworkSession* session)
+{
+    g_return_val_if_fail(WEBKIT_IS_WEB_CONTEXT(context), FALSE);
+    g_return_val_if_fail(WEBKIT_IS_NETWORK_SESSION(session), FALSE);
+    auto& store = webkitWebsiteDataManagerGetDataStore(webkit_network_session_get_website_data_manager(session));
+    return context->priv->processPool->prewarmProcessForDataStore(store);
+}
+
+guint64 webkit_web_context_get_prewarmed_web_process_identifier(WebKitWebContext* context)
+{
+    g_return_val_if_fail(WEBKIT_IS_WEB_CONTEXT(context), 0);
+    auto identifiers = context->priv->processPool->prewarmedProcessIdentifiers();
+    if (identifiers.isEmpty()) {
+        return 0;
+    }
+    return *identifiers.begin();
+}
+#endif

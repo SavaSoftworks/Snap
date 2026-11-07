@@ -431,6 +431,7 @@ public:
     // Called when the web process has crashed or we know that it will terminate soon.
     // Will potentially cause the WebProcessProxy object to be freed.
     void shutDown();
+    bool isShuttingDown() const { return m_isShuttingDown; }
 
     enum ShutdownPreventingScopeType { };
     using ShutdownPreventingScopeCounter = RefCounter<ShutdownPreventingScopeType>;

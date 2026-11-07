@@ -334,6 +334,8 @@ public:
         WebProcessProxy::LockdownMode, EnhancedSecurity, const API::PageConfiguration&, WebCore::ProcessSwapDisposition); // Will return an existing one if limit is met or due to caching.
 
     void prewarmProcess();
+    bool prewarmProcessForDataStore(WebsiteDataStore&);
+    void clearPrewarmedProcesses();
 
     bool NODELETE shouldTerminate(WebProcessProxy&);
 
@@ -629,6 +631,7 @@ public:
     bool hasUsedSiteIsolation() const { return m_hasUsedSiteIsolation; }
 
     unsigned prewarmedProcessCountLimit() const;
+    unsigned livePrewarmedProcessCount() const;
 
 private:
     enum class NeedsGlobalStaticInitialization : bool { No, Yes };
@@ -774,6 +777,7 @@ private:
 
     Vector<Ref<WebProcessProxy>> m_processes;
     WeakHashSet<WebProcessProxy> m_prewarmedProcesses;
+    RefPtr<WebsiteDataStore> m_prewarmingDataStore;
 
     bool m_hasUsedSiteIsolation { false };
 

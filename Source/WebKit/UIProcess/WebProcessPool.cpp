@@ -858,6 +858,14 @@ RefPtr<WebProcessProxy> WebProcessPool::tryTakePrewarmedProcess(WebsiteDataStore
     RefPtr<WebProcessProxy> prewarmedProcess;
 
     for (Ref process : m_prewarmedProcesses) {
+        if (m_prewarmingDataStore && process->websiteDataStore() != &websiteDataStore) {
+            continue;
+        }
+#if PLATFORM(GTK) || PLATFORM(WPE)
+        if (m_sandboxEnabled && !m_prewarmingDataStore) {
+            continue;
+        }
+#endif
         if (process->lockdownMode() != lockdownMode || process->enhancedSecurity() != enhancedSecurity)
             continue;
 
@@ -886,12 +894,14 @@ RefPtr<WebProcessProxy> WebProcessPool::tryTakePrewarmedProcess(WebsiteDataStore
 #if PLATFORM(GTK) || PLATFORM(WPE)
     // In platforms using Bubblewrap for sandboxing, prewarmed process is launched using the WebProcessPool primary WebsiteDataStore,
     // so we don't use it in case of using a different WebsiteDataStore.
-    if (m_sandboxEnabled)
+    if (m_sandboxEnabled && !m_prewarmingDataStore)
         return nullptr;
 #endif
 
     ASSERT(prewarmedProcess->isPrewarmed());
-    prewarmedProcess->setWebsiteDataStore(websiteDataStore);
+    if (!m_prewarmingDataStore) {
+        prewarmedProcess->setWebsiteDataStore(websiteDataStore);
+    }
     prewarmedProcess->markIsNoLongerInPrewarmedPool();
 
     return prewarmedProcess;
@@ -1114,9 +1124,51 @@ void WebProcessPool::initializeNewWebProcess(WebProcessProxy& process, WebsiteDa
     registerHighDynamicRangeChangeCallback();
 }
 
+bool WebProcessPool::prewarmProcessForDataStore(WebsiteDataStore& dataStore)
+{
+    if (m_prewarmingDataStore && m_prewarmingDataStore.get() != &dataStore) {
+        return false;
+    }
+    if (!configuration().isAutomaticProcessWarmingEnabled()
+        || !configuration().processSwapsOnNavigation() || usesSingleWebProcess()) {
+        return false;
+    }
+    if (!m_prewarmingDataStore) {
+        clearPrewarmedProcesses();
+        m_prewarmingDataStore = &dataStore;
+    }
+    for (WeakPtr maybeProcess : copyToVector(m_prewarmedProcesses)) {
+        if (RefPtr process = maybeProcess.get(); process && !process->isShuttingDown() && process->wasTerminated()) {
+            process->shutDown();
+        }
+    }
+    prewarmProcess();
+    return livePrewarmedProcessCount() > 0;
+}
+
+void WebProcessPool::clearPrewarmedProcesses()
+{
+    for (WeakPtr maybeProcess : copyToVector(m_prewarmedProcesses)) {
+        if (RefPtr process = maybeProcess.get()) {
+            process->shutDown();
+        }
+    }
+}
+
 void WebProcessPool::prewarmProcess()
 {
-    if (m_prewarmedProcesses.computeSize() >= prewarmedProcessCountLimit())
+    if (MemoryPressureHandler::singleton().isUnderMemoryPressure()) {
+        return;
+    }
+    if (m_prewarmingDataStore && !configuration().isAutomaticProcessWarmingEnabled()) {
+        return;
+    }
+#if PLATFORM(GTK) || PLATFORM(WPE)
+    if (m_sandboxEnabled && !m_prewarmingDataStore) {
+        return;
+    }
+#endif
+    if (livePrewarmedProcessCount() >= prewarmedProcessCountLimit())
         return;
 
     if (WebProcessProxy::hasReachedProcessCountLimit()) {
@@ -1128,7 +1180,7 @@ void WebProcessPool::prewarmProcess()
 
     auto lockdownMode = lockdownModeEnabledBySystem() ? WebProcessProxy::LockdownMode::Enabled : WebProcessProxy::LockdownMode::Disabled;
     auto enhancedSecurity = EnhancedSecurity::Disabled;
-    createNewWebProcess(nullptr, lockdownMode, enhancedSecurity, WebProcessProxy::EnableWebAssemblyDebugger::No, WebProcessProxy::IsPrewarmed::Yes);
+    createNewWebProcess(m_prewarmingDataStore.get(), lockdownMode, enhancedSecurity, WebProcessProxy::EnableWebAssemblyDebugger::No, WebProcessProxy::IsPrewarmed::Yes);
 }
 
 void WebProcessPool::enableProcessTermination()
@@ -1200,7 +1252,7 @@ void WebProcessPool::processDidFinishLaunching(WebProcessProxy& process)
 #endif
 
     // Continue spawning prewarmed processes until we hit the prewarmed process limit.
-    if (process.isPrewarmed() && m_prewarmedProcesses.computeSize() < prewarmedProcessCountLimit()) {
+    if (process.isPrewarmed() && livePrewarmedProcessCount() < prewarmedProcessCountLimit()) {
 #if PLATFORM(COCOA)
         static Seconds prewarmedLaunchInterval = []() {
             auto value = CFPreferencesGetAppIntegerValue(CFSTR("DebugWebProcessPoolPrewarmingIntervalMillis"), kCFPreferencesCurrentApplication, nullptr);
@@ -1550,6 +1602,8 @@ HashSet<ProcessID> WebProcessPool::prewarmedProcessIdentifiers()
 {
     HashSet<ProcessID> pids;
     for (Ref process : m_prewarmedProcesses) {
+        if (process->isShuttingDown() || process->state() != AuxiliaryProcessProxy::State::Running || process->wasTerminated())
+            continue;
         if (auto pid = process->processID())
             pids.add(pid);
     }
@@ -2148,8 +2202,23 @@ void WebProcessPool::removeProcessFromOriginCacheSet(WebProcessProxy& process)
     });
 }
 
+unsigned WebProcessPool::livePrewarmedProcessCount() const
+{
+    unsigned count = 0;
+    for (Ref process : m_prewarmedProcesses) {
+        if (!process->isShuttingDown()
+            && process->state() != AuxiliaryProcessProxy::State::Terminated && !process->wasTerminated()) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 unsigned WebProcessPool::prewarmedProcessCountLimit() const
 {
+    if (m_prewarmingDataStore) {
+        return 1;
+    }
 #if PLATFORM(COCOA)
     static unsigned processCountLimitFromPreferences = []() {
         return static_cast<unsigned>(CFPreferencesGetAppIntegerValue(CFSTR("DebugWebProcessPoolPrewarmedProcessCountLimit"), kCFPreferencesCurrentApplication, nullptr));
