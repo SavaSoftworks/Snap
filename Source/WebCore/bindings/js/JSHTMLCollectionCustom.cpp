@@ -20,35 +20,138 @@
 #include "config.h"
 #include "JSHTMLCollection.h"
 
+#include "DOMWrapperWorld.h"
+#include "Document.h"
+#include "DocumentQuirks.h"
+#include "Element.h"
 #include "HTMLCollectionInlines.h"
+#include "JSDOMAbstractOperations.h"
 #include "JSDOMBinding.h"
-#include "JSHTMLAllCollection.h"
-#include "JSHTMLFormControlsCollection.h"
-#include "JSHTMLOptionsCollection.h"
-
+#include "JSDOMConvertInterface.h"
+#include "JSDOMConvertNullable.h"
+#include "JSDOMExceptionHandling.h"
+#include "JSDOMGlobalObject.h"
+#include "JSElement.h"
+#include "ScriptExecutionContext.h"
+#include <JavaScriptCore/IndexingType.h>
 
 namespace WebCore {
 using namespace JSC;
 
-JSValue toJSNewlyCreated(JSGlobalObject*, JSDOMGlobalObject* globalObject, Ref<HTMLCollection>&& collection)
+static bool getHTMLCollectionOwnProperty(JSObject* object, JSGlobalObject* lexicalGlobalObject, PropertyName propertyName, PropertySlot& slot, bool ignoreNamedProperties)
 {
-    switch (collection->type()) {
-    case CollectionType::FormControls:
-        return createWrapper<HTMLFormControlsCollection>(globalObject, WTF::move(collection));
-    case CollectionType::SelectOptions:
-        return createWrapper<HTMLOptionsCollection>(globalObject, WTF::move(collection));
-    case CollectionType::DocAll:
-        return createWrapper<HTMLAllCollection>(globalObject, WTF::move(collection));
-    default:
-        break;
+    auto throwScope = DECLARE_THROW_SCOPE(JSC::getVM(lexicalGlobalObject));
+    auto* thisObject = uncheckedDowncast<JSHTMLCollection>(object);
+    ASSERT_GC_OBJECT_INHERITS(thisObject, JSHTMLCollection::info());
+    if (auto index = parseIndex(propertyName)) {
+        if (auto item = thisObject->wrapped().item(index.value()); !!item) [[likely]] {
+            auto value = toJS<IDLNullable<IDLInterface<Element>>>(*lexicalGlobalObject, *thisObject->realm(), throwScope, IDLNullable<IDLInterface<Element>>::extractValueFromNullable(WTF::move(item)));
+            RETURN_IF_EXCEPTION(throwScope, false);
+            slot.setValue(thisObject, static_cast<unsigned>(JSC::PropertyAttribute::ReadOnly), value);
+            return true;
+        }
+        if (!hasIndexedProperties(thisObject->indexingType()))
+            return false;
+        return WebCore::getOwnPropertySlot(object, lexicalGlobalObject, propertyName, slot);
     }
-
-    return createWrapper<HTMLCollection>(globalObject, WTF::move(collection));
+    if (!ignoreNamedProperties) {
+        using GetterIDLType = IDLInterface<Element>;
+        auto getterFunctor = visibleNamedPropertyItemAccessorFunctor<GetterIDLType, JSHTMLCollection>([](JSHTMLCollection& thisObject, PropertyName propertyName) -> decltype(auto) {
+            return thisObject.wrapped().namedItem(propertyNameToAtomString(propertyName));
+        });
+        if (auto namedProperty = accessVisibleNamedProperty<LegacyOverrideBuiltIns::No>(*lexicalGlobalObject, *thisObject, propertyName, getterFunctor)) {
+            auto value = toJS<IDLNullable<IDLInterface<Element>>>(*lexicalGlobalObject, *thisObject->realm(), throwScope, WTF::move(namedProperty.value()));
+            RETURN_IF_EXCEPTION(throwScope, false);
+            slot.setValue(thisObject, JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum, value);
+            return true;
+        }
+    }
+    return WebCore::getOwnPropertySlot(object, lexicalGlobalObject, propertyName, slot);
 }
 
-JSValue toJS(JSGlobalObject* lexicalGlobalObject, JSDOMGlobalObject* globalObject, HTMLCollection& collection)
+bool JSHTMLCollection::getOwnPropertySlot(JSObject* object, JSGlobalObject* lexicalGlobalObject, PropertyName propertyName, PropertySlot& slot)
 {
-    return wrap(lexicalGlobalObject, globalObject, collection);
+    bool ignoreNamedProperties = false;
+    return getHTMLCollectionOwnProperty(object, lexicalGlobalObject, propertyName, slot, ignoreNamedProperties);
+}
+
+bool JSHTMLCollection::getOwnPropertySlotByIndex(JSObject* object, JSGlobalObject* lexicalGlobalObject, unsigned index, PropertySlot& slot)
+{
+    SUPPRESS_UNCOUNTED_LOCAL auto& vm = JSC::getVM(lexicalGlobalObject);
+    auto* thisObject = uncheckedDowncast<JSHTMLCollection>(object);
+    ASSERT_GC_OBJECT_INHERITS(thisObject, info());
+    if (index <= MAX_ARRAY_INDEX) [[likely]] {
+        auto throwScope = DECLARE_THROW_SCOPE(vm);
+        if (auto item = thisObject->wrapped().item(index); !!item) [[likely]] {
+            auto value = toJS<IDLNullable<IDLInterface<Element>>>(*lexicalGlobalObject, *thisObject->realm(), throwScope, IDLNullable<IDLInterface<Element>>::extractValueFromNullable(WTF::move(item)));
+            RETURN_IF_EXCEPTION(throwScope, false);
+            slot.setValue(thisObject, static_cast<unsigned>(JSC::PropertyAttribute::ReadOnly), value);
+            return true;
+        }
+        if (!hasIndexedProperties(thisObject->indexingType()))
+            return false;
+        return JSObject::getOwnPropertySlotByIndex(object, lexicalGlobalObject, index, slot);
+    }
+    auto propertyName = Identifier::from(vm, index);
+    auto throwScope = DECLARE_THROW_SCOPE(vm);
+    using GetterIDLType = IDLInterface<Element>;
+    auto getterFunctor = visibleNamedPropertyItemAccessorFunctor<GetterIDLType, JSHTMLCollection>([](JSHTMLCollection& thisObject, PropertyName propertyName) -> decltype(auto) {
+        return thisObject.wrapped().namedItem(propertyNameToAtomString(propertyName));
+    });
+    if (auto namedProperty = accessVisibleNamedProperty<LegacyOverrideBuiltIns::No>(*lexicalGlobalObject, *thisObject, propertyName, getterFunctor)) {
+        auto value = toJS<IDLNullable<IDLInterface<Element>>>(*lexicalGlobalObject, *thisObject->realm(), throwScope, WTF::move(namedProperty.value()));
+        RETURN_IF_EXCEPTION(throwScope, false);
+        slot.setValue(thisObject, JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::DontEnum, value);
+        return true;
+    }
+    return JSObject::getOwnPropertySlotByIndex(object, lexicalGlobalObject, index, slot);
+}
+
+bool JSHTMLCollection::put(JSCell* cell, JSGlobalObject* lexicalGlobalObject, PropertyName propertyName, JSValue value, PutPropertySlot& putPropertySlot)
+{
+    auto* thisObject = uncheckedDowncast<JSHTMLCollection>(cell);
+    ASSERT_GC_OBJECT_INHERITS(thisObject, info());
+
+    if (thisObject != putPropertySlot.thisValue()) [[unlikely]]
+        return JSObject::put(thisObject, lexicalGlobalObject, propertyName, value, putPropertySlot);
+
+    if (auto* document = dynamicDowncast<Document>(dynamicDowncast<JSDOMGlobalObject>(lexicalGlobalObject)->scriptExecutionContext())) {
+        if (document->quirks().needsConfigurableIndexedPropertiesQuirk()) [[unlikely]]
+            return JSObject::put(thisObject, lexicalGlobalObject, propertyName, value, putPropertySlot);
+    }
+
+    auto throwScope = DECLARE_THROW_SCOPE(lexicalGlobalObject->vm());
+
+    throwScope.assertNoException();
+    PropertyDescriptor ownDescriptor;
+    PropertySlot slot(thisObject, PropertySlot::InternalMethodType::GetOwnProperty);
+    bool ignoreNamedProperties = true;
+    bool hasOwnProperty = getHTMLCollectionOwnProperty(thisObject, lexicalGlobalObject, propertyName, slot, ignoreNamedProperties);
+    RETURN_IF_EXCEPTION(throwScope, false);
+    if (hasOwnProperty) {
+        ownDescriptor.setPropertySlot(lexicalGlobalObject, propertyName, slot);
+        RETURN_IF_EXCEPTION(throwScope, false);
+    }
+    RELEASE_AND_RETURN(throwScope, ordinarySetWithOwnDescriptor(lexicalGlobalObject, thisObject, propertyName, value, putPropertySlot.thisValue(), WTF::move(ownDescriptor), putPropertySlot.isStrictMode()));
+}
+
+bool JSHTMLCollection::putByIndex(JSCell* cell, JSGlobalObject* lexicalGlobalObject, unsigned index, JSValue value, bool shouldThrow)
+{
+    if (auto* document = dynamicDowncast<Document>(dynamicDowncast<JSDOMGlobalObject>(lexicalGlobalObject)->scriptExecutionContext())) {
+        if (document->quirks().needsConfigurableIndexedPropertiesQuirk()) [[unlikely]]
+            return JSObject::putByIndex(cell, lexicalGlobalObject, index, value, shouldThrow);
+    }
+
+    auto* thisObject = uncheckedDowncast<JSHTMLCollection>(cell);
+    ASSERT_GC_OBJECT_INHERITS(thisObject, info());
+
+    SUPPRESS_UNCOUNTED_LOCAL auto& vm = JSC::getVM(lexicalGlobalObject);
+    auto throwScope = DECLARE_THROW_SCOPE(vm);
+
+    throwScope.assertNoException();
+    auto propertyName = Identifier::from(vm, index);
+    PutPropertySlot putPropertySlot(thisObject, shouldThrow);
+    RELEASE_AND_RETURN(throwScope, ordinarySetSlow(lexicalGlobalObject, thisObject, propertyName, value, putPropertySlot.thisValue(), shouldThrow));
 }
 
 } // namespace WebCore

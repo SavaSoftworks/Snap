@@ -20,6 +20,8 @@
 
 [
     ExportToWrappedFunction,
+    CustomGetOwnPropertySlot,
+    CustomPut,
     GenerateIsReachable=ImplOwnerNodeRoot,
     LegacyUnenumerableNamedProperties,
     ReportExtraMemoryCost,
