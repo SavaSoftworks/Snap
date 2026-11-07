@@ -65,6 +65,9 @@ private:
     void computeIntrinsicLogicalWidthContributions() final;
 
     void updateValueNow() const;
+    void setCachedValue(int) const;
+    void clearCachedValue() const;
+    void willBeDestroyed() final;
     void usedCounterDirectivesChanged();
 
     SingleThreadWeakPtr<RenderListMarker> m_marker;

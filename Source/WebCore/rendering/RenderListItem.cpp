@@ -24,8 +24,9 @@
 #include "config.h"
 #include "RenderListItem.h"
 
-#include "ContainerNodeInlines.h"
 #include "CSSFontSelector.h"
+#include "ContainerNodeInlines.h"
+#include "Document.h"
 #include "ElementInlines.h"
 #include "ElementTraversal.h"
 #include "HTMLNames.h"
@@ -40,6 +41,10 @@
 #include "RenderView.h"
 #include "StyleComputedStyle+SettersInlines.h"
 #include "UnicodeBidi.h"
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <wtf/StackStats.h>
 #include <wtf/StdLibExtras.h>
 #include <wtf/TZoneMallocInlines.h>
@@ -47,6 +52,54 @@
 namespace WebCore {
 
 using namespace HTMLNames;
+
+static bool snapListRenumberingEnabled()
+{
+    static const bool enabled = [] {
+        const char* value = std::getenv("WEBKIT_SNAP_LIST_RENUMBERING");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+static bool snapListRenumberingDiagnosticsEnabled()
+{
+    static const bool enabled = [] {
+        const char* value = std::getenv("WEBKIT_SNAP_LIST_RENUMBERING_DIAGNOSTICS");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+static bool snapListRenumberingVerificationEnabled()
+{
+    static const bool enabled = [] {
+        const char* value = std::getenv("WEBKIT_SNAP_VERIFY_LIST_RENUMBERING");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+static unsigned snapListRenumberingDiagnosticEventIndex()
+{
+    static std::atomic<unsigned> eventCount { 0 };
+    constexpr unsigned eventLimit = 8192;
+    unsigned current = eventCount.load(std::memory_order_relaxed);
+    while (current <= eventLimit) {
+        if (eventCount.compare_exchange_weak(current, current + 1, std::memory_order_relaxed))
+            return current;
+    }
+    return eventLimit + 1;
+}
+
+static void reportSnapListRenumberingEvent(const char* outcome, unsigned examined)
+{
+    unsigned eventIndex = snapListRenumberingDiagnosticEventIndex();
+    if (eventIndex < 8192)
+        std::fprintf(stderr, "SNAP_LIST_RENUMBERING|outcome=%s|examined=%u\n", outcome, examined);
+    else if (eventIndex == 8192)
+        std::fprintf(stderr, "SNAP_LIST_RENUMBERING|truncated=1\n");
+}
 
 WTF_MAKE_TZONE_ALLOCATED_IMPL(RenderListItem);
 
@@ -226,6 +279,27 @@ int RenderListItem::startForReversedOrderedList(const HTMLOListElement& list)
     return list.start();
 }
 
+void RenderListItem::setCachedValue(int value) const
+{
+    if (!m_value)
+        document().incrementListItemsWithCachedValues();
+    m_value = value;
+}
+
+void RenderListItem::clearCachedValue() const
+{
+    if (!m_value)
+        return;
+    document().decrementListItemsWithCachedValues();
+    m_value = std::nullopt;
+}
+
+void RenderListItem::willBeDestroyed()
+{
+    clearCachedValue();
+    RenderBlockFlow::willBeDestroyed();
+}
+
 void RenderListItem::updateValueNow() const
 {
     RefPtr list = enclosingList(*this);
@@ -254,29 +328,28 @@ void RenderListItem::updateValueNow() const
         return previousValue + increment;
     };
 
-    auto& startValue = startItem->m_value;
-    if (!startValue) {
+    if (!startItem->m_value) {
         // Take in account enclosing list counter-reset.
         // FIXME: This can be a lot more simple when lists use presentational hints.
         if (list && list->renderer()) {
             auto listDirectives = list->renderer()->style().usedCounterDirectives().map.get("list-item"_s);
             if (listDirectives.resetValue)
-                startValue = *listDirectives.resetValue;
+                startItem->setCachedValue(*listDirectives.resetValue);
             else if (orderedList && orderedList->isReversed() && !orderedList->hasExplicitStart())
-                startValue = startForReversedOrderedList(*orderedList) - defaultIncrement;
+                startItem->setCachedValue(startForReversedOrderedList(*orderedList) - defaultIncrement);
             else
-                startValue = orderedList ? orderedList->start() - defaultIncrement : 0;
+                startItem->setCachedValue(orderedList ? orderedList->start() - defaultIncrement : 0);
         }
         auto directives = startItem->style().usedCounterDirectives().map.get("list-item"_s);
-        startValue = valueForItem(startValue.value_or(0), directives);
+        startItem->setCachedValue(valueForItem(startItem->m_value.value_or(0), directives));
     }
 
-    int value = *startValue;
+    int value = *startItem->m_value;
 
     for (auto* item = startItem; item != this; ) {
         item = nextListItem(*list, *item);
         auto directives = item->style().usedCounterDirectives().map.get("list-item"_s);
-        item->m_value = valueForItem(value, directives);
+        item->setCachedValue(valueForItem(value, directives));
         // counter-reset creates a new nested counter, so it should not be counted towards the current counter.
         if (!directives.resetValue)
             value = *item->m_value;
@@ -285,7 +358,7 @@ void RenderListItem::updateValueNow() const
 
 void RenderListItem::updateValue()
 {
-    m_value = std::nullopt;
+    clearCachedValue();
     if (m_marker)
         m_marker->setNeedsLayoutAndInvalidateContentLogicalWidths();
 }
@@ -355,10 +428,40 @@ void RenderListItem::updateListMarkerNumbers()
         isInReversedOrderedList = orderedList->isReversed();
     }
 
+    bool diagnosticsEnabled = snapListRenumberingDiagnosticsEnabled();
+    if (snapListRenumberingEnabled() && !document().listItemsWithCachedValues()) {
+        if (snapListRenumberingVerificationEnabled()) {
+            RELEASE_ASSERT(!m_value);
+            auto* verifiedItem = this;
+            unsigned verifiedItems = 1;
+            auto subsequentListItem = isInReversedOrderedList ? previousListItem : nextListItem;
+            while ((verifiedItem = subsequentListItem(*list, *verifiedItem))) {
+                RELEASE_ASSERT(!verifiedItem->m_value);
+                ++verifiedItems;
+            }
+            if (diagnosticsEnabled)
+                reportSnapListRenumberingEvent("verified-skip", verifiedItems);
+        }
+        if (diagnosticsEnabled)
+            reportSnapListRenumberingEvent("skip", 0);
+        return;
+    }
+
     // If an item has been marked for update before, we know that all following items have, too.
     // This gives us the opportunity to stop and avoid marking the same nodes again.
     auto* item = this;
     auto subsequentListItem = isInReversedOrderedList ? previousListItem : nextListItem;
+    if (diagnosticsEnabled) {
+        unsigned examined = 0;
+        while ((item = subsequentListItem(*list, *item))) {
+            ++examined;
+            if (!item->m_value)
+                break;
+            item->updateValue();
+        }
+        reportSnapListRenumberingEvent("scan", examined);
+        return;
+    }
     while ((item = subsequentListItem(*list, *item)) && item->m_value)
         item->updateValue();
 }

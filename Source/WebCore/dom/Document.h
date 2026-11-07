@@ -1652,6 +1652,13 @@ public:
     void addDisabledFieldsetElement() { m_disabledFieldsetElementsCount++; }
     void removeDisabledFieldsetElement() { ASSERT(m_disabledFieldsetElementsCount); m_disabledFieldsetElementsCount--; }
 
+    unsigned listItemsWithCachedValues() const { return m_listItemsWithCachedValues; }
+    void incrementListItemsWithCachedValues() { ++m_listItemsWithCachedValues; }
+    void decrementListItemsWithCachedValues()
+    {
+        ASSERT(m_listItemsWithCachedValues);
+        --m_listItemsWithCachedValues;
+    }
     bool hasDataListElements() const { return m_dataListElementCount; }
     void incrementDataListElementCount() { ++m_dataListElementCount; }
     void decrementDataListElementCount() { ASSERT(m_dataListElementCount); --m_dataListElementCount; }
@@ -2694,6 +2701,7 @@ private:
 
     unsigned m_disabledFieldsetElementsCount { 0 };
     unsigned m_dataListElementCount { 0 };
+    unsigned m_listItemsWithCachedValues { 0 };
 
     OptionSet<ListenerType> m_listenerTypes;
     MemoryCompactRobinHoodHashMap<AtomString, EventListenerCounts> m_eventListenerCounts;
