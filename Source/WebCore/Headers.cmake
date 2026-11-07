@@ -1251,6 +1251,7 @@ set(WebCore_PRIVATE_FRAMEWORK_HEADERS
     dom/ActiveDOMObject.h
     dom/AddEventListenerOptions.h
     dom/AsyncNodeDeletionQueue.h
+    dom/AsyncNodeDeletionQueueInlines.h
     dom/Attr.h
     dom/Attribute.h
     dom/BoundaryPoint.h
@@ -1417,6 +1418,7 @@ set(WebCore_PRIVATE_FRAMEWORK_HEADERS
     dom/SelectionType.h
     dom/SerializedNode.h
     dom/ShadowRoot.h
+    dom/ShadowRootInit.h
     dom/ShadowRootMode.h
     dom/SimpleRange.h
     dom/SimulatedClickOptions.h
