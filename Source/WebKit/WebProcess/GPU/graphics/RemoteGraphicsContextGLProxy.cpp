@@ -209,6 +209,10 @@ RefPtr<WebCore::VideoFrame> RemoteGraphicsContextGLProxy::surfaceBufferToVideoFr
     ASSERT(isMainRunLoop());
     if (isContextLost())
         return nullptr;
+#if USE(GSTREAMER)
+    UNUSED_PARAM(buffer);
+    return nullptr;
+#else
     auto sendResult = sendSync(Messages::RemoteGraphicsContextGL::SurfaceBufferToVideoFrame(buffer));
     if (!sendResult.succeeded()) {
         markContextLost();
@@ -218,6 +222,7 @@ RefPtr<WebCore::VideoFrame> RemoteGraphicsContextGLProxy::surfaceBufferToVideoFr
     if (!result)
         return nullptr;
     return RemoteVideoFrameProxy::create(WebProcess::singleton().ensureGPUProcessConnection().connection(), protect(protect(WebProcess::singleton().ensureGPUProcessConnection())->videoFrameObjectHeapProxy()), WTF::move(*result));
+#endif
 }
 #endif
 

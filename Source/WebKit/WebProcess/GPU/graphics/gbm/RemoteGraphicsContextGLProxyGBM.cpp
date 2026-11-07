@@ -80,6 +80,7 @@ void RemoteGraphicsContextGLProxyGBM::prepareForDisplay()
     if (!m_displayBuffer)
         return;
 
+    m_hasPreparedForDisplay = true;
     OptionSet<TextureMapperFlags> flags = TextureMapperFlags::ShouldFlipTexture;
     if (contextAttributes().alpha)
         flags.add(TextureMapperFlags::ShouldBlend);

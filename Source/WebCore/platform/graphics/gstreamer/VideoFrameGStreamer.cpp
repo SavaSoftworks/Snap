@@ -33,12 +33,14 @@
 #include "ImageOrientation.h"
 #include "PixelBuffer.h"
 #include "PlatformDisplay.h"
+#include "TypedArrayPixelBuffer.h"
 #include "VideoFrameContentHint.h"
 #include "VideoPixelFormat.h"
 #include <JavaScriptCore/JSCInlines.h>
 #include <JavaScriptCore/TypedArrayInlines.h>
 #include <skia/core/SkData.h>
 #include <skia/core/SkImage.h>
+#include <wtf/RuntimeApplicationChecks.h>
 #include <wtf/glib/GMallocString.h>
 
 #if USE(GBM)
@@ -67,6 +69,10 @@ static void ensureVideoFrameDebugCategoryInitialized()
 {
     static std::once_flag debugRegisteredFlag;
     std::call_once(debugRegisteredFlag, [] {
+        if (isInWebProcess())
+            ensureGStreamerInitialized();
+        else
+            ensureGStreamerInitializedNonWebProcess();
         GST_DEBUG_CATEGORY_INIT(webkit_video_frame_debug, "webkitvideoframe", 0, "WebKit Video Frame");
         GST_DEBUG_CATEGORY_GET(GST_CAT_PERFORMANCE, "GST_PERFORMANCE");
     });
@@ -165,6 +171,51 @@ static RefPtr<ImageGStreamer> convertSampleToImage(const GRefPtr<GstSample>& sam
         return nullptr;
 
     return ImageGStreamer::create(WTF::move(convertedSample));
+}
+
+RefPtr<VideoFrameGStreamer> VideoFrameGStreamer::createFromBottomUpNativeImage(NativeImage& image, double frameRate)
+{
+    ensureVideoFrameDebugCategoryInitialized();
+    auto size = image.size();
+    const auto& platformImage = image.platformImage();
+    if (!platformImage || size.isEmpty() || platformImage->width() != size.width() || platformImage->height() != size.height())
+        return nullptr;
+
+    GST_DEBUG("Copying a %dx%d WebGL surface into a video frame through the CPU", size.width(), size.height());
+    SkPixmap pixmap;
+    bool canPeek = !platformImage->isTextureBacked() && platformImage->peekPixels(&pixmap) && (pixmap.colorType() == kRGBA_8888_SkColorType || pixmap.colorType() == kBGRA_8888_SkColorType) && pixmap.alphaType() != kPremul_SkAlphaType;
+    auto pixelFormat = canPeek && pixmap.colorType() == kRGBA_8888_SkColorType ? PixelFormat::RGBA8 : PixelFormat::BGRA8;
+    RefPtr pixelBuffer = ByteArrayPixelBuffer::tryCreate({ AlphaPremultiplication::Unpremultiplied, pixelFormat, DestinationColorSpace::SRGB() }, size);
+    if (!pixelBuffer)
+        return nullptr;
+
+    size_t rowBytes = static_cast<size_t>(size.width()) * 4;
+    size_t height = size.height();
+    auto destination = pixelBuffer->bytes();
+    if (destination.size() < rowBytes * height)
+        return nullptr;
+
+    if (canPeek) {
+        auto source = unsafeMakeSpan(static_cast<const uint8_t*>(pixmap.addr()), pixmap.computeByteSize());
+        for (size_t row = 0; row < height; ++row)
+            memcpySpan(destination.subspan(row * rowBytes, rowBytes), source.subspan((height - 1 - row) * pixmap.rowBytes(), rowBytes));
+        return createFromPixelBuffer(pixelBuffer.releaseNonNull(), {}, frameRate, {});
+    }
+
+    if (platformImage->isTextureBacked() && !PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent())
+        return nullptr;
+    auto info = platformImage->imageInfo().makeColorType(kBGRA_8888_SkColorType).makeAlphaType(platformImage->isOpaque() ? kOpaque_SkAlphaType : kUnpremul_SkAlphaType);
+    if (!platformImage->readPixels(image.grContext(), info, destination.data(), rowBytes, 0, 0))
+        return nullptr;
+    Vector<uint8_t> scratch(rowBytes);
+    for (size_t top = 0, bottom = height - 1; top < bottom; ++top, --bottom) {
+        auto topRow = destination.subspan(top * rowBytes, rowBytes);
+        auto bottomRow = destination.subspan(bottom * rowBytes, rowBytes);
+        memcpySpan(scratch.mutableSpan(), bottomRow);
+        memcpySpan(bottomRow, topRow);
+        memcpySpan(topRow, scratch.span());
+    }
+    return createFromPixelBuffer(pixelBuffer.releaseNonNull(), {}, frameRate, {});
 }
 
 RefPtr<VideoFrame> VideoFrame::fromNativeImage(NativeImage& image)
@@ -570,7 +621,7 @@ void VideoFrameGStreamer::setMetadata(std::optional<VideoFrameTimeMetadata> meta
     gst_sample_set_buffer(m_sample.get(), modifiedBuffer.get());
 }
 
-static void copyPlane(std::span<uint8_t>& destination, const std::span<uint8_t>& source, uint64_t sourceStride, const ComputedPlaneLayout& spanPlaneLayout)
+static bool copyPlane(std::span<uint8_t>& destination, const std::span<uint8_t>& source, uint64_t sourceStride, const ComputedPlaneLayout& spanPlaneLayout)
 {
     uint64_t sourceOffset = spanPlaneLayout.sourceTop * sourceStride;
     sourceOffset += spanPlaneLayout.sourceLeftBytes;
@@ -579,17 +630,50 @@ static void copyPlane(std::span<uint8_t>& destination, const std::span<uint8_t>&
     for (size_t rowIndex = 0; rowIndex < spanPlaneLayout.sourceHeight; ++rowIndex) {
         if (sourceOffset + rowBytes > source.size()) {
             GST_ERROR("Computed sourceOffset doesn't fit in source plane");
-            return;
+            return false;
         }
         if (destinationOffset + rowBytes > destination.size()) {
             GST_ERROR("Computed destinationOffset doesn't fit in destination plane");
-            return;
+            return false;
         }
 
         memcpySpan(destination.subspan(destinationOffset, rowBytes), source.subspan(sourceOffset, rowBytes));
         sourceOffset += sourceStride;
         destinationOffset += spanPlaneLayout.destinationStride;
     }
+    return true;
+}
+
+static GstVideoFormat gstVideoFormatForCopy(VideoPixelFormat format)
+{
+    switch (format) {
+    case VideoPixelFormat::I420:
+        return GST_VIDEO_FORMAT_I420;
+    case VideoPixelFormat::I420A:
+        return GST_VIDEO_FORMAT_A420;
+    case VideoPixelFormat::I422:
+        return GST_VIDEO_FORMAT_Y42B;
+    case VideoPixelFormat::I444:
+        return GST_VIDEO_FORMAT_Y444;
+    case VideoPixelFormat::NV12:
+        return GST_VIDEO_FORMAT_NV12;
+    case VideoPixelFormat::RGBA:
+        return GST_VIDEO_FORMAT_RGBA;
+    case VideoPixelFormat::RGBX:
+        return GST_VIDEO_FORMAT_RGBx;
+    case VideoPixelFormat::BGRA:
+        return GST_VIDEO_FORMAT_BGRA;
+    case VideoPixelFormat::BGRX:
+        return GST_VIDEO_FORMAT_BGRx;
+    }
+    return GST_VIDEO_FORMAT_UNKNOWN;
+}
+
+static bool copiesWithoutConversion(GstVideoFormat source, GstVideoFormat target)
+{
+    if (source == target)
+        return true;
+    return (source == GST_VIDEO_FORMAT_BGRA && target == GST_VIDEO_FORMAT_BGRx) || (source == GST_VIDEO_FORMAT_RGBA && target == GST_VIDEO_FORMAT_RGBx);
 }
 
 void VideoFrame::copyTo(std::span<uint8_t> destination, VideoPixelFormat pixelFormat, Vector<ComputedPlaneLayout>&& computedPlaneLayout, CompletionHandler<void(std::optional<Vector<PlaneLayout>>&&)>&& callback)
@@ -597,22 +681,28 @@ void VideoFrame::copyTo(std::span<uint8_t> destination, VideoPixelFormat pixelFo
     ensureVideoFrameDebugCategoryInitialized();
     auto& self = downcast<VideoFrameGStreamer>(*this);
 
+    auto targetFormat = gstVideoFormatForCopy(pixelFormat);
     GRefPtr<GstSample> inputSample;
-    switch (self.memoryType()) {
-    case VideoFrameGStreamer::MemoryType::Unsupported:
-        callback({ });
-        return;
-    case VideoFrameGStreamer::MemoryType::System:
-        inputSample = self.sample();
-        break;
+    if (!copiesWithoutConversion(static_cast<GstVideoFormat>(self.pixelFormat()), targetFormat)) {
+        const auto& info = self.info();
+        inputSample = self.convert(targetFormat, { static_cast<int>(GST_VIDEO_INFO_WIDTH(&info)), static_cast<int>(GST_VIDEO_INFO_HEIGHT(&info)) });
+    } else {
+        switch (self.memoryType()) {
+        case VideoFrameGStreamer::MemoryType::Unsupported:
+            callback({});
+            return;
+        case VideoFrameGStreamer::MemoryType::System:
+            inputSample = self.sample();
+            break;
 #if USE(GSTREAMER_GL)
-    case VideoFrameGStreamer::MemoryType::GL:
+        case VideoFrameGStreamer::MemoryType::GL:
 #if USE(GBM)
-    case VideoFrameGStreamer::MemoryType::DMABuf:
+        case VideoFrameGStreamer::MemoryType::DMABuf:
 #endif
-        inputSample = self.downloadSample();
-        break;
+            inputSample = self.downloadSample();
+            break;
 #endif
+        }
     }
 
     if (!inputSample) {
@@ -632,87 +722,24 @@ void VideoFrame::copyTo(std::span<uint8_t> destination, VideoPixelFormat pixelFo
 #ifndef GST_DISABLE_GST_DEBUG
     GST_CAT_DEBUG(GST_CAT_PERFORMANCE, "Copying frame data to %s pixel format", convertVideoPixelFormatToString(pixelFormat).ascii().data());
 #endif
-    if (pixelFormat == VideoPixelFormat::NV12) {
-        auto spanPlaneLayoutY = computedPlaneLayout[GST_VIDEO_COMP_Y];
-        auto widthY = inputFrame.componentWidth(GST_VIDEO_COMP_Y);
-        PlaneLayout planeLayoutY { spanPlaneLayoutY.destinationOffset, spanPlaneLayoutY.destinationStride ? spanPlaneLayoutY.destinationStride : widthY };
-
-        auto spanPlaneLayoutUV = computedPlaneLayout[GST_VIDEO_COMP_U];
-        auto widthUV = inputFrame.componentWidth(GST_VIDEO_COMP_U);
-        PlaneLayout planeLayoutUV { spanPlaneLayoutUV.destinationOffset, spanPlaneLayoutUV.destinationStride ? spanPlaneLayoutUV.destinationStride : widthUV };
-
-        auto planeY = inputFrame.planeData(GST_VIDEO_COMP_Y);
-        auto bytesPerRowY = inputFrame.componentStride(GST_VIDEO_COMP_Y);
-        copyPlane(destination, planeY, bytesPerRowY, spanPlaneLayoutY);
-
-        auto planeUV = inputFrame.planeData(GST_VIDEO_COMP_U);
-        auto bytesPerRowUV = inputFrame.componentStride(GST_VIDEO_COMP_U);
-        copyPlane(destination, planeUV, bytesPerRowUV, spanPlaneLayoutUV);
-
-        Vector<PlaneLayout> planeLayouts;
-        planeLayouts.append(planeLayoutY);
-        planeLayouts.append(planeLayoutUV);
-        callback(WTF::move(planeLayouts));
+    unsigned planeCount = GST_VIDEO_INFO_N_PLANES(inputFrame.info());
+    if (computedPlaneLayout.size() != planeCount) {
+        GST_WARNING("The frame has %u planes but the copy layout has %zu", planeCount, computedPlaneLayout.size());
+        callback({});
         return;
     }
 
-    if (pixelFormat == VideoPixelFormat::I420 || pixelFormat == VideoPixelFormat::I420A) {
-        auto spanPlaneLayoutY = computedPlaneLayout[GST_VIDEO_COMP_Y];
-        auto widthY = inputFrame.componentWidth(GST_VIDEO_COMP_Y);
-        PlaneLayout planeLayoutY { spanPlaneLayoutY.destinationOffset, spanPlaneLayoutY.destinationStride ? spanPlaneLayoutY.destinationStride : widthY };
-        auto planeY = inputFrame.planeData(GST_VIDEO_COMP_Y);
-        auto bytesPerRowY = inputFrame.width() % 2 ? inputFrame.planeStride(GST_VIDEO_COMP_Y) : inputFrame.width();
-        copyPlane(destination, planeY, bytesPerRowY, spanPlaneLayoutY);
-
-        auto spanPlaneLayoutU = computedPlaneLayout[GST_VIDEO_COMP_U];
-        auto widthUV = inputFrame.componentWidth(GST_VIDEO_COMP_U);
-        PlaneLayout planeLayoutU { spanPlaneLayoutU.destinationOffset, spanPlaneLayoutU.destinationStride ? spanPlaneLayoutU.destinationStride : widthUV / 2 };
-
-        auto spanPlaneLayoutV = computedPlaneLayout[GST_VIDEO_COMP_V];
-        PlaneLayout planeLayoutV { spanPlaneLayoutV.destinationOffset, spanPlaneLayoutV.destinationStride ? spanPlaneLayoutV.destinationStride : widthUV / 2 };
-
-        auto planeU = inputFrame.planeData(GST_VIDEO_COMP_U);
-        auto bytesPerRowU = inputFrame.planeStride(GST_VIDEO_COMP_U);
-        copyPlane(destination, planeU, bytesPerRowU, spanPlaneLayoutU);
-
-        auto planeV = inputFrame.planeData(GST_VIDEO_COMP_V);
-        auto bytesPerRowV = inputFrame.planeStride(GST_VIDEO_COMP_V);
-        copyPlane(destination, planeV, bytesPerRowV, spanPlaneLayoutV);
-
-        Vector<PlaneLayout> planeLayouts;
-        planeLayouts.append(planeLayoutY);
-        planeLayouts.append(planeLayoutU);
-        planeLayouts.append(planeLayoutV);
-
-        if (pixelFormat == VideoPixelFormat::I420A) {
-            auto spanPlaneLayoutA = computedPlaneLayout[GST_VIDEO_COMP_A];
-            auto widthA = inputFrame.componentWidth(GST_VIDEO_COMP_A);
-            PlaneLayout planeLayoutA { spanPlaneLayoutA.destinationOffset, spanPlaneLayoutA.destinationStride ? spanPlaneLayoutA.destinationStride : widthA };
-            auto planeA = inputFrame.planeData(GST_VIDEO_COMP_A);
-            auto bytesPerRowA = inputFrame.width() % 2 ? inputFrame.planeStride(GST_VIDEO_COMP_A) : inputFrame.width();
-            copyPlane(destination, planeA, bytesPerRowA, spanPlaneLayoutA);
-            planeLayouts.append(planeLayoutA);
+    Vector<PlaneLayout> planeLayouts;
+    planeLayouts.reserveInitialCapacity(planeCount);
+    for (unsigned plane = 0; plane < planeCount; ++plane) {
+        const auto& layout = computedPlaneLayout[plane];
+        if (!copyPlane(destination, inputFrame.planeData(plane), inputFrame.planeStride(plane), layout)) {
+            callback({});
+            return;
         }
-
-        callback(WTF::move(planeLayouts));
-        return;
+        planeLayouts.append({ layout.destinationOffset, layout.destinationStride });
     }
-
-    if (pixelFormat == VideoPixelFormat::RGBA || pixelFormat == VideoPixelFormat::BGRA) {
-        ComputedPlaneLayout planeLayout;
-        if (!computedPlaneLayout.isEmpty())
-            planeLayout = computedPlaneLayout[0];
-        auto plane = inputFrame.planeData(0);
-        auto bytesPerRow = inputFrame.componentStride(0);
-        copyPlane(destination, plane, bytesPerRow, planeLayout);
-        Vector<PlaneLayout> planeLayouts;
-        planeLayouts.append({ planeLayout.destinationOffset, planeLayout.destinationStride ? planeLayout.destinationStride : 4 * inputFrame.width() });
-        callback(WTF::move(planeLayouts));
-        return;
-    }
-
-    // FIXME: Handle I422, I444, RGBX and BGRX formats.
-    callback({ });
+    callback(WTF::move(planeLayouts));
 }
 
 RefPtr<NativeImage> VideoFrame::copyNativeImage() const

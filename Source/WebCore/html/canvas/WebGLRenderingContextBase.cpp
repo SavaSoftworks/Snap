@@ -171,6 +171,9 @@
 
 #if ENABLE(VIDEO)
 #include "VideoFrame.h"
+#if USE(GSTREAMER)
+#include "VideoFrameGStreamer.h"
+#endif
 #endif
 
 #if ENABLE(OFFSCREEN_CANVAS)
@@ -861,7 +864,17 @@ RefPtr<VideoFrame> WebGLRenderingContextBase::surfaceBufferToVideoFrame(SurfaceB
         return nullptr;
     if (buffer == SurfaceBuffer::DrawingBuffer)
         clearIfComposited(CallerTypeOther);
+#if USE(GSTREAMER)
+    RefPtr context = graphicsContextGL();
+    if (RefPtr frame = context->surfaceBufferToVideoFrame(toGCGLSurfaceBuffer(buffer)))
+        return frame;
+    RefPtr image = context->copyNativeImageYFlipped(toGCGLSurfaceBuffer(buffer));
+    if (!image)
+        return nullptr;
+    return VideoFrameGStreamer::createFromBottomUpNativeImage(*image, 30);
+#else
     return protect(graphicsContextGL())->surfaceBufferToVideoFrame(toGCGLSurfaceBuffer(buffer));
+#endif
 }
 #endif
 

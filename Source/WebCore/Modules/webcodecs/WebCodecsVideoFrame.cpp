@@ -476,7 +476,7 @@ ExceptionOr<size_t> WebCodecsVideoFrame::allocationSize(const CopyToOptions& opt
     if (isDetached())
         return Exception { ExceptionCode::InvalidStateError,  "VideoFrame is detached"_s };
 
-    if (!m_data.format)
+    if (!m_data.format && !options.format)
         return Exception { ExceptionCode::NotSupportedError,  "VideoFrame has no format"_s };
 
     auto layoutOrException = parseVideoFrameCopyToOptions(*this, options);
@@ -492,7 +492,7 @@ void WebCodecsVideoFrame::copyTo(BufferSource&& source, CopyToOptions&& options,
         promise.reject(Exception { ExceptionCode::InvalidStateError,  "VideoFrame is detached"_s });
         return;
     }
-    if (!m_data.format) {
+    if (!m_data.format && !options.format) {
         promise.reject(Exception { ExceptionCode::NotSupportedError,  "VideoFrame has no format"_s });
         return;
     }
@@ -510,7 +510,8 @@ void WebCodecsVideoFrame::copyTo(BufferSource&& source, CopyToOptions&& options,
     }
 
     auto buffer = source.mutableSpan();
-    protect(m_data.internalFrame)->copyTo(buffer, *m_data.format, WTF::move(combinedLayout.computedLayouts), [source = WTF::move(source), promise = WTF::move(promise)](auto planeLayouts) mutable {
+    auto copyFormat = options.format ? *options.format : *m_data.format;
+    protect(m_data.internalFrame)->copyTo(buffer, copyFormat, WTF::move(combinedLayout.computedLayouts), [source = WTF::move(source), promise = WTF::move(promise)](auto planeLayouts) mutable {
         if (!planeLayouts) {
             promise.reject(Exception { ExceptionCode::TypeError,  "Unable to copy data"_s });
             return;

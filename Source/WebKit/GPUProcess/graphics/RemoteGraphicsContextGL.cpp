@@ -238,8 +238,12 @@ void RemoteGraphicsContextGL::surfaceBufferToVideoFrame(WebCore::GraphicsContext
 {
     assertIsCurrent(workQueue());
     std::optional<WebKit::RemoteVideoFrameProxy::Properties> result;
+#if USE(GSTREAMER)
+    UNUSED_PARAM(buffer);
+#else
     if (auto videoFrame = protect(m_context)->surfaceBufferToVideoFrame(buffer))
         result = m_videoFrameObjectHeap->add(videoFrame.releaseNonNull());
+#endif
     completionHandler(WTF::move(result));
 }
 #endif

@@ -30,6 +30,7 @@
 
 #include "DOMRectReadOnly.h"
 #include "ExceptionOr.h"
+#include "PredefinedColorSpace.h"
 #include "ScriptWrappableInlines.h"
 #include "VideoColorSpace.h"
 
@@ -236,15 +237,21 @@ ExceptionOr<CombinedPlaneLayout> computeLayoutAndAllocationSize(const DOMRectIni
 ExceptionOr<CombinedPlaneLayout> parseVideoFrameCopyToOptions(const WebCodecsVideoFrame& frame, const WebCodecsVideoFrame::CopyToOptions& options)
 {
     ASSERT(!frame.isDetached());
-    ASSERT(frame.format());
+    ASSERT(frame.format() || options.format);
 
+    if (options.format && !isRGBVideoPixelFormat(*options.format))
+        return Exception { ExceptionCode::NotSupportedError, "copyTo() can only convert to RGBA, RGBX, BGRA or BGRX"_s };
+    if (options.colorSpace && *options.colorSpace != PredefinedColorSpace::SRGB)
+        return Exception { ExceptionCode::NotSupportedError, "copyTo() can only convert to the srgb color space"_s };
+
+    auto sourceFormat = frame.format() ? *frame.format() : *options.format;
     Ref visibleRect = *frame.visibleRect();
-    auto parsedRect = parseVisibleRect({ visibleRect->x(), visibleRect->y(), visibleRect->width(), visibleRect->height() }, options.rect, frame.codedWidth(), frame.codedHeight(), *frame.format());
+    auto parsedRect = parseVisibleRect({ visibleRect->x(), visibleRect->y(), visibleRect->width(), visibleRect->height() }, options.rect, frame.codedWidth(), frame.codedHeight(), sourceFormat);
 
     if (parsedRect.hasException())
         return parsedRect.releaseException();
 
-    return computeLayoutAndAllocationSize(parsedRect.returnValue(), options.layout, *frame.format());
+    return computeLayoutAndAllocationSize(parsedRect.returnValue(), options.layout, options.format ? *options.format : sourceFormat);
 }
 
 // https://w3c.github.io/webcodecs/#videoframe-initialize-visible-rect-and-display-size

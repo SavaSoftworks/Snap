@@ -22,9 +22,12 @@
 
 #include "GRefPtrGStreamer.h"
 #include <wtf/Forward.h>
+#include <wtf/Lock.h>
+#include <wtf/MonotonicTime.h>
 #include <wtf/RunLoop.h>
 #include <wtf/TZoneMalloc.h>
 #include <wtf/ThreadSafeWeakPtr.h>
+#include <wtf/Vector.h>
 #include <wtf/WeakPtr.h>
 
 namespace WebCore {
@@ -48,41 +51,60 @@ private:
     class Pipeline {
         WTF_MAKE_TZONE_ALLOCATED(Pipeline);
     public:
-        enum class Type : uint8_t {
-            SystemMemory,
-#if USE(GSTREAMER_GL)
-            GLMemory,
-            DMABufMemory
-#endif
-        };
-        Pipeline(Type);
+        Pipeline();
         ~Pipeline();
 
         GRefPtr<GstSample> run(const GRefPtr<GstSample>&, GstCaps*);
 
     private:
-        Type m_type { Type::SystemMemory };
         GRefPtr<GstElement> m_pipeline;
         GRefPtr<GstElement> m_src;
         GRefPtr<GstElement> m_sink;
-        GRefPtr<GstElement> m_capsfilter;
     };
 
-    Pipeline& ensurePipeline(GstCaps*);
-    void releaseUnusedSystemMemoryPipelineTimerFired();
 #if USE(GSTREAMER_GL)
-    void releaseUnusedGLMemoryPipelineTimerFired();
-    void releaseUnusedDMABufMemoryPipelineTimerFired();
+    class GPUPipeline {
+        WTF_MAKE_TZONE_ALLOCATED(GPUPipeline);
+
+    public:
+        static std::unique_ptr<GPUPipeline> create(GRefPtr<GstCaps>&& inputCaps, GRefPtr<GstCaps>&& outputCaps);
+        ~GPUPipeline();
+
+        bool matches(GstCaps* inputCaps, GstCaps* outputCaps) const;
+        bool isUsable() const { return m_isUsable; }
+        MonotonicTime failureTime() const { return m_failureTime; }
+        GRefPtr<GstSample> run(GstBuffer*);
+
+        MonotonicTime lastUse;
+
+    private:
+        GPUPipeline(GRefPtr<GstCaps>&&, GRefPtr<GstCaps>&&);
+        bool initialize();
+        void tearDown();
+
+        GRefPtr<GstCaps> m_inputCaps;
+        GRefPtr<GstCaps> m_outputCaps;
+        GRefPtr<GstElement> m_pipeline;
+        GRefPtr<GstElement> m_sink;
+        GRefPtr<GstPad> m_sourcePad;
+        bool m_isUsable { false };
+        MonotonicTime m_failureTime;
+    };
+
+    GRefPtr<GstSample> convertOnGPU(const GRefPtr<GstSample>&, GstCaps*) WTF_REQUIRES_LOCK(m_lock);
 #endif
 
-    std::unique_ptr<Pipeline> m_systemMemoryPipeline;
-    std::unique_ptr<RunLoop::Timer> m_releaseUnusedSystemMemoryPipelineTimer;
+    Pipeline& ensurePipeline() WTF_REQUIRES_LOCK(m_lock);
+    void scheduleReleaseOfUnusedPipelines();
+    void releaseUnusedPipelinesTimerFired();
+
+    Lock m_lock;
+    std::unique_ptr<Pipeline> m_systemMemoryPipeline WTF_GUARDED_BY_LOCK(m_lock);
+    MonotonicTime m_systemMemoryPipelineLastUse WTF_GUARDED_BY_LOCK(m_lock);
 #if USE(GSTREAMER_GL)
-    std::unique_ptr<Pipeline> m_glMemoryPipeline;
-    std::unique_ptr<RunLoop::Timer> m_releaseUnusedGLMemoryPipelineTimer;
-    std::unique_ptr<Pipeline> m_dmabufMemoryPipeline;
-    std::unique_ptr<RunLoop::Timer> m_releaseUnusedDMABufMemoryPipelineTimer;
+    Vector<std::unique_ptr<GPUPipeline>> m_gpuPipelines WTF_GUARDED_BY_LOCK(m_lock);
 #endif
+    RunLoop::Timer m_releaseUnusedPipelinesTimer;
 };
 
 } // namespace WebCore

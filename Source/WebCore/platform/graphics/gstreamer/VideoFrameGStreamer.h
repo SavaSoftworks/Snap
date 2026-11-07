@@ -71,6 +71,7 @@ public:
     static Ref<VideoFrameGStreamer> createWrappedSample(const GRefPtr<GstSample>&, std::optional<CreateOptions> = std::nullopt);
 
     static RefPtr<VideoFrameGStreamer> createFromPixelBuffer(Ref<PixelBuffer>&&, const IntSize& destinationSize, double frameRate, const CreateOptions&, PlatformVideoColorSpace&& = { });
+    static RefPtr<VideoFrameGStreamer> createFromBottomUpNativeImage(NativeImage&, double frameRate);
 
     void setFrameRate(double);
     void setMaxFrameRate(double);
