@@ -29,9 +29,12 @@
 #include <WebKit/WKDeclarationSpecifiers.h>
 #include <array>
 #include <atomic>
+#include <optional>
 #include <wtf/ExportMacros.h>
 #include <wtf/MathExtras.h>
 #include <wtf/Noncopyable.h>
+#include <wtf/Seconds.h>
+#include <wtf/text/ASCIILiteral.h>
 
 namespace IPC {
 
@@ -72,5 +75,8 @@ struct MessageLogMetadata {
 
 WK_EXPORT MessageLog<messageLogCapacity>& NODELETE messageLog();
 WK_EXPORT const MessageLogMetadata& NODELETE messageLogMetadata();
+
+std::optional<Seconds> hangLogThreshold();
+void reportSlowMessage(ASCIILiteral activity, MessageName, Seconds duration);
 
 } // namespace IPC

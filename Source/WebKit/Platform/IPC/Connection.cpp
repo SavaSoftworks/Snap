@@ -908,6 +908,7 @@ auto Connection::sendSyncMessage(SyncRequestID syncRequestID, UniqueRef<Encoder>
         encoder->setShouldMaintainOrderingWithAsyncMessages();
 
     auto messageName = encoder->messageName();
+    auto sendStarted = MonotonicTime::now();
 
 #if ENABLE(CORE_IPC_SIGNPOSTS)
     uintptr_t signpostIdentifier = 0;
@@ -923,6 +924,7 @@ auto Connection::sendSyncMessage(SyncRequestID syncRequestID, UniqueRef<Encoder>
             WTFEndSignpost(signpostIdentifier, IPCConnection);
 #endif
         popPendingSyncRequestID(syncRequestID);
+        reportSlowMessage("waiting for the reply to"_s, messageName, MonotonicTime::now() - sendStarted);
     });
 
     // Since sync IPC is blocking the current thread, make sure we use the same priority for the IPC sending thread
@@ -1304,8 +1306,11 @@ void Connection::dispatchSyncMessage(Decoder& decoder)
             sendMessageImpl(WTF::move(replyEncoder), { });
         } else
             decoder.markInvalid();
-    } else
+    } else {
+        auto handlingStarted = MonotonicTime::now();
         protect(client())->didReceiveSyncMessage(*this, decoder, replyEncoder);
+        reportSlowMessage("handling"_s, decoder.messageName(), MonotonicTime::now() - handlingStarted);
+    }
 
     // If the message was not handled, i.e. replyEncoder was not consumed, reply with cancel
     // message. We do not distinquish between a decode failure and failure to find a
@@ -1436,7 +1441,9 @@ void Connection::dispatchMessage(Decoder& decoder)
     }
 #endif
 
+    auto handlingStarted = MonotonicTime::now();
     client->didReceiveMessage(*this, decoder);
+    reportSlowMessage("handling"_s, decoder.messageName(), MonotonicTime::now() - handlingStarted);
 
 #if ENABLE(IPC_TESTING_API)
     // If we haven't registered an error yet, check whether we found one

@@ -271,7 +271,9 @@ bool StreamServerConnection::dispatchStreamMessage(Decoder& message, StreamMessa
     m_isDispatchingMessage = true;
 #endif
     IPC::messageLog().add(message.messageName());
+    auto handlingStarted = MonotonicTime::now();
     receiver.didReceiveStreamMessage(*this, message);
+    reportSlowMessage("handling"_s, message.messageName(), MonotonicTime::now() - handlingStarted);
 #if ASSERT_ENABLED
     m_isDispatchingMessage = false;
 #endif

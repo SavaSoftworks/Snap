@@ -89,6 +89,12 @@
 #include "WebKitFaviconDatabasePrivate.h"
 #endif
 
+#if OS(LINUX)
+namespace WebKit {
+void startEdenHangRecorderIfRequested();
+}
+#endif
+
 using namespace WebKit;
 
 /**
@@ -430,6 +436,9 @@ static void webkitWebContextSetProperty(GObject* object, guint propID, const GVa
 static void webkitWebContextConstructed(GObject* object)
 {
     G_OBJECT_CLASS(webkit_web_context_parent_class)->constructed(object);
+#if OS(LINUX)
+    startEdenHangRecorderIfRequested();
+#endif
 
     GUniquePtr<char> bundleFilename(g_build_filename(injectedBundleDirectory(), INJECTED_BUNDLE_FILENAME, nullptr));
 

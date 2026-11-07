@@ -26,6 +26,12 @@
 #include "config.h"
 #include "MessageLog.h"
 
+#include <cerrno>
+#include <cstdlib>
+#include <wtf/ProcessID.h>
+#include <wtf/text/StringToIntegerConversion.h>
+#include <wtf/text/StringView.h>
+
 namespace IPC {
 
 constinit MessageLog<messageLogCapacity> gMessageLog;
@@ -46,6 +52,30 @@ MessageLog<messageLogCapacity>& messageLog()
 const MessageLogMetadata& messageLogMetadata()
 {
     return gMessageLogMetadata;
+}
+
+std::optional<Seconds> hangLogThreshold()
+{
+    static const std::optional<Seconds> threshold = []() -> std::optional<Seconds> {
+        auto milliseconds = parseInteger<unsigned>(StringView::fromLatin1(getenv("EDEN_WPE_HANG_LOG")));
+        if (!milliseconds || !*milliseconds)
+            return std::nullopt;
+        return Seconds::fromMilliseconds(*milliseconds);
+    }();
+    return threshold;
+}
+
+void reportSlowMessage(ASCIILiteral activity, MessageName name, Seconds duration)
+{
+    auto threshold = hangLogThreshold();
+    if (!threshold || duration < *threshold)
+        return;
+#if OS(LINUX)
+    const char* processName = program_invocation_short_name;
+#else
+    const char* processName = "WebKit";
+#endif
+    WTFLogAlways("Eden hang recorder: %s spent %.0f ms %s %s", processName, duration.milliseconds(), activity.characters(), description(name).characters());
 }
 
 } // namespace IPC
