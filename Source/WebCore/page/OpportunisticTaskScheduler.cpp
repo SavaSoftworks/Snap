@@ -247,7 +247,7 @@ OpportunisticTaskScheduler::FullGCActivityCallback::FullGCActivityCallback(JSC::
 {
 }
 
-// We would like to keep FullGCActivityCallback::doCollection and SnapGCActivityCallback::doCollection separate
+// We would like to keep FullGCActivityCallback::doCollection and EdenGCActivityCallback::doCollection separate
 // since we would like to encode more and more different heuristics for them.
 void OpportunisticTaskScheduler::FullGCActivityCallback::doCollection(JSC::VM& vm)
 {
@@ -281,7 +281,7 @@ void OpportunisticTaskScheduler::FullGCActivityCallback::doCollection(JSC::VM& v
     Base::doCollection(vm);
 }
 
-OpportunisticTaskScheduler::SnapGCActivityCallback::SnapGCActivityCallback(JSC::Heap& heap)
+OpportunisticTaskScheduler::EdenGCActivityCallback::EdenGCActivityCallback(JSC::Heap& heap)
     : Base(heap, JSC::Synchronousness::Sync)
     , m_vm(heap.vm())
     , m_runLoopObserver(makeUniqueRef<RunLoopObserver>(RunLoopObserver::WellKnownOrder::PostRenderingUpdate, [this] {
@@ -292,14 +292,14 @@ OpportunisticTaskScheduler::SnapGCActivityCallback::SnapGCActivityCallback(JSC::
 {
 }
 
-void OpportunisticTaskScheduler::SnapGCActivityCallback::doCollection(JSC::VM& vm)
+void OpportunisticTaskScheduler::EdenGCActivityCallback::doCollection(JSC::VM& vm)
 {
     constexpr Seconds delay { 10_ms };
     constexpr unsigned deferCountThreshold = 5;
 
     if (isBusyForTimerBasedGC(vm)) {
-        if (!m_version || m_version != vm.heap.objectSpace().snapVersion()) {
-            m_version = vm.heap.objectSpace().snapVersion();
+        if (!m_version || m_version != vm.heap.objectSpace().edenVersion()) {
+            m_version = vm.heap.objectSpace().edenVersion();
             m_deferCount = 0;
             m_delay = delay;
             setTimeUntilFire(delay);

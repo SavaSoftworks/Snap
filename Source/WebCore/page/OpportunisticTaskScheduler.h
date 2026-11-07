@@ -28,7 +28,7 @@
 #include "RunLoopObserver.h"
 #include <JavaScriptCore/FullGCActivityCallback.h>
 #include <JavaScriptCore/MarkedSpace.h>
-#include <JavaScriptCore/SnapGCActivityCallback.h>
+#include <JavaScriptCore/EdenGCActivityCallback.h>
 #include <memory>
 #include <wtf/CheckedPtr.h>
 #include <wtf/MonotonicTime.h>
@@ -91,19 +91,19 @@ public:
         unsigned m_deferCount { 0 };
     };
 
-    class SnapGCActivityCallback final : public JSC::SnapGCActivityCallback {
+    class EdenGCActivityCallback final : public JSC::EdenGCActivityCallback {
     public:
-        using Base = JSC::SnapGCActivityCallback;
+        using Base = JSC::EdenGCActivityCallback;
 
-        static Ref<SnapGCActivityCallback> create(JSC::Heap& heap)
+        static Ref<EdenGCActivityCallback> create(JSC::Heap& heap)
         {
-            return adoptRef(*new SnapGCActivityCallback(heap));
+            return adoptRef(*new EdenGCActivityCallback(heap));
         }
 
         void doCollection(JSC::VM&) final;
 
     private:
-        SnapGCActivityCallback(JSC::Heap&);
+        EdenGCActivityCallback(JSC::Heap&);
 
         JSC::VM& m_vm;
         const UniqueRef<RunLoopObserver> m_runLoopObserver;
