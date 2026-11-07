@@ -23,6 +23,7 @@
 #if USE(GSTREAMER)
 
 #include "GStreamerCommon.h"
+#include <wtf/MainThread.h>
 #include <wtf/NeverDestroyed.h>
 
 namespace WebCore {
@@ -46,12 +47,40 @@ GStreamerAudioMixer::GStreamerAudioMixer()
     GST_DEBUG_CATEGORY_INIT(webkit_media_gst_audio_mixer_debug, "webkitaudiomixer", 0, "WebKit GStreamer audio mixer");
 }
 
+enum class EchoReferenceShift : int { ToClockTime = 1,
+    ToRunningTime = 2 };
+
+static GstPadProbeReturn shiftEchoReferenceTimestamp(GstPad* pad, GstPadProbeInfo* info, gpointer userData)
+{
+    auto* buffer = GST_PAD_PROBE_INFO_BUFFER(info);
+    if (!buffer || !GST_BUFFER_PTS_IS_VALID(buffer))
+        return GST_PAD_PROBE_OK;
+
+    GRefPtr element = adoptGRef(gst_pad_get_parent_element(pad));
+    if (!element)
+        return GST_PAD_PROBE_OK;
+
+    auto baseTime = gst_element_get_base_time(element.get());
+    if (!GST_CLOCK_TIME_IS_VALID(baseTime) || !baseTime)
+        return GST_PAD_PROBE_OK;
+
+    bool toClockTime = GPOINTER_TO_INT(userData) == static_cast<int>(EchoReferenceShift::ToClockTime);
+    if (!toClockTime && GST_BUFFER_PTS(buffer) < baseTime)
+        return GST_PAD_PROBE_OK;
+
+    buffer = gst_buffer_make_writable(buffer);
+    GST_BUFFER_PTS(buffer) = toClockTime ? GST_BUFFER_PTS(buffer) + baseTime : GST_BUFFER_PTS(buffer) - baseTime;
+    GST_PAD_PROBE_INFO_DATA(info) = buffer;
+    return GST_PAD_PROBE_OK;
+}
+
 GStreamerAudioMixer::MixerPipeline& GStreamerAudioMixer::ensureMixerPipeline(DataMutexLocker<StreamingMembers>& locker, const String& deviceId, const GRefPtr<GstDevice>& device)
 {
     auto result = locker->m_pipelines.find(deviceId);
     if (result != locker->m_pipelines.end()) {
         // Cancel any pending teardown since a new producer is registering.
-        result->value->teardownTimer.stop();
+        if (isMainThread())
+            result->value->teardownTimer.stop();
         return *result->value;
     }
 
@@ -70,15 +99,33 @@ GStreamerAudioMixer::MixerPipeline& GStreamerAudioMixer::ensureMixerPipeline(Dat
         audioSink = createAutoAudioSink({ });
 
     gst_bin_add_many(GST_BIN_CAST(pipeline.get()), mixer, audioSink, nullptr);
-    gst_element_link(mixer, audioSink);
+    GstElement* echoProbe = nullptr;
+    if (isGStreamerPluginAvailable("webrtcdsp"_s))
+        echoProbe = makeGStreamerElement("webrtcechoprobe"_s, makeString("webkitechoprobe-"_s, deviceId));
+    if (echoProbe) {
+        auto* echoFormat = gst_element_factory_make("capsfilter", nullptr);
+        GRefPtr echoCaps = adoptGRef(gst_caps_new_simple("audio/x-raw", "format", G_TYPE_STRING, "S16LE", "layout", G_TYPE_STRING, "interleaved", "rate", G_TYPE_INT, 48000, nullptr));
+        g_object_set(echoFormat, "caps", echoCaps.get(), nullptr);
+        auto* outputConvert = makeGStreamerElement("audioconvert"_s);
+        auto* outputResample = makeGStreamerElement("audioresample"_s);
+        gst_bin_add_many(GST_BIN_CAST(pipeline.get()), echoFormat, echoProbe, outputConvert, outputResample, nullptr);
+        gst_element_link_many(mixer, echoFormat, echoProbe, outputConvert, outputResample, audioSink, nullptr);
+        GRefPtr echoClock = adoptGRef(gst_system_clock_obtain());
+        gst_pipeline_use_clock(GST_PIPELINE(pipeline.get()), echoClock.get());
+        GRefPtr echoInput = adoptGRef(gst_element_get_static_pad(echoProbe, "sink"));
+        gst_pad_add_probe(echoInput.get(), GST_PAD_PROBE_TYPE_BUFFER, shiftEchoReferenceTimestamp, GINT_TO_POINTER(static_cast<int>(EchoReferenceShift::ToClockTime)), nullptr);
+        GRefPtr echoOutput = adoptGRef(gst_element_get_static_pad(echoProbe, "src"));
+        gst_pad_add_probe(echoOutput.get(), GST_PAD_PROBE_TYPE_BUFFER, shiftEchoReferenceTimestamp, GINT_TO_POINTER(static_cast<int>(EchoReferenceShift::ToRunningTime)), nullptr);
+    } else
+        gst_element_link(mixer, audioSink);
     gst_element_set_state(pipeline.get(), GST_STATE_READY);
 
     GST_DEBUG_OBJECT(pipeline.get(), "Created mixer pipeline for device '%s'.", deviceId.utf8().data());
     auto mp = std::unique_ptr<MixerPipeline>(new MixerPipeline {
         WTF::move(pipeline),
         GRefPtr<GstElement>(mixer),
-        RunLoop::Timer(RunLoop::mainSingleton(), "GStreamerAudioMixer::TeardownTimer"_s, [deviceId] { GStreamerAudioMixer::singleton().teardownPipeline(deviceId); })
-    });
+        GRefPtr<GstElement>(echoProbe),
+        RunLoop::Timer(RunLoop::mainSingleton(), "GStreamerAudioMixer::TeardownTimer"_s, [deviceId] { GStreamerAudioMixer::singleton().teardownPipeline(deviceId); }) });
     auto addResult = locker->m_pipelines.set(deviceId, WTF::move(mp));
     return *addResult.iterator->value;
 }
@@ -89,8 +136,12 @@ void GStreamerAudioMixer::teardownPipeline(const String& deviceId)
     auto it = locker->m_pipelines.find(deviceId);
     RELEASE_ASSERT(it != locker->m_pipelines.end());
 
+    if (deviceId == "default"_s && locker->echoReferences)
+        return;
+
     auto& mp = *it->value;
-    ASSERT(!mp.mixer->numsinkpads);
+    if (mp.mixer->numsinkpads)
+        return;
     GST_DEBUG_OBJECT(mp.pipeline.get(), "Teardown timeout reached, destroying idle pipeline for device '%s'.", deviceId.utf8().data());
     unregisterPipeline(mp.pipeline);
     gst_element_set_state(mp.pipeline.get(), GST_STATE_NULL);
@@ -233,6 +284,57 @@ void GStreamerAudioMixer::configureSourcePeriodTime(CStringView sourceName, uint
         g_object_set(src.get(), "period-time", periodTime, nullptr);
         return;
     }
+}
+
+void GStreamerAudioMixer::configureCommunicationSource(CStringView sourceName)
+{
+    static constexpr guint64 communicationPeriodTime = 10 * GST_MSECOND;
+    static constexpr guint64 communicationLatencyTime = 30 * GST_MSECOND;
+    DataMutexLocker locker { m_streamingMembers };
+    for (auto& [deviceId, mp] : locker->m_pipelines) {
+        GRefPtr src = adoptGRef(gst_bin_get_by_name(GST_BIN_CAST(mp->pipeline.get()), sourceName.utf8()));
+        if (!src)
+            continue;
+
+        g_object_set(src.get(), "period-time", communicationPeriodTime, "latency-time", communicationLatencyTime, nullptr);
+        return;
+    }
+}
+
+std::optional<CString> GStreamerAudioMixer::acquireEchoReference()
+{
+    if (!isAvailable())
+        return std::nullopt;
+
+    DataMutexLocker locker { m_streamingMembers };
+    auto& mp = ensureMixerPipeline(locker, "default"_s, nullptr);
+    if (!mp.echoProbe)
+        return std::nullopt;
+
+    locker->echoReferences++;
+    if (isMainThread())
+        mp.teardownTimer.stop();
+    GST_DEBUG_OBJECT(mp.pipeline.get(), "Echo reference acquired, %u active.", locker->echoReferences);
+    return CString(GST_ELEMENT_NAME(mp.echoProbe.get()));
+}
+
+void GStreamerAudioMixer::releaseEchoReference()
+{
+    DataMutexLocker locker { m_streamingMembers };
+    if (!locker->echoReferences)
+        return;
+
+    if (--locker->echoReferences)
+        return;
+
+    auto it = locker->m_pipelines.find("default"_s);
+    if (it == locker->m_pipelines.end())
+        return;
+
+    auto& mp = *it->value;
+    GST_DEBUG_OBJECT(mp.pipeline.get(), "Last echo reference released.");
+    if (!mp.mixer->numsinkpads)
+        mp.teardownTimer.startOneShot(s_teardownTimeout);
 }
 
 #undef GST_CAT_DEFAULT

@@ -57,6 +57,8 @@
 #include <wtf/WeakPtr.h>
 #include <wtf/text/AtomStringHash.h>
 
+enum class WebKitAudioSinkUsage : uint8_t;
+
 #if USE(COORDINATED_GRAPHICS)
 #include "CoordinatedPlatformLayerBufferVideo.h"
 #endif
@@ -513,6 +515,7 @@ private:
 
     GstElement* createVideoSink();
     GstElement* createAudioSink();
+    GstElement* createAudioSink(WebKitAudioSinkUsage);
     GstElement* audioSink() const { return m_audioSink.get(); }
 
     friend class MediaPlayerFactoryGStreamer;

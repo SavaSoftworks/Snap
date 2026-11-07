@@ -25,6 +25,7 @@
 #if ENABLE(MEDIA_STREAM) && USE(GSTREAMER)
 
 #include "GStreamerCapturer.h"
+#include <wtf/text/CString.h>
 
 namespace WTF {
 class MediaTime;
@@ -36,18 +37,22 @@ class GStreamerAudioCapturer final : public GStreamerCapturer {
 public:
     GStreamerAudioCapturer(GStreamerCaptureDevice&&);
     GStreamerAudioCapturer(const PipeWireCaptureDevice&);
-    ~GStreamerAudioCapturer() = default;
+    ~GStreamerAudioCapturer();
 
     GstElement* createConverter() final;
     ASCIILiteral name() final { return "Audio"_s; }
 
     bool setSampleRate(int);
+    void setVoiceProcessing(bool);
 
     using SinkAudioDataCallback = Function<void(GRefPtr<GstSample>&&, WTF::MediaTime&&)>;
     void setSinkAudioCallback(SinkAudioDataCallback&&);
 
 private:
     void handleSample(GRefPtr<GstSample>&&);
+    void addVoiceProcessor(GstBin*, bool hasNoiseSuppressor);
+    bool m_voiceProcessing { false };
+    std::optional<CString> m_echoProbeName;
     std::pair<GStreamerCapturer::SinkSignalsHolder, SinkAudioDataCallback> m_sinkAudioDataCallback;
 };
 

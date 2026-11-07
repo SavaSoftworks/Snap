@@ -1636,6 +1636,11 @@ void MediaPlayerPrivateGStreamer::loadingFailed(MediaPlayer::NetworkState networ
 
 GstElement* MediaPlayerPrivateGStreamer::createAudioSink()
 {
+    return createAudioSink(WebKitAudioSinkUsage::Default);
+}
+
+GstElement* MediaPlayerPrivateGStreamer::createAudioSink(WebKitAudioSinkUsage usage)
+{
     auto& quirksManager = GStreamerQuirksManager::singleton();
 
     // If audio is being controlled by an another pipeline, creating sink here may interfere with
@@ -1655,12 +1660,12 @@ GstElement* MediaPlayerPrivateGStreamer::createAudioSink()
     if (!deviceId.isEmpty()) {
         auto [resolvedId, device] = resolveAudioOutputDevice(deviceId);
         if (device)
-            audioSink = createPlatformAudioSink(role, resolvedId, device);
+            audioSink = usage == WebKitAudioSinkUsage::Communication ? createCommunicationAudioSink(role, resolvedId, device) : createPlatformAudioSink(role, resolvedId, device);
     }
 #endif
 
     if (!audioSink)
-        audioSink = createPlatformAudioSink(role);
+        audioSink = usage == WebKitAudioSinkUsage::Communication ? createCommunicationAudioSink(role) : createPlatformAudioSink(role);
     RELEASE_ASSERT(audioSink);
     if (!audioSink)
         return nullptr;
@@ -3675,6 +3680,17 @@ void MediaPlayerPrivateGStreamer::createGSTPlayBin(const URL& url)
     ASSERT(m_textSink);
 
     g_object_set(m_pipeline.get(), "text-sink", m_textSink.get(), nullptr);
+
+    if (isMediaStream) {
+        bool hasAudioSourceClient = false;
+#if ENABLE(WEB_AUDIO)
+        hasAudioSourceClient = m_audioSourceProvider && m_audioSourceProvider->client();
+#endif
+        if (!hasAudioSourceClient) {
+            if (auto* communicationSink = createAudioSink(WebKitAudioSinkUsage::Communication))
+                m_audioSink = communicationSink;
+        }
+    }
 
     if (!m_audioSink)
         m_audioSink = createAudioSink();

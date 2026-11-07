@@ -27,6 +27,7 @@
 #include <wtf/HashMap.h>
 #include <wtf/RunLoop.h>
 #include <wtf/Seconds.h>
+#include <wtf/text/CString.h>
 #include <wtf/text/CStringView.h>
 #include <wtf/text/StringHash.h>
 
@@ -43,6 +44,10 @@ public:
     void unregisterProducer(const GRefPtr<GstPad>&);
 
     void configureSourcePeriodTime(CStringView sourceName, uint64_t periodTime);
+    void configureCommunicationSource(CStringView sourceName);
+
+    std::optional<CString> acquireEchoReference();
+    void releaseEchoReference();
 
 private:
     GStreamerAudioMixer();
@@ -50,12 +55,14 @@ private:
     struct MixerPipeline {
         GRefPtr<GstElement> pipeline;
         GRefPtr<GstElement> mixer;
+        GRefPtr<GstElement> echoProbe;
         RunLoop::Timer teardownTimer;
     };
 
     struct StreamingMembers {
         HashMap<String, std::unique_ptr<MixerPipeline>> m_pipelines;
         HashMap<GstPad*, String> m_padToDeviceId; // Reverse lookup: pad → deviceId.
+        unsigned echoReferences { 0 };
     };
 
     MixerPipeline& ensureMixerPipeline(DataMutexLocker<StreamingMembers>&, const String& deviceId, const GRefPtr<GstDevice>&);

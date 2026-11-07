@@ -127,6 +127,7 @@ std::pair<GstClockTime, GstClockTime> GStreamerAudioCaptureSource::queryCaptureL
 
 void GStreamerAudioCaptureSource::startProducingData()
 {
+    m_capturer->setVoiceProcessing(echoCancellation());
     m_capturer->setupPipeline();
     m_capturer->setSampleRate(sampleRate());
     m_capturer->setSinkAudioCallback([this](auto&& sample, auto&& presentationTime) {
@@ -163,6 +164,14 @@ void GStreamerAudioCaptureSource::settingsDidChange(OptionSet<RealtimeMediaSourc
 {
     if (settings.contains(RealtimeMediaSourceSettings::Flag::SampleRate))
         m_capturer->setSampleRate(sampleRate());
+
+    if (settings.contains(RealtimeMediaSourceSettings::Flag::EchoCancellation)) {
+        m_capturer->setVoiceProcessing(echoCancellation());
+        if (isProducingData()) {
+            m_capturer->stop();
+            startProducingData();
+        }
+    }
 }
 
 const RealtimeMediaSourceSettings& GStreamerAudioCaptureSource::settings()
