@@ -29,10 +29,14 @@
 #include "Allowlist.h"
 #include "Document.h"
 #include "ElementInlines.h"
+#include "FrameDestructionObserverInlines.h"
+#include "FrameTree.h"
 #include "HTMLIFrameElement.h"
 #include "HTMLNames.h"
 #include "LocalDOMWindow.h"
+#include "LocalFrame.h"
 #include "OwnerPermissionsPolicyData.h"
+#include "Page.h"
 #include "Quirks.h"
 #include "SecurityOrigin.h"
 #include <wtf/TZoneMalloc.h>
@@ -91,6 +95,8 @@ static ASCIILiteral toFeatureNameForLogging(PermissionsPolicy::Feature feature)
         return "PrivateToken"_s;
     case PermissionsPolicy::Feature::StorageAccess:
         return "StorageAccess"_s;
+    case PermissionsPolicy::Feature::Autoplay:
+        return "Autoplay"_s;
     case PermissionsPolicy::Feature::Invalid:
         return "Invalid"_s;
     }
@@ -131,6 +137,7 @@ static std::pair<PermissionsPolicy::Feature, StringView> readFeatureIdentifier(S
 #endif
     constexpr auto privateTokenToken { "private-token"_s };
     constexpr auto storageAccessToken { "storage-access"_s };
+    constexpr auto autoplayToken { "autoplay"_s };
 
     if (value.startsWith(cameraToken)) {
         feature = PermissionsPolicy::Feature::Camera;
@@ -195,6 +202,9 @@ static std::pair<PermissionsPolicy::Feature, StringView> readFeatureIdentifier(S
     } else if (value.startsWith(storageAccessToken)) {
         feature = PermissionsPolicy::Feature::StorageAccess;
         remainingValue = value.substring(storageAccessToken.length());
+    } else if (value.startsWith(autoplayToken)) {
+        feature = PermissionsPolicy::Feature::Autoplay;
+        remainingValue = value.substring(autoplayToken.length());
     }
 
     // FIXME: webkit.org/b/274159.
@@ -235,6 +245,7 @@ static ASCIILiteral defaultAllowlistValue(PermissionsPolicy::Feature feature)
     case PermissionsPolicy::Feature::XRSpatialTracking:
 #endif
     case PermissionsPolicy::Feature::PrivateToken:
+    case PermissionsPolicy::Feature::Autoplay:
         return "'self'"_s;
     case PermissionsPolicy::Feature::Invalid:
         return "'none'"_s;
@@ -430,6 +441,28 @@ PermissionsPolicy::PermissionsPolicy()
     forEachFeature([&](auto feature) {
         m_inheritedPolicy.add(feature);
     });
+}
+
+bool PermissionsPolicy::isDocumentAllowedToAutoplay(const Document& document)
+{
+    if (document.requiresUserGestureForVideoPlayback())
+        return false;
+
+    RefPtr page = document.page();
+    if (page && page->requiresUserGestureForVideoPlayback())
+        return false;
+
+    if (document.isCapturing())
+        return true;
+
+    bool autoplayIsEnabled = isFeatureEnabled(Feature::Autoplay, document, ShouldReportViolation::No);
+    for (RefPtr frame = document.frame(); frame; frame = dynamicDowncast<LocalFrame>(frame->tree().parent())) {
+        if (RefPtr window = frame->window(); window && window->hasStickyActivation())
+            return true;
+        if (!autoplayIsEnabled)
+            return false;
+    }
+    return false;
 }
 
 bool PermissionsPolicy::isFeatureEnabled(Feature feature, const Document& document, ShouldReportViolation shouldReportViolation)

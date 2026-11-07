@@ -50,6 +50,7 @@
 #include "Navigator.h"
 #include "NowPlayingInfo.h"
 #include "Page.h"
+#include "PermissionsPolicy.h"
 #include "PlatformMediaSessionManager.h"
 #include "RenderBoxInlines.h"
 #include "RenderMediaInlines.h"
@@ -527,7 +528,7 @@ Expected<void, MediaPlaybackDenialExplanation> MediaElementSession::playbackStat
     if (m_restrictions & RequireUserGestureForVideoRateChange && element->isVideo() && !document->processingUserGestureForMedia())
         return makeUnexpectedDenial(MediaPlaybackDenialReason::UserGestureRequired, "User gesture required for video rate change"_s);
 
-    if (m_restrictions & RequireUserGestureForAudioRateChange && (!element->isVideo() || element->hasAudio()) && !element->muted() && element->volume() && !document->processingUserGestureForMedia())
+    if (m_restrictions & RequireUserGestureForAudioRateChange && (!element->isVideo() || element->hasAudio()) && !element->muted() && element->volume() && !document->processingUserGestureForMedia() && !PermissionsPolicy::isDocumentAllowedToAutoplay(document.get()))
         return makeUnexpectedDenial(MediaPlaybackDenialReason::UserGestureRequired, "User gesture required for audio rate change"_s);
 
     if (m_restrictions & RequirePageVisibilityToPlayAudio && (!element->isVideo() || element->hasAudio()) && !element->muted() && element->volume() && element->elementIsHidden())

@@ -43,6 +43,7 @@
 #include "NowPlayingInfo.h"
 #include "PageInlines.h"
 #include "Performance.h"
+#include "PermissionsPolicy.h"
 #include "PlatformMediaSessionManager.h"
 #include "Settings.h"
 #include <wtf/CryptographicallyRandomNumber.h>
@@ -96,7 +97,9 @@ static bool shouldDocumentAllowWebAudioToAutoPlay(const Document& document)
     if (document.quirks().shouldAutoplayWebAudioForArbitraryUserGesture() && mainDocument && mainDocument->hasHadUserInteraction())
         return true;
     RefPtr window = document.window();
-    return window && window->hasTransientActivation();
+    if (window && window->hasTransientActivation())
+        return true;
+    return PermissionsPolicy::isDocumentAllowedToAutoplay(document);
 }
 
 void AudioContext::setDefaultSampleRateForTesting(std::optional<float> sampleRate)
@@ -264,6 +267,10 @@ void AudioContext::suspendRendering(DOMPromiseDeferred<void>&& promise)
     m_wasSuspendedByScript = true;
 
     if (!willPausePlayback()) {
+        if (state() == State::Suspended) {
+            promise.resolve();
+            return;
+        }
         addReaction(State::Suspended, WTF::move(promise));
         return;
     }

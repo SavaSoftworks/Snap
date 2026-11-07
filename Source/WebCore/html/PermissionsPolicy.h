@@ -71,10 +71,12 @@ public:
 #endif
         PrivateToken,
         StorageAccess,
+        Autoplay,
         Invalid
     };
     enum class ShouldReportViolation : bool { No, Yes };
     static bool isFeatureEnabled(Feature, const Document&, ShouldReportViolation = ShouldReportViolation::Yes);
+    static bool isDocumentAllowedToAutoplay(const Document&);
     bool NODELETE inheritedPolicyValueForFeature(Feature) const;
 
     // InheritedPolicy contains enabled features.

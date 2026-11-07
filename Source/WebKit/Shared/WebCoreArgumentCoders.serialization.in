@@ -6751,6 +6751,7 @@ struct WebCore::OwnerPermissionsPolicyData {
 #endif
     PrivateToken,
     StorageAccess,
+    Autoplay,
     Invalid
 };
 
