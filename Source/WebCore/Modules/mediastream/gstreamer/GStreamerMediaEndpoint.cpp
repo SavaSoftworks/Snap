@@ -1962,7 +1962,28 @@ ExceptionOr<GStreamerMediaEndpoint::Backends> GStreamerMediaEndpoint::createTran
             gst_printerrln("Missing video encoder / RTP payloader. Please install an H.264 encoder and/or a VP8 encoder");
     }
 
-    gst_structure_set_value(initData.get(), "encodings", &encodingsValue);
+    std::optional<uint32_t> sourceSSRC;
+    GValue reservedEncodings = G_VALUE_INIT;
+    g_value_init(&reservedEncodings, GST_TYPE_LIST);
+    auto releaseReservedEncodings = makeScopeExit([&] {
+        g_value_unset(&reservedEncodings);
+    });
+    unsigned encodingCount = gst_value_list_get_size(&encodingsValue);
+    for (unsigned i = 0; i < encodingCount; ++i) {
+        auto ssrc = m_ssrcGenerator->generateSSRC();
+        if (!ssrc || ssrc == std::numeric_limits<uint32_t>::max())
+            return Exception { ExceptionCode::OperationError, "Unable to reserve an RTP source identifier"_s };
+        const auto* encoding = gst_value_get_structure(gst_value_list_get_value(&encodingsValue, i));
+        GUniquePtr<GstStructure> reservedEncoding(gst_structure_copy(encoding));
+        gst_structure_set(reservedEncoding.get(), "reserved-ssrc", G_TYPE_UINT, ssrc, nullptr);
+        GValue value = G_VALUE_INIT;
+        g_value_init(&value, GST_TYPE_STRUCTURE);
+        gst_value_set_structure(&value, reservedEncoding.get());
+        gst_value_list_append_and_take_value(&reservedEncodings, &value);
+        if (encodingCount == 1)
+            sourceSSRC = ssrc;
+    }
+    gst_structure_set_value(initData.get(), "encodings", &reservedEncodings);
 
     auto transactionId = createVersion4UUIDString();
     gst_structure_set(initData.get(), "transaction-id", G_TYPE_STRING, transactionId.ascii().data(), nullptr);
@@ -1982,7 +2003,7 @@ ExceptionOr<GStreamerMediaEndpoint::Backends> GStreamerMediaEndpoint::createTran
     }, [](std::nullptr_t&) {
     });
 
-    auto transceiver = makeUniqueRef<GStreamerRtpTransceiverBackend>(WTF::move(rtcTransceiver));
+    auto transceiver = makeUniqueRef<GStreamerRtpTransceiverBackend>(WTF::move(rtcTransceiver), sourceSSRC);
 
     return GStreamerMediaEndpoint::Backends { transceiver->createSenderBackend(WeakPtr { m_peerConnectionBackend }, WTF::move(source), WTF::move(initData)), transceiver->createReceiverBackend(), WTF::move(transceiver) };
 }

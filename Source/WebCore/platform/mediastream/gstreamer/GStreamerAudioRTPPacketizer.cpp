@@ -62,7 +62,8 @@ RefPtr<GStreamerAudioRTPPacketizer> GStreamerAudioRTPPacketizer::create(RefPtr<U
     GRefPtr inputCaps = adoptGRef(gst_caps_new_any());
     GUniquePtr<GstStructure> structure(gst_structure_copy(codecParameters));
 
-    auto ssrc = ssrcGenerator->generateSSRC();
+    auto reservedSSRC = encodingParameters ? gstStructureGet<unsigned>(encodingParameters.get(), "reserved-ssrc"_s) : std::nullopt;
+    auto ssrc = reservedSSRC ? *reservedSSRC : ssrcGenerator->generateSSRC();
     if (ssrc != std::numeric_limits<uint32_t>::max())
         gst_structure_set(structure.get(), "ssrc", G_TYPE_UINT, ssrc, nullptr);
 

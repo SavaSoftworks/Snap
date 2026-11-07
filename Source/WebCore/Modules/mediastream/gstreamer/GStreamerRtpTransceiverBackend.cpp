@@ -38,13 +38,24 @@ namespace WebCore {
 
 WTF_MAKE_TZONE_ALLOCATED_IMPL(GStreamerRtpTransceiverBackend);
 
-GStreamerRtpTransceiverBackend::GStreamerRtpTransceiverBackend(GRefPtr<GstWebRTCRTPTransceiver>&& rtcTransceiver)
+GStreamerRtpTransceiverBackend::GStreamerRtpTransceiverBackend(GRefPtr<GstWebRTCRTPTransceiver>&& rtcTransceiver, std::optional<uint32_t> sourceSSRC)
     : m_rtcTransceiver(WTF::move(rtcTransceiver))
+    , m_sourceSSRC(sourceSSRC)
 {
     static std::once_flag debugRegisteredFlag;
     std::call_once(debugRegisteredFlag, [] {
         GST_DEBUG_CATEGORY_INIT(webkit_webrtc_transceiver_debug, "webkitwebrtcrtptransceiver", 0, "WebKit WebRTC RTP transceiver");
     });
+
+    if (m_sourceSSRC) {
+        GRefPtr<GstCaps> caps;
+        g_object_get(m_rtcTransceiver.get(), "codec-preferences", &caps.outPtr(), nullptr);
+        if (caps) {
+            caps = adoptGRef(gst_caps_make_writable(caps.leakRef()));
+            applySourceSSRC(caps.get(), direction());
+            g_object_set(m_rtcTransceiver.get(), "codec-preferences", caps.get(), nullptr);
+        }
+    }
 
     GstWebRTCKind kind;
     g_object_get(m_rtcTransceiver.get(), "kind", &kind, nullptr);
@@ -91,6 +102,21 @@ std::optional<RTCRtpTransceiverDirection> GStreamerRtpTransceiverBackend::curren
     return toRTCRtpTransceiverDirection(gstDirection);
 }
 
+void GStreamerRtpTransceiverBackend::applySourceSSRC(GstCaps* caps, RTCRtpTransceiverDirection direction)
+{
+    if (!m_sourceSSRC || gst_caps_is_empty(caps) || gst_caps_is_any(caps))
+        return;
+    bool sends = direction == RTCRtpTransceiverDirection::Sendonly || direction == RTCRtpTransceiverDirection::Sendrecv;
+    m_hasSendingSSRC |= sends;
+    for (unsigned i = 0; i < gst_caps_get_size(caps); ++i) {
+        auto* structure = gst_caps_get_structure(caps, i);
+        if (m_hasSendingSSRC && !i)
+            gst_structure_set(structure, "ssrc", G_TYPE_UINT, *m_sourceSSRC, nullptr);
+        else
+            gst_structure_remove_field(structure, "ssrc");
+    }
+}
+
 void GStreamerRtpTransceiverBackend::setDirection(RTCRtpTransceiverDirection direction)
 {
     auto gstDirection = fromRTCRtpTransceiverDirection(direction);
@@ -98,7 +124,15 @@ void GStreamerRtpTransceiverBackend::setDirection(RTCRtpTransceiverDirection dir
     auto directionString = GMallocString::unsafeAdoptFromUTF8(g_enum_to_string(GST_TYPE_WEBRTC_RTP_TRANSCEIVER_DIRECTION, gstDirection));
     GST_DEBUG_OBJECT(m_rtcTransceiver.get(), "Setting direction to %s", directionString.utf8());
 #endif
-    g_object_set(m_rtcTransceiver.get(), "direction", gstDirection, nullptr);
+    GRefPtr<GstCaps> caps;
+    if (m_sourceSSRC)
+        g_object_get(m_rtcTransceiver.get(), "codec-preferences", &caps.outPtr(), nullptr);
+    if (caps) {
+        caps = adoptGRef(gst_caps_make_writable(caps.leakRef()));
+        applySourceSSRC(caps.get(), direction);
+        g_object_set(m_rtcTransceiver.get(), "direction", gstDirection, "codec-preferences", caps.get(), nullptr);
+    } else
+        g_object_set(m_rtcTransceiver.get(), "direction", gstDirection, nullptr);
 }
 
 String GStreamerRtpTransceiverBackend::mid()
@@ -196,6 +230,7 @@ ExceptionOr<void> GStreamerRtpTransceiverBackend::setCodecPreferences(const Vect
         gst_caps_append(gstCodecs.get(), codecCaps.leakRef());
     }
     GST_DEBUG_OBJECT(m_rtcTransceiver.get(), "Setting codec preferences to %" GST_PTR_FORMAT, gstCodecs.get());
+    applySourceSSRC(gstCodecs.get(), direction());
     g_object_set(m_rtcTransceiver.get(), "codec-preferences", gstCodecs.get(), nullptr);
     return { };
 }

@@ -139,7 +139,8 @@ RefPtr<GStreamerVideoRTPPacketizer> GStreamerVideoRTPPacketizer::create(RefPtr<U
         return nullptr;
     }
 
-    auto ssrc = ssrcGenerator->generateSSRC();
+    auto reservedSSRC = encodingParameters ? gstStructureGet<unsigned>(encodingParameters.get(), "reserved-ssrc"_s) : std::nullopt;
+    auto ssrc = reservedSSRC ? *reservedSSRC : ssrcGenerator->generateSSRC();
     if (ssrc != std::numeric_limits<uint32_t>::max())
         gst_structure_set(codecParameters.get(), "ssrc", G_TYPE_UINT, ssrc, nullptr);
 

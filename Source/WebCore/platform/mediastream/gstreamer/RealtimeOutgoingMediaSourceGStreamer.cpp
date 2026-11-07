@@ -84,6 +84,7 @@ void RealtimeOutgoingMediaSourceGStreamer::initialize()
     });
 
     m_bin = gst_bin_new(nullptr);
+    gst_element_set_locked_state(m_bin.get(), TRUE);
     m_inputSelector = gst_element_factory_make("input-selector", nullptr);
     g_object_set(m_inputSelector.get(), "sync-streams", FALSE, nullptr);
     m_tee = gst_element_factory_make("tee", nullptr);
@@ -260,6 +261,7 @@ void RealtimeOutgoingMediaSourceGStreamer::link()
 
     GRefPtr srcPad = adoptGRef(gst_element_get_static_pad(m_bin.get(), "src"));
     gst_pad_link(srcPad.get(), m_webrtcSinkPad.get());
+    gst_element_set_locked_state(m_bin.get(), FALSE);
 }
 
 void RealtimeOutgoingMediaSourceGStreamer::setSinkPad(GRefPtr<GstPad>&& pad)
@@ -477,8 +479,19 @@ void RealtimeOutgoingMediaSourceGStreamer::setParameters(GUniquePtr<GstStructure
         return;
     }
 
-    for (const auto& encoding : encodings) {
-        GUniquePtr<GstStructure> encodingParameters(gst_structure_copy(encoding));
+    GValue reservedEncodings = G_VALUE_INIT;
+    g_value_init(&reservedEncodings, GST_TYPE_LIST);
+    auto oldEncodings = m_parameters ? gstStructureGetList<const GstStructure*>(m_parameters.get(), "encodings"_s) : Vector<const GstStructure*> {};
+    for (unsigned i = 0; i < encodings.size(); ++i) {
+        GUniquePtr<GstStructure> encodingParameters(gst_structure_copy(encodings[i]));
+        if (i < oldEncodings.size()) {
+            if (auto ssrc = gstStructureGet<unsigned>(oldEncodings[i], "reserved-ssrc"_s))
+                gst_structure_set(encodingParameters.get(), "reserved-ssrc", G_TYPE_UINT, *ssrc, nullptr);
+        }
+        GValue reservedEncoding = G_VALUE_INIT;
+        g_value_init(&reservedEncoding, GST_TYPE_STRUCTURE);
+        gst_value_set_structure(&reservedEncoding, encodingParameters.get());
+        gst_value_list_append_and_take_value(&reservedEncodings, &reservedEncoding);
         auto rid = gstStructureGetString(encodingParameters.get(), "rid"_s);
         if (!rid)
             continue;
@@ -489,6 +502,7 @@ void RealtimeOutgoingMediaSourceGStreamer::setParameters(GUniquePtr<GstStructure
 
         packetizer->reconfigure(WTF::move(encodingParameters));
     }
+    gst_structure_take_value(parameters.get(), "encodings", &reservedEncodings);
     m_parameters = WTF::move(parameters);
 }
 

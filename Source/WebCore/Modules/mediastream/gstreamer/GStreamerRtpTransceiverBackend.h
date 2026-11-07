@@ -34,7 +34,7 @@ class GStreamerRtpReceiverBackend;
 class GStreamerRtpTransceiverBackend final : public RTCRtpTransceiverBackend {
     WTF_MAKE_TZONE_ALLOCATED(GStreamerRtpTransceiverBackend);
 public:
-    GStreamerRtpTransceiverBackend(GRefPtr<GstWebRTCRTPTransceiver>&&);
+    GStreamerRtpTransceiverBackend(GRefPtr<GstWebRTCRTPTransceiver>&&, std::optional<uint32_t> sourceSSRC = std::nullopt);
 
     UniqueRef<GStreamerRtpReceiverBackend> createReceiverBackend();
     Ref<GStreamerRtpSenderBackend> createSenderBackend(WeakPtr<GStreamerPeerConnectionBackend>&&, GStreamerRtpSenderBackend::Source&&, GUniquePtr<GstStructure>&&);
@@ -52,7 +52,10 @@ public:
     ExceptionOr<void> setCodecPreferences(const Vector<RTCRtpCodec>&) final;
 
 private:
+    void applySourceSSRC(GstCaps*, RTCRtpTransceiverDirection);
     GRefPtr<GstWebRTCRTPTransceiver> m_rtcTransceiver;
+    const std::optional<uint32_t> m_sourceSSRC;
+    bool m_hasSendingSSRC { false };
     bool m_isStopped { false };
 };
 
