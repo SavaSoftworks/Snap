@@ -34,6 +34,10 @@
 #include "NotImplemented.h"
 #include "OpenTypeTypes.h"
 #include "SkiaHarfBuzzFont.h"
+#include <algorithm>
+#include <array>
+#include <hb-ot.h>
+#include <span>
 #include <wtf/Hasher.h>
 
 #if ENABLE(MATHML)
@@ -130,6 +134,84 @@ bool FontPlatformData::skiaTypefaceHasAnySupportedColorTable(const SkTypeface& t
     return false;
 }
 
+static bool snapTableHasAnyFeature(hb_face_t* face, hb_tag_t table, std::span<const hb_tag_t> wanted)
+{
+    unsigned offset = 0;
+    while (true) {
+        std::array<hb_tag_t, 64> tags;
+        unsigned count = tags.size();
+        hb_ot_layout_table_get_feature_tags(face, table, offset, &count, tags.data());
+        if (!count)
+            return false;
+        for (unsigned i = 0; i < count; ++i) {
+            if (std::ranges::find(wanted, tags[i]) != wanted.end())
+                return true;
+        }
+        offset += count;
+    }
+}
+
+static bool snapFaceHasTable(hb_face_t* face, hb_tag_t tag)
+{
+    hb_blob_t* blob = hb_face_reference_table(face, tag);
+    bool present = hb_blob_get_length(blob);
+    hb_blob_destroy(blob);
+    return present;
+}
+
+static uint8_t snapComputeSimpleTextShapingFlags(hb_face_t* face)
+{
+    static constexpr uint8_t substitution = 1;
+    static constexpr uint8_t kernPositioning = 2;
+    static constexpr uint8_t otherPositioning = 4;
+    static constexpr std::array substitutionTags {
+        HB_TAG('r', 'v', 'r', 'n'),
+        HB_TAG('l', 't', 'r', 'a'),
+        HB_TAG('l', 't', 'r', 'm'),
+        HB_TAG('r', 't', 'l', 'a'),
+        HB_TAG('r', 't', 'l', 'm'),
+        HB_TAG('f', 'r', 'a', 'c'),
+        HB_TAG('n', 'u', 'm', 'r'),
+        HB_TAG('d', 'n', 'o', 'm'),
+        HB_TAG('r', 'a', 'n', 'd'),
+        HB_TAG('c', 'c', 'm', 'p'),
+        HB_TAG('l', 'o', 'c', 'l'),
+        HB_TAG('r', 'l', 'i', 'g'),
+        HB_TAG('c', 'a', 'l', 't'),
+        HB_TAG('c', 'l', 'i', 'g'),
+        HB_TAG('l', 'i', 'g', 'a'),
+        HB_TAG('r', 'c', 'l', 't'),
+        HB_TAG('H', 'a', 'r', 'f'),
+        HB_TAG('H', 'A', 'R', 'F'),
+        HB_TAG('B', 'u', 'z', 'z'),
+        HB_TAG('B', 'U', 'Z', 'Z'),
+    };
+    static constexpr std::array kernTags { HB_TAG('k', 'e', 'r', 'n') };
+    static constexpr std::array otherPositioningTags {
+        HB_TAG('m', 'a', 'r', 'k'),
+        HB_TAG('m', 'k', 'm', 'k'),
+        HB_TAG('c', 'u', 'r', 's'),
+        HB_TAG('d', 'i', 's', 't'),
+        HB_TAG('a', 'b', 'v', 'm'),
+        HB_TAG('b', 'l', 'w', 'm'),
+        HB_TAG('H', 'a', 'r', 'f'),
+        HB_TAG('H', 'A', 'R', 'F'),
+        HB_TAG('B', 'u', 'z', 'z'),
+        HB_TAG('B', 'U', 'Z', 'Z'),
+    };
+    uint8_t flags = 0;
+    if (snapFaceHasTable(face, HB_TAG('m', 'o', 'r', 'x')) || snapFaceHasTable(face, HB_TAG('m', 'o', 'r', 't'))
+        || (hb_ot_layout_has_substitution(face) && snapTableHasAnyFeature(face, HB_OT_TAG_GSUB, substitutionTags)))
+        flags |= substitution;
+    if (snapFaceHasTable(face, HB_TAG('k', 'e', 'r', 'n')) || snapFaceHasTable(face, HB_TAG('k', 'e', 'r', 'x'))
+        || (hb_ot_layout_has_positioning(face) && snapTableHasAnyFeature(face, HB_OT_TAG_GPOS, kernTags)))
+        flags |= kernPositioning;
+    if (snapFaceHasTable(face, HB_TAG('t', 'r', 'a', 'k'))
+        || (hb_ot_layout_has_positioning(face) && snapTableHasAnyFeature(face, HB_OT_TAG_GPOS, otherPositioningTags)))
+        flags |= otherPositioning;
+    return flags;
+}
+
 void FontPlatformData::platformDataInit()
 {
     m_font.setEmbolden(m_metadata.isSyntheticBold);
@@ -156,6 +238,12 @@ void FontPlatformData::platformDataInit()
     auto& typeface = *m_font.getTypeface();
     m_hbFont = SkiaHarfBuzzFont::getOrCreate(typeface);
     m_isColorBitmapFont = m_hbFont->isColorBitmapFont();
+    m_simpleTextShapingFlags = snapComputeSimpleTextShapingFlags(hb_font_get_face(hbFont()));
+    m_simpleTextFeaturesWithoutKerning.clear();
+    if (!m_features.isEmpty()) {
+        m_simpleTextFeaturesWithoutKerning.append({ HB_TAG('k', 'e', 'r', 'n'), 0, 0, static_cast<unsigned>(-1) });
+        m_simpleTextFeaturesWithoutKerning.appendVector(m_features);
+    }
 }
 
 std::optional<FontPlatformData> FontPlatformData::fromIPCData(const FontMetadata& metadata, IPCData&& ipcData)
@@ -257,6 +345,30 @@ FontPlatformData::Attributes FontPlatformData::attributes() const
     SkFontStyle style = skFont().getTypeface()->fontStyle();
     Vector<hb_feature_t> features = m_features;
     return { m_metadata, familyName, style, WTF::move(features) };
+}
+
+const Vector<hb_feature_t>& FontPlatformData::simpleTextFeatures(bool enableKerning) const
+{
+    static const Vector<hb_feature_t> featuresWithKerningDisabled = [] {
+        Vector<hb_feature_t> features;
+        features.append({ HB_TAG('k', 'e', 'r', 'n'), 0, 0, static_cast<unsigned>(-1) });
+        return features;
+    }();
+    if (enableKerning)
+        return m_features;
+    return m_simpleTextFeaturesWithoutKerning.isEmpty() ? featuresWithKerningDisabled : m_simpleTextFeaturesWithoutKerning;
+}
+
+bool FontPlatformData::simpleTextNeedsShaping(bool enableKerning) const
+{
+    static constexpr uint8_t substitution = 1;
+    static constexpr uint8_t kernPositioning = 2;
+    static constexpr uint8_t otherPositioning = 4;
+    if (!m_features.isEmpty())
+        return true;
+    if (m_simpleTextShapingFlags & (substitution | otherPositioning))
+        return true;
+    return enableKerning && (m_simpleTextShapingFlags & kernPositioning);
 }
 
 hb_font_t* FontPlatformData::hbFont() const

@@ -54,7 +54,7 @@ namespace TextMeasurementCacheDefaults {
 static constexpr int minInterval = -3; // A cache hit pays for about 3 cache misses.
 static constexpr int maxInterval = 20; // Sampling at this interval has almost no overhead.
 static constexpr unsigned maxSize = 500000; // Just enough to guard against pathological growth.
-static constexpr unsigned maxTextLength = 64; // Maximum text length for SmallStringKey.
+static constexpr unsigned maxTextLength = 128; // Maximum text length for SmallStringKey.
 }
 
 template <typename CachedType,
@@ -85,7 +85,7 @@ private:
                 copySmallCharacters(std::span { m_characters }, string.span8());
             else
                 copySmallCharacters(std::span { m_characters }, string.span16());
-            m_hashAndLength = RapidHash::computeHashAndMaskTop8Bits(std::span<const char16_t> { m_characters }.first(s_capacity)) | (length << 24);
+            m_hashAndLength = RapidHash::computeHashAndMaskTop8Bits(std::span<const char16_t> { m_characters }.first(length)) | (length << 24);
         }
 
         const char16_t* characters() const LIFETIME_BOUND { return m_characters.data(); }

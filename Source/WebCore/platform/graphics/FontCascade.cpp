@@ -22,6 +22,21 @@
  */
 
 #include "config.h"
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <unicode/uchar.h>
+
+#if USE(SKIA)
+static bool snapSimpleTextTransformsEnabled()
+{
+    static bool enabled = [] {
+        const char* value = std::getenv("WEBKIT_SNAP_DISABLE_SIMPLE_TEXT");
+        return !value || std::strcmp(value, "1");
+    }();
+    return enabled;
+}
+#endif
 #include "FontCascade.h"
 
 #include "ComplexTextController.h"
@@ -180,6 +195,11 @@ TextShapingResult FontCascade::layoutText(CodePath codePathToUse, const TextRun&
         if (auto* cached = fonts->getOrCreateCachedShapedText(run, *this, from, to, forTextEmphasis))
             return cached->textShapingResult;
     }
+
+#if USE(SKIA)
+    if (forTextEmphasis == ForTextEmphasis::Yes && snapSimpleTextTransformsEnabled())
+        return layoutComplexText(run, from, to, forTextEmphasis);
+#endif
 
     if (shouldUseComplexTextController(codePathToUse))
         return layoutComplexText(run, from, to, forTextEmphasis);
@@ -402,9 +422,28 @@ NEVER_INLINE float FontCascade::widthForSimpleTextSlow(StringView text, TextDire
 
     auto initialAdvance = font->applyTransforms(glyphBuffer, 0, 0, enableKerning(), requiresShaping(), fontDescription().computedLocale(), text, textDirection);
     auto result = 0.f;
+#if USE(SKIA)
+    float spaceWidth = font->spaceWidth(Font::SyntheticBoldInclusion::Exclude);
+    for (size_t i = 0; i < glyphBuffer.size(); ++i)
+        result += treatAsSpace(text[glyphBuffer.uncheckedStringOffsetAt(i)]) ? spaceWidth : WebCore::width(glyphBuffer.advanceAt(i));
+#else
     for (size_t i = 0; i < glyphBuffer.size(); ++i)
         result += WebCore::width(glyphBuffer.advanceAt(i));
+#endif
     result += WebCore::width(initialAdvance);
+#ifdef WEBKIT_SNAP_VERIFY_PATCHES
+    {
+        TextRun verificationRun { text, 0, 0, ExpansionBehavior::defaultBehavior(), textDirection, false, false };
+        ComplexTextController controller(*this, verificationRun, true, nullptr);
+        float expected = controller.totalAdvance().width();
+        if (std::abs(expected - result) > 0.01f) {
+            static unsigned reports = 0;
+            if (reports++ < 200)
+                WTFLogAlways("Snap simple text: width mismatch simple=%f complex=%f length=%u text=%s", result, expected, text.length(), text.utf8().data());
+            RELEASE_ASSERT_NOT_REACHED();
+        }
+    }
+#endif
 #endif
     if (cacheEntry)
         cacheEntry->width = result;
@@ -691,6 +730,11 @@ bool FontCascade::shouldUseComplexTextControllerForSimpleText() const
     if (fontDescription().variantCaps() != FontVariantCaps::Normal || fontDescription().variantEmoji() == FontVariantEmoji::Emoji)
         return true;
 
+#if USE(SKIA)
+    if (snapSimpleTextTransformsEnabled() && fontDescription().orientation() == FontOrientation::Horizontal)
+        return false;
+#endif
+
     return enableKerning() || requiresShaping();
 }
 #endif
@@ -705,10 +749,49 @@ Markable<FontCascade::CodePath> FontCascade::forcedCodePath()
     return s_forcedCodePath;
 }
 
+static bool snapSimpleTextHasOppositeBidiRun(const TextRun& run)
+{
+    bool rightToLeft = run.rtl();
+    if (run.is8Bit()) {
+        if (!rightToLeft)
+            return false;
+        for (auto character : run.span8()) {
+            if (isASCIIAlpha(character) || isASCIIDigit(character))
+                return true;
+        }
+        return false;
+    }
+
+    auto characters = run.span16();
+    for (size_t index = 0; index < characters.size(); ++index) {
+        UChar32 character = characters[index];
+        if (U16_IS_LEAD(characters[index]) && index + 1 < characters.size() && U16_IS_TRAIL(characters[index + 1])) {
+            auto lead = characters[index];
+            ++index;
+            character = U16_GET_SUPPLEMENTARY(lead, characters[index]);
+        }
+        if ((character >= 0x202a && character <= 0x202e) || (character >= 0x2066 && character <= 0x2069))
+            return true;
+        auto bidiClass = u_charDirection(character);
+        if (rightToLeft) {
+            if (bidiClass == U_LEFT_TO_RIGHT || bidiClass == U_EUROPEAN_NUMBER || bidiClass == U_ARABIC_NUMBER)
+                return true;
+        } else if (bidiClass == U_RIGHT_TO_LEFT || bidiClass == U_RIGHT_TO_LEFT_ARABIC)
+            return true;
+    }
+    return false;
+}
+
 FontCascade::CodePath FontCascade::codePath(const TextRun& run, std::optional<unsigned> from, std::optional<unsigned> to) const
 {
     if (s_forcedCodePath)
         return *s_forcedCodePath;
+
+#if USE(SKIA)
+    if (snapSimpleTextTransformsEnabled() && fontDescription().orientation() == FontOrientation::Horizontal
+        && snapSimpleTextHasOppositeBidiRun(run))
+        return CodePath::Complex;
+#endif
 
     if (!canHandleRunAsSimpleText(run, from.value_or(0), to.value_or(run.length())))
         return CodePath::Complex;
@@ -1507,6 +1590,43 @@ TextShapingResult FontCascade::layoutSimpleText(const TextRun& run, unsigned fro
     // but we need to return the results in visual order.
     if (run.rtl())
         result.glyphBuffer.reverse(0, result.glyphBuffer.size());
+
+#if defined(WEBKIT_SNAP_VERIFY_PATCHES) && USE(SKIA)
+    if (!from && to == run.length()) {
+        auto expected = layoutComplexText(run, from, to, forTextEmphasis);
+        auto flattenedInitialX = [](const GlyphBuffer& buffer) {
+            return WebCore::width(buffer.initialAdvance()) + (buffer.isEmpty() ? 0 : WebCore::x(buffer.originAt(0)));
+        };
+        auto flattenedInitialY = [](const GlyphBuffer& buffer) {
+            return WebCore::height(buffer.initialAdvance()) + (buffer.isEmpty() ? 0 : WebCore::y(buffer.originAt(0)));
+        };
+        auto flattenedAdvanceX = [](const GlyphBuffer& buffer, unsigned index) {
+            return -WebCore::x(buffer.originAt(index)) + WebCore::width(buffer.advanceAt(index))
+                + (index + 1 < buffer.size() ? WebCore::x(buffer.originAt(index + 1)) : 0);
+        };
+        auto flattenedAdvanceY = [](const GlyphBuffer& buffer, unsigned index) {
+            return -WebCore::y(buffer.originAt(index)) + WebCore::height(buffer.advanceAt(index))
+                + (index + 1 < buffer.size() ? WebCore::y(buffer.originAt(index + 1)) : 0);
+        };
+        bool matches = expected.glyphBuffer.size() == result.glyphBuffer.size()
+            && std::abs(expected.width - result.width) <= 0.01f
+            && std::abs(flattenedInitialX(expected.glyphBuffer) - flattenedInitialX(result.glyphBuffer)) <= 0.01f
+            && std::abs(flattenedInitialY(expected.glyphBuffer) - flattenedInitialY(result.glyphBuffer)) <= 0.01f;
+        for (unsigned i = 0; matches && i < result.glyphBuffer.size(); ++i) {
+            matches = expected.glyphBuffer.glyphAt(i) == result.glyphBuffer.glyphAt(i)
+                && &expected.glyphBuffer.fontAt(i) == &result.glyphBuffer.fontAt(i)
+                && expected.glyphBuffer.uncheckedStringOffsetAt(i) == result.glyphBuffer.uncheckedStringOffsetAt(i)
+                && std::abs(flattenedAdvanceX(expected.glyphBuffer, i) - flattenedAdvanceX(result.glyphBuffer, i)) <= 0.01f
+                && std::abs(flattenedAdvanceY(expected.glyphBuffer, i) - flattenedAdvanceY(result.glyphBuffer, i)) <= 0.01f;
+        }
+        if (!matches) {
+            static unsigned reports = 0;
+            if (reports++ < 200)
+                WTFLogAlways("Snap simple text: layout mismatch glyphs=%u/%u width=%f/%f rtl=%d text=%s", result.glyphBuffer.size(), expected.glyphBuffer.size(), result.width, expected.width, run.rtl(), run.text().utf8().data());
+            RELEASE_ASSERT_NOT_REACHED();
+        }
+    }
+#endif
 
     return result;
 }

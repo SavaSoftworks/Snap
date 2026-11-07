@@ -588,7 +588,7 @@ RefPtr<Font> Font::createHalfWidthFont() const
     return platformCreateHalfWidthFont();
 }
 
-#if !USE(CORE_TEXT)
+#if !USE(CORE_TEXT) && !USE(SKIA)
 GlyphBufferAdvance Font::applyTransforms(GlyphBuffer&, unsigned, unsigned, bool, bool, const AtomString&, StringView, TextDirection) const
 {
     return makeGlyphBufferAdvance();

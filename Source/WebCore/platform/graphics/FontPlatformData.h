@@ -389,6 +389,8 @@ public:
     SkiaHarfBuzzFont* skiaHarfBuzzFont() const { return m_hbFont.get(); }
     hb_font_t* hbFont() const;
     const Vector<hb_feature_t>& features() const LIFETIME_BOUND { return m_features; }
+    bool simpleTextNeedsShaping(bool enableKerning) const;
+    const Vector<hb_feature_t>& simpleTextFeatures(bool enableKerning) const;
     static bool skiaTypefaceHasAnySupportedColorTable(const SkTypeface&);
 #endif
 
@@ -472,6 +474,8 @@ private:
     SkFont m_font;
     RefPtr<SkiaHarfBuzzFont> m_hbFont;
     Vector<hb_feature_t> m_features;
+    uint8_t m_simpleTextShapingFlags { 0 };
+    Vector<hb_feature_t> m_simpleTextFeaturesWithoutKerning;
 #endif
 
 #if USE(FREETYPE)
