@@ -27,9 +27,12 @@
 #include "GStreamerRtpSenderBackend.h"
 #include "GStreamerWebRTCUtils.h"
 #include "RTCRtpCodec.h"
+#include <array>
+#include <gst/pbutils/codec-utils.h>
 #include <wtf/TZoneMallocInlines.h>
 #include <wtf/glib/GMallocString.h>
 #include <wtf/glib/GUniquePtr.h>
+#include <wtf/text/StringToIntegerConversion.h>
 
 GST_DEBUG_CATEGORY(webkit_webrtc_transceiver_debug);
 #define GST_CAT_DEFAULT webkit_webrtc_transceiver_debug
@@ -154,40 +157,119 @@ bool GStreamerRtpTransceiverBackend::stopped() const
     return m_isStopped;
 }
 
-[[nodiscard]] static inline ExceptionOr<GRefPtr<GstCaps>> toRtpCodecCapability(const RTCRtpCodec& codec, int& dynamicPayloadType, const String& msid)
+static bool isDerivedRedundancyCodec(const String& codecName)
 {
-    if (!codec.mimeType.startsWith("video/"_s) && !codec.mimeType.startsWith("audio/"_s))
-        return Exception { ExceptionCode::InvalidModificationError, "RTCRtpCodec bad mimeType"_s };
+    return equalLettersIgnoringASCIICase(codecName, "rtx"_s) || equalLettersIgnoringASCIICase(codecName, "red"_s) || equalLettersIgnoringASCIICase(codecName, "ulpfec"_s) || equalLettersIgnoringASCIICase(codecName, "flexfec-03"_s);
+}
 
-    auto components = codec.mimeType.split('/');
-    const auto mediaType = components[0];
-    const auto codecName = components[1];
+static Vector<std::pair<String, String>> codecFormatParameters(const String& line)
+{
+    Vector<std::pair<String, String>> parameters;
+    for (auto& attribute : line.split(';')) {
+        auto separator = attribute.find('=');
+        if (separator == notFound)
+            continue;
+        auto name = attribute.left(separator).trim([](char16_t character) { return isASCIIWhitespace(character); });
+        auto value = attribute.substring(separator + 1).trim([](char16_t character) { return isASCIIWhitespace(character); });
+        if (!name.isEmpty())
+            parameters.append({ WTF::move(name), WTF::move(value) });
+    }
+    return parameters;
+}
 
-    int payloadType = payloadTypeForEncodingName(codecName).value_or(dynamicPayloadType++);
-    GRefPtr caps = adoptGRef(gst_caps_new_simple("application/x-rtp", "media", G_TYPE_STRING, mediaType.ascii().data(), "encoding-name", G_TYPE_STRING, codecName.ascii().data(), "clock-rate", G_TYPE_INT, codec.clockRate, "payload", G_TYPE_INT, payloadType, nullptr));
-    if (codec.channels)
-        gst_caps_set_simple(caps.get(), "channels", G_TYPE_INT, *codec.channels, nullptr);
+static unsigned codecChannelCount(const GstStructure* structure)
+{
+    int channels = 0;
+    if (gst_structure_get_int(structure, "channels", &channels) && channels > 0)
+        return channels;
+    if (const char* parameters = gst_structure_get_string(structure, "encoding-params")) {
+        if (auto count = parseInteger<unsigned>(StringView::fromLatin1(parameters)); count && *count)
+            return *count;
+    }
+    return 1;
+}
 
-    if (!codec.sdpFmtpLine.isEmpty()) {
-        // Forward each fmtp attribute as <fmtp-name> in the caps so that the downstream
-        // webkitvideoencoder can take those into account when configuring the encoder. For instance
-        // VP9 profile 2 requires a 10bit pixel input format, so a conversion might be needed just
-        // before encoding. This is taken care of in the webkitvideoencoder itself.
-        for (auto& attribute : codec.sdpFmtpLine.split(';')) {
-            if (!attribute.contains('='))
-                continue;
-            auto components = attribute.split('=');
-            if (components.size() < 2) [[unlikely]]
-                continue;
-            gst_caps_set_simple(caps.get(), components[0].ascii().data(), G_TYPE_STRING, components[1].ascii().data(), nullptr);
-        }
+static String h264ProfileName(const String& profileLevelId)
+{
+    if (profileLevelId.length() != 6)
+        return {};
+    std::array<uint8_t, 3> bytes {};
+    for (unsigned index = 0; index < bytes.size(); index++) {
+        auto value = parseInteger<uint8_t>(StringView(profileLevelId).substring(index * 2, 2), 16);
+        if (!value)
+            return {};
+        bytes[index] = *value;
+    }
+    if (const char* profile = gst_codec_utils_h264_get_profile(bytes.data(), bytes.size()))
+        return String::fromLatin1(profile);
+    return {};
+}
+
+static String codecParameter(const Vector<std::pair<String, String>>& parameters, ASCIILiteral name)
+{
+    for (auto& [key, value] : parameters) {
+        if (equalIgnoringASCIICase(key, name))
+            return value;
+    }
+    return {};
+}
+
+static String structureParameter(const GstStructure* structure, ASCIILiteral name)
+{
+    if (const char* value = gst_structure_get_string(structure, name.characters()))
+        return String::fromLatin1(value);
+    return {};
+}
+
+static bool sameCodecParameter(String requested, String current, ASCIILiteral fallback)
+{
+    if (requested.isNull())
+        requested = fallback;
+    if (current.isNull())
+        current = fallback;
+    return equalIgnoringASCIICase(requested, current);
+}
+
+static bool codecMatchesStructure(const RTCRtpCodec& codec, const String& mediaType, const String& codecName, const Vector<std::pair<String, String>>& parameters, const GstStructure* structure, bool compareAllParameters)
+{
+    if (const char* media = gst_structure_get_string(structure, "media"); media && !equalIgnoringASCIICase(StringView::fromLatin1(media), mediaType))
+        return false;
+    const char* encodingName = gst_structure_get_string(structure, "encoding-name");
+    if (!encodingName || !equalIgnoringASCIICase(StringView::fromLatin1(encodingName), codecName))
+        return false;
+    int clockRate = 0;
+    if (!gst_structure_get_int(structure, "clock-rate", &clockRate) || clockRate != static_cast<int>(codec.clockRate))
+        return false;
+    if (codec.channels && codecChannelCount(structure) != *codec.channels)
+        return false;
+
+    if (equalLettersIgnoringASCIICase(codecName, "h264"_s)) {
+        if (!sameCodecParameter(codecParameter(parameters, "packetization-mode"_s), structureParameter(structure, "packetization-mode"_s), "0"_s))
+            return false;
+        auto requestedProfile = h264ProfileName(codecParameter(parameters, "profile-level-id"_s));
+        auto currentProfile = structureParameter(structure, "profile"_s);
+        if (currentProfile.isNull())
+            currentProfile = h264ProfileName(structureParameter(structure, "profile-level-id"_s));
+        if (!requestedProfile.isNull() && !currentProfile.isNull() && !equalIgnoringASCIICase(requestedProfile, currentProfile))
+            return false;
+    } else if (equalLettersIgnoringASCIICase(codecName, "vp9"_s)) {
+        if (!sameCodecParameter(codecParameter(parameters, "profile-id"_s), structureParameter(structure, "profile-id"_s), "0"_s))
+            return false;
+    } else if (equalLettersIgnoringASCIICase(codecName, "av1"_s)) {
+        if (!sameCodecParameter(codecParameter(parameters, "profile"_s), structureParameter(structure, "profile"_s), "0"_s))
+            return false;
     }
 
-    if (!msid.isEmpty())
-        gst_caps_set_simple(caps.get(), "a-msid", G_TYPE_STRING, msid.ascii().data(), nullptr);
-
-    GST_DEBUG("Codec capability: %" GST_PTR_FORMAT, caps.get());
-    return caps;
+    if (!compareAllParameters)
+        return true;
+    for (auto& [key, value] : parameters) {
+        if (equalLettersIgnoringASCIICase(key, "profile-level-id"_s) || equalLettersIgnoringASCIICase(key, "profile"_s))
+            continue;
+        auto field = key.utf8();
+        if (const char* current = gst_structure_get_string(structure, field.data()); current && !equalIgnoringASCIICase(StringView::fromLatin1(current), value))
+            return false;
+    }
+    return true;
 }
 
 ExceptionOr<void> GStreamerRtpTransceiverBackend::setCodecPreferences(const Vector<RTCRtpCodec>& codecs)
@@ -195,39 +277,70 @@ ExceptionOr<void> GStreamerRtpTransceiverBackend::setCodecPreferences(const Vect
     GRefPtr<GstCaps> currentCaps;
     g_object_get(m_rtcTransceiver.get(), "codec-preferences", &currentCaps.outPtr(), nullptr);
     GST_TRACE_OBJECT(m_rtcTransceiver.get(), "Current codec preferences: %" GST_PTR_FORMAT, currentCaps.get());
+    if (codecs.isEmpty() || !currentCaps || gst_caps_is_empty(currentCaps.get()))
+        return {};
+
+    Vector<const GstStructure*> negotiatedCodecs;
+    for (unsigned index = 0; index < gst_caps_get_size(currentCaps.get()); index++)
+        negotiatedCodecs.append(gst_caps_get_structure(currentCaps.get(), index));
+    const GstStructure* extensionSource = negotiatedCodecs[0];
     String msid;
-    HashMap<String, String> extensions;
-    if (currentCaps && gst_caps_get_size(currentCaps.get()) > 0) {
-        auto structure = gst_caps_get_structure(currentCaps.get(), 0);
-        if (auto msIdValue = gstStructureGetString(structure, "a-msid"_s))
-            msid = msIdValue.span();
-
-        gstStructureForeach(structure, [&](auto id, const auto& value) -> bool {
-            auto key = gstIdToString(id);
-            if (!key.startsWith("extmap-"_s))
-                return true;
-
-            extensions.add(key, byteCast<char8_t>(unsafeSpan(g_value_get_string(value))));
-            return true;
-        });
+    for (auto* structure : negotiatedCodecs) {
+        if (const char* value = gst_structure_get_string(structure, "a-msid")) {
+            msid = String::fromUTF8(value);
+            break;
+        }
     }
 
+    Vector<bool> consumed;
+    consumed.fill(false, negotiatedCodecs.size());
     GRefPtr gstCodecs = adoptGRef(gst_caps_new_empty());
-    int dynamicPayloadType = 96;
     for (auto& codec : codecs) {
-        auto result = toRtpCodecCapability(codec, dynamicPayloadType, msid);
-        if (result.hasException())
-            return result.releaseException();
+        if (!codec.mimeType.startsWithIgnoringASCIICase("video/"_s) && !codec.mimeType.startsWithIgnoringASCIICase("audio/"_s))
+            return Exception { ExceptionCode::InvalidModificationError, "RTCRtpCodec bad mimeType"_s };
 
-        auto codecCaps = result.releaseReturnValue();
+        auto separator = codec.mimeType.find('/');
+        auto mediaType = codec.mimeType.left(separator).convertToASCIILowercase();
+        auto codecName = codec.mimeType.substring(separator + 1);
+        if (codecName.isEmpty())
+            return Exception { ExceptionCode::InvalidModificationError, "RTCRtpCodec bad mimeType"_s };
+        if (isDerivedRedundancyCodec(codecName))
+            continue;
 
-        // Restore extensions data on the first codec. It might be useful to do in the others too.
-        if (!extensions.isEmpty()) {
-            for (auto& [extensionId, url] : extensions)
-                gst_caps_set_simple(codecCaps.get(), extensionId.ascii().data(), G_TYPE_STRING, url.ascii().data(), nullptr);
-            extensions.clear();
+        auto parameters = codecFormatParameters(codec.sdpFmtpLine);
+        std::optional<size_t> match;
+        for (bool compareAllParameters : { true, false }) {
+            for (size_t index = 0; index < negotiatedCodecs.size() && !match; index++) {
+                if (!consumed[index] && codecMatchesStructure(codec, mediaType, codecName, parameters, negotiatedCodecs[index], compareAllParameters))
+                    match = index;
+            }
+            if (match)
+                break;
         }
-        gst_caps_append(gstCodecs.get(), codecCaps.leakRef());
+        if (!match) {
+            GST_DEBUG_OBJECT(m_rtcTransceiver.get(), "No negotiated payload type for %s, leaving it out of the codec preferences", codec.mimeType.utf8().data());
+            continue;
+        }
+
+        consumed[*match] = true;
+        auto* structure = gst_structure_copy(negotiatedCodecs[*match]);
+        for (int field = 0; field < gst_structure_n_fields(extensionSource); field++) {
+            const char* name = gst_structure_nth_field_name(extensionSource, field);
+            if (g_str_has_prefix(name, "extmap-") && !gst_structure_has_field(structure, name))
+                gst_structure_set_value(structure, name, gst_structure_get_value(extensionSource, name));
+        }
+        gst_caps_append_structure(gstCodecs.get(), structure);
+    }
+
+    if (gst_caps_is_empty(gstCodecs.get())) {
+        GST_DEBUG_OBJECT(m_rtcTransceiver.get(), "None of the preferred codecs is negotiable, keeping the current codec preferences");
+        return {};
+    }
+
+    if (!msid.isEmpty()) {
+        auto* first = gst_caps_get_structure(gstCodecs.get(), 0);
+        if (!gst_structure_has_field(first, "a-msid"))
+            gst_structure_set(first, "a-msid", G_TYPE_STRING, msid.utf8().data(), nullptr);
     }
     GST_DEBUG_OBJECT(m_rtcTransceiver.get(), "Setting codec preferences to %" GST_PTR_FORMAT, gstCodecs.get());
     applySourceSSRC(gstCodecs.get(), direction());

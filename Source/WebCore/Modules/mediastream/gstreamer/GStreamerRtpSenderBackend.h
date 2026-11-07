@@ -73,6 +73,7 @@ public:
     }
 
     bool hasSource() const { return !std::holds_alternative<std::nullptr_t>(m_source); }
+    const String& mediaStreamId() const { return m_mediaStreamId; }
 
     void setSource(Source&&);
     void takeSource(GStreamerRtpSenderBackend&);
@@ -102,6 +103,7 @@ private:
     Source m_source;
     GUniquePtr<GstStructure> m_initData;
     mutable GUniquePtr<GstStructure> m_currentParameters;
+    String m_mediaStreamId;
 };
 
 } // namespace WebCore

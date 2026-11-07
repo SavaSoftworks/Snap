@@ -17,7 +17,7 @@ if (USE_GSTREAMER)
           endif ()
 
           if (USE_GSTREAMER_WEBRTC)
-              list(APPEND GSTREAMER_COMPONENTS webrtc)
+              list(APPEND GSTREAMER_COMPONENTS webrtc webrtc_nice)
           endif ()
 
           find_package(GStreamer 1.18.4 REQUIRED COMPONENTS ${GSTREAMER_COMPONENTS})

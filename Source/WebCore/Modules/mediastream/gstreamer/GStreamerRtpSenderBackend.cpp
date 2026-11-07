@@ -171,7 +171,8 @@ bool GStreamerRtpSenderBackend::replaceTrack(RTCRtpSender& sender, MediaStreamTr
         GST_DEBUG_OBJECT(m_rtcSender.get(), "No outgoing source yet");
     });
 
-    peerConnectionBackend->trackWasReplaced(previousTrackId, newTrack ? newTrack->id() : emptyString());
+    if (!hasSource() && newTrack)
+        peerConnectionBackend->attachSourceForReplacedTrack(*this, *newTrack);
     return true;
 }
 
@@ -297,9 +298,9 @@ Ref<RTCRtpTransformBackend> GStreamerRtpSenderBackend::rtcRtpTransformBackend()
     return GStreamerRtpSenderTransformBackend::create(m_rtcSender);
 }
 
-void GStreamerRtpSenderBackend::setMediaStreamIds(const FixedVector<String>&)
+void GStreamerRtpSenderBackend::setMediaStreamIds(const FixedVector<String>& mediaStreamIds)
 {
-    notImplemented();
+    m_mediaStreamId = mediaStreamIds.isEmpty() ? String() : mediaStreamIds[0];
 }
 
 std::unique_ptr<RTCDtlsTransportBackend> GStreamerRtpSenderBackend::dtlsTransportBackend()

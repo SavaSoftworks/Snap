@@ -408,31 +408,6 @@ void RealtimeOutgoingMediaSourceGStreamer::replaceTrack(const RefPtr<MediaStream
     RELEASE_ASSERT(activePad);
     g_object_set(m_inputSelector.get(), "active-pad", activePad.get(), nullptr);
 
-    if (m_transceiver) {
-        GRefPtr<GstCaps> caps;
-        g_object_get(m_transceiver.get(), "codec-preferences", &caps.outPtr(), nullptr);
-
-        m_pendingTrackId = trackPrivate ? trackPrivate->id() : emptyString();
-        GRefPtr newCaps = adoptGRef(gst_caps_make_writable(caps.leakRef()));
-        gst_caps_map_in_place(newCaps.get(), [](auto*, auto* structure, gpointer userData) -> gboolean {
-            if (!gst_structure_has_field_typed(structure, "a-msid", G_TYPE_STRING)) [[unlikely]]
-                return TRUE;
-
-            auto self = static_cast<RealtimeOutgoingMediaSourceGStreamer*>(userData);
-            if (self->m_pendingTrackId.isEmpty())
-                gst_structure_remove_field(structure, "a-msid");
-            else {
-                auto newMsid = makeString(self->m_mediaStreamId, ' ', self->m_pendingTrackId);
-                gst_structure_set(structure, "a-msid", G_TYPE_STRING, newMsid.utf8().data(), nullptr);
-            }
-
-            return TRUE;
-        }, this);
-        g_object_freeze_notify(G_OBJECT(m_transceiver.get()));
-        g_object_set(m_transceiver.get(), "codec-preferences", newCaps.get(), nullptr);
-        m_pendingTrackId = emptyString();
-        g_object_thaw_notify(G_OBJECT(m_transceiver.get()));
-    }
 
     if (!newTrack) {
         m_isStopped = true;

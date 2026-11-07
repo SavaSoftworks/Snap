@@ -57,6 +57,9 @@
 #include "RealtimeOutgoingVideoSourceGStreamer.h"
 #include <algorithm>
 #include <gst/sdp/sdp.h>
+#include <wtf/CryptographicallyRandomNumber.h>
+#include <wtf/Deque.h>
+#include <wtf/Lock.h>
 #include <wtf/MainThread.h>
 #include <wtf/ObjectIdentifier.h>
 #include <wtf/ReducedResolutionSeconds.h>
@@ -66,12 +69,332 @@
 #include <wtf/glib/GMallocString.h>
 #include <wtf/glib/GThreadSafeWeakPtr.h>
 #include <wtf/glib/RunLoopSourcePriority.h>
+#include <wtf/text/CString.h>
 #include <wtf/text/StringToIntegerConversion.h>
 
 GST_DEBUG_CATEGORY(webkit_webrtc_endpoint_debug);
 #define GST_CAT_DEFAULT webkit_webrtc_endpoint_debug
 
+extern "C" GType gst_webrtc_nice_get_type(void);
+
 namespace WebCore {
+
+static constexpr size_t maximumIceCredentialSurrogates = 256;
+static constexpr size_t iceCredentialSurrogateLength = 32;
+static constexpr size_t minimumIceUsernameFragmentLength = 4;
+static constexpr size_t minimumIcePasswordLength = 22;
+static constexpr size_t maximumIceCredentialLength = 256;
+
+enum class IceCredentialField : uint8_t { UsernameFragment,
+    Password };
+
+static bool isStrictIceCharacter(char character)
+{
+    return isASCIIAlphanumeric(character) || character == '+' || character == '/';
+}
+
+static bool isTolerableIceCharacter(char character)
+{
+    return isStrictIceCharacter(character) || character == '-' || character == '=' || character == '#' || character == '_';
+}
+
+static bool iceCredentialNeedsSurrogate(IceCredentialField field, std::span<const char> value)
+{
+    size_t minimumLength = field == IceCredentialField::UsernameFragment ? minimumIceUsernameFragmentLength : minimumIcePasswordLength;
+    if (value.size() < minimumLength || value.size() > maximumIceCredentialLength)
+        return false;
+    bool hasTolerableCharacter = false;
+    for (char character : value) {
+        if (!isTolerableIceCharacter(character))
+            return false;
+        if (!isStrictIceCharacter(character))
+            hasTolerableCharacter = true;
+    }
+    return hasTolerableCharacter;
+}
+
+static std::optional<IceCredentialField> iceCredentialField(const GstSDPAttribute* attribute)
+{
+    if (!attribute || !attribute->key || !attribute->value)
+        return std::nullopt;
+    auto key = unsafeSpan(attribute->key);
+    if (equal(key, "ice-ufrag"_s))
+        return IceCredentialField::UsernameFragment;
+    if (equal(key, "ice-pwd"_s))
+        return IceCredentialField::Password;
+    return std::nullopt;
+}
+
+static bool spansEqual(std::span<const char> first, std::span<const char> second)
+{
+    return std::ranges::equal(first, second);
+}
+
+class IceCredentialSurrogates {
+    WTF_MAKE_TZONE_ALLOCATED_INLINE(IceCredentialSurrogates);
+    WTF_MAKE_NONCOPYABLE(IceCredentialSurrogates);
+
+public:
+    IceCredentialSurrogates() = default;
+
+    CString surrogateFor(std::span<const char> original)
+    {
+        Locker locker { m_lock };
+        for (auto& entry : m_entries) {
+            if (spansEqual(entry.original.span(), original))
+                return CString(entry.surrogate.span());
+        }
+        auto surrogate = uniqueSurrogate();
+        if (m_entries.size() >= maximumIceCredentialSurrogates)
+            m_entries.removeFirst();
+        m_entries.append({ CString(surrogate.span()), CString(original) });
+        return surrogate;
+    }
+
+    std::optional<CString> originalForSurrogate(std::span<const char> value) const
+    {
+        Locker locker { m_lock };
+        for (auto& entry : m_entries) {
+            if (spansEqual(entry.surrogate.span(), value))
+                return CString(entry.original.span());
+        }
+        return std::nullopt;
+    }
+
+private:
+    struct Entry {
+        CString surrogate;
+        CString original;
+    };
+
+    CString uniqueSurrogate() const WTF_REQUIRES_LOCK(m_lock)
+    {
+        static constexpr std::array<char, 64> alphabet {
+            'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P',
+            'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z', 'a', 'b', 'c', 'd', 'e', 'f',
+            'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v',
+            'w', 'x', 'y', 'z', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '+', '/'
+        };
+        while (true) {
+            std::array<uint8_t, iceCredentialSurrogateLength> randomValues;
+            cryptographicallyRandomValues(randomValues);
+            std::array<char, iceCredentialSurrogateLength> characters;
+            for (size_t i = 0; i < characters.size(); ++i)
+                characters[i] = alphabet[randomValues[i] % alphabet.size()];
+            std::span<const char> candidate { characters };
+            bool isUsed = false;
+            for (auto& entry : m_entries) {
+                if (spansEqual(entry.surrogate.span(), candidate) || spansEqual(entry.original.span(), candidate)) {
+                    isUsed = true;
+                    break;
+                }
+            }
+            if (!isUsed)
+                return CString(candidate);
+        }
+    }
+
+    mutable Lock m_lock;
+    Deque<Entry> m_entries WTF_GUARDED_BY_LOCK(m_lock);
+};
+
+static GQuark iceCredentialSurrogatesQuark()
+{
+    static GQuark quark = g_quark_from_static_string("webkit-ice-credential-surrogates");
+    return quark;
+}
+
+static IceCredentialSurrogates* iceCredentialSurrogates(GstWebRTCICE* ice)
+{
+    if (!ice)
+        return nullptr;
+    return static_cast<IceCredentialSurrogates*>(g_object_get_qdata(G_OBJECT(ice), iceCredentialSurrogatesQuark()));
+}
+
+static IceCredentialSurrogates* iceCredentialSurrogates(GstElement* webrtcBin)
+{
+    if (!webrtcBin)
+        return nullptr;
+    GRefPtr<GstWebRTCICE> ice;
+    g_object_get(webrtcBin, "ice-agent", &ice.outPtr(), nullptr);
+    return iceCredentialSurrogates(ice.get());
+}
+
+static GstWebRTCICEClass* lenientNiceParentClass;
+
+static gboolean lenientNiceSetRemoteCredentials(GstWebRTCICE* ice, GstWebRTCICEStream* stream, const gchar* usernameFragment, const gchar* password)
+{
+    auto* surrogates = iceCredentialSurrogates(ice);
+    if (!surrogates || !usernameFragment || !password)
+        return lenientNiceParentClass->set_remote_credentials(ice, stream, usernameFragment, password);
+    auto originalUsernameFragment = surrogates->originalForSurrogate(unsafeSpan(usernameFragment));
+    auto originalPassword = surrogates->originalForSurrogate(unsafeSpan(password));
+    return lenientNiceParentClass->set_remote_credentials(ice, stream,
+        originalUsernameFragment ? originalUsernameFragment->data() : usernameFragment,
+        originalPassword ? originalPassword->data() : password);
+}
+
+static void lenientNiceClassInit(gpointer klass, gpointer)
+{
+    lenientNiceParentClass = GST_WEBRTC_ICE_CLASS(g_type_class_peek_parent(klass));
+    GST_WEBRTC_ICE_CLASS(klass)->set_remote_credentials = lenientNiceSetRemoteCredentials;
+}
+
+static GType lenientNiceType()
+{
+    static GType type;
+    static std::once_flag onceFlag;
+    std::call_once(onceFlag, [] {
+        GType parentType = gst_webrtc_nice_get_type();
+        GTypeQuery query;
+        g_type_query(parentType, &query);
+        if (!query.type || query.class_size > std::numeric_limits<guint16>::max() || query.instance_size > std::numeric_limits<guint16>::max())
+            return;
+        GTypeInfo info {};
+        info.class_size = static_cast<guint16>(query.class_size);
+        info.class_init = lenientNiceClassInit;
+        info.instance_size = static_cast<guint16>(query.instance_size);
+        type = g_type_register_static(parentType, "WebKitGstWebRTCLenientNice", &info, static_cast<GTypeFlags>(0));
+    });
+    return type;
+}
+
+static GRefPtr<GstWebRTCICE> createLenientNiceAgent(const String& name)
+{
+    GType type = lenientNiceType();
+    if (!type)
+        return nullptr;
+    GRefPtr<GstWebRTCICE> agent = GST_WEBRTC_ICE(g_object_new(type, "name", name.ascii().data(), nullptr));
+    g_object_set_qdata_full(G_OBJECT(agent.get()), iceCredentialSurrogatesQuark(), new IceCredentialSurrogates, [](gpointer data) {
+        delete static_cast<IceCredentialSurrogates*>(data);
+    });
+    return agent;
+}
+
+static void replaceIceCredentialsWithSurrogates(GstSDPMessage* message, IceCredentialSurrogates& surrogates)
+{
+    auto surrogateForAttribute = [&](const GstSDPAttribute* attribute) -> std::optional<CString> {
+        auto field = iceCredentialField(attribute);
+        if (!field || !iceCredentialNeedsSurrogate(*field, unsafeSpan(attribute->value)))
+            return std::nullopt;
+        return surrogates.surrogateFor(unsafeSpan(attribute->value));
+    };
+    for (unsigned i = 0; i < gst_sdp_message_attributes_len(message); i++) {
+        const auto* attribute = gst_sdp_message_get_attribute(message, i);
+        if (auto surrogate = surrogateForAttribute(attribute)) {
+            GstSDPAttribute replacement {};
+            gst_sdp_attribute_set(&replacement, attribute->key, surrogate->data());
+            gst_sdp_message_replace_attribute(message, i, &replacement);
+        }
+    }
+    for (unsigned i = 0; i < gst_sdp_message_medias_len(message); i++) {
+        auto* media = const_cast<GstSDPMedia*>(gst_sdp_message_get_media(message, i));
+        for (unsigned j = 0; j < gst_sdp_media_attributes_len(media); j++) {
+            const auto* attribute = gst_sdp_media_get_attribute(media, j);
+            if (auto surrogate = surrogateForAttribute(attribute)) {
+                GstSDPAttribute replacement {};
+                gst_sdp_attribute_set(&replacement, attribute->key, surrogate->data());
+                gst_sdp_media_replace_attribute(media, j, &replacement);
+            }
+        }
+    }
+}
+
+static void restoreIceCredentials(GstSDPMessage* message, const IceCredentialSurrogates& surrogates)
+{
+    auto originalForAttribute = [&](const GstSDPAttribute* attribute) -> std::optional<CString> {
+        if (!iceCredentialField(attribute))
+            return std::nullopt;
+        return surrogates.originalForSurrogate(unsafeSpan(attribute->value));
+    };
+    for (unsigned i = 0; i < gst_sdp_message_attributes_len(message); i++) {
+        const auto* attribute = gst_sdp_message_get_attribute(message, i);
+        if (auto original = originalForAttribute(attribute)) {
+            GstSDPAttribute replacement {};
+            gst_sdp_attribute_set(&replacement, attribute->key, original->data());
+            gst_sdp_message_replace_attribute(message, i, &replacement);
+        }
+    }
+    for (unsigned i = 0; i < gst_sdp_message_medias_len(message); i++) {
+        auto* media = const_cast<GstSDPMedia*>(gst_sdp_message_get_media(message, i));
+        for (unsigned j = 0; j < gst_sdp_media_attributes_len(media); j++) {
+            const auto* attribute = gst_sdp_media_get_attribute(media, j);
+            if (auto original = originalForAttribute(attribute)) {
+                GstSDPAttribute replacement {};
+                gst_sdp_attribute_set(&replacement, attribute->key, original->data());
+                gst_sdp_media_replace_attribute(media, j, &replacement);
+            }
+        }
+    }
+}
+
+static void normalizeLegacyDataChannelMedia(GstSDPMedia* media)
+{
+    auto mediaType = gst_sdp_media_get_media(media);
+    auto protocol = gst_sdp_media_get_proto(media);
+    if (!mediaType || !protocol || !equal(unsafeSpan(mediaType), "application"_s) || gst_sdp_media_formats_len(media) != 1)
+        return;
+    if (!equal(unsafeSpan(protocol), "DTLS/SCTP"_s) && !equal(unsafeSpan(protocol), "UDP/DTLS/SCTP"_s))
+        return;
+    auto format = gst_sdp_media_get_format(media, 0);
+    auto port = format ? parseInteger<uint16_t>(StringView::fromLatin1(format)) : std::nullopt;
+    if (!port)
+        return;
+    std::optional<unsigned> sctpMapIndex;
+    bool hasSctpPort = false;
+    for (unsigned i = 0; i < gst_sdp_media_attributes_len(media); i++) {
+        const auto* attribute = gst_sdp_media_get_attribute(media, i);
+        if (!attribute->key)
+            continue;
+        auto key = unsafeSpan(attribute->key);
+        if (equal(key, "sctp-port"_s)) {
+            hasSctpPort = true;
+            continue;
+        }
+        if (!equal(key, "sctpmap"_s) || !attribute->value || sctpMapIndex)
+            continue;
+        auto fields = String::fromLatin1(attribute->value).split(' ');
+        if (fields.size() >= 2 && parseInteger<uint16_t>(fields[0]) == port && fields[1] == "webrtc-datachannel"_s)
+            sctpMapIndex = i;
+    }
+    if (!sctpMapIndex)
+        return;
+    gst_sdp_media_remove_attribute(media, *sctpMapIndex);
+    gst_sdp_media_set_proto(media, "UDP/DTLS/SCTP");
+    gst_sdp_media_replace_format(media, 0, "webrtc-datachannel");
+    if (!hasSctpPort)
+        gst_sdp_media_add_attribute(media, "sctp-port", String::number(*port).ascii().data());
+}
+
+static bool isIceCandidateOnUnusableTransport(const String& candidate)
+{
+    auto tokens = candidate.split(' ');
+    if (tokens.size() < 8 || !equalLettersIgnoringASCIICase(tokens[6], "typ"_s))
+        return false;
+    return !equalLettersIgnoringASCIICase(tokens[2], "udp"_s) && !equalLettersIgnoringASCIICase(tokens[2], "tcp"_s);
+}
+
+static bool isSourceBoundToAnotherMLine(RealtimeOutgoingMediaSourceGStreamer& source, unsigned mLineIndex)
+{
+    const auto& pad = source.pad();
+    if (!pad)
+        return false;
+    GRefPtr<GstWebRTCRTPTransceiver> transceiver;
+    g_object_get(pad.get(), "transceiver", &transceiver.outPtr(), nullptr);
+    if (!transceiver)
+        return false;
+    unsigned boundMLineIndex;
+    g_object_get(transceiver.get(), "mlineindex", &boundMLineIndex, nullptr);
+    return boundMLineIndex != std::numeric_limits<unsigned>::max() && boundMLineIndex != mLineIndex;
+}
+
+static void normalizeRemoteDescription(GstSDPMessage* message, IceCredentialSurrogates* surrogates)
+{
+    if (surrogates)
+        replaceIceCredentialsWithSurrogates(message, *surrogates);
+    for (unsigned i = 0; i < gst_sdp_message_medias_len(message); i++)
+        normalizeLegacyDataChannelMedia(const_cast<GstSDPMedia*>(gst_sdp_message_get_media(message, i)));
+}
 
 GStreamerMediaEndpoint::GStreamerMediaEndpoint(GStreamerPeerConnectionBackend& peerConnection)
     : m_peerConnectionBackend(WeakPtr { &peerConnection })
@@ -199,6 +522,16 @@ bool GStreamerMediaEndpoint::initializePipeline()
         m_webrtcBin = gst_element_factory_create_full(webrtcBinFactory.get(), "name", name.data(), "ice-agent", agent, nullptr);
     }
 #endif // USE(LIBRICE) && GST_CHECK_VERSION(1, 20, 0)
+#if GST_CHECK_VERSION(1, 22, 0)
+    if (!m_webrtcBin && gst_check_version(1, 22, 0)) {
+        if (auto agent = createLenientNiceAgent(makeString(binName, ":ice"_s))) {
+            auto* transferredAgent = agent.leakRef();
+            m_webrtcBin = gst_element_factory_create_full(webrtcBinFactory.get(), "name", binName.ascii().data(), "ice-agent", transferredAgent, nullptr);
+            if (!m_webrtcBin)
+                gst_object_unref(transferredAgent);
+        }
+    }
+#endif
     if (!m_webrtcBin)
         m_webrtcBin = gst_element_factory_create(webrtcBinFactory.get(), binName.ascii().data());
 
@@ -435,6 +768,8 @@ bool GStreamerMediaEndpoint::setConfiguration(MediaEndpointConfiguration& config
         bundlePolicy = GST_WEBRTC_BUNDLE_POLICY_MAX_BUNDLE;
     } else
         bundlePolicy = bundlePolicyFromConfiguration(configuration);
+    if (bundlePolicy == GST_WEBRTC_BUNDLE_POLICY_BALANCED)
+        bundlePolicy = GST_WEBRTC_BUNDLE_POLICY_MAX_COMPAT;
     g_object_set(m_webrtcBin.get(), "bundle-policy", bundlePolicy, nullptr);
 
     auto iceTransportPolicy = iceTransportPolicyFromConfiguration(configuration);
@@ -480,7 +815,7 @@ void GStreamerMediaEndpoint::restartIce()
     // We should re-initiate negotiation with the ice-restart offer option set to true.
 }
 
-static std::optional<std::pair<RTCSdpType, String>> fetchDescription(GstElement* webrtcBin, ASCIILiteral name)
+static std::optional<std::pair<RTCSdpType, String>> fetchDescription(GstElement* webrtcBin, ASCIILiteral name, const IceCredentialSurrogates* surrogates = nullptr)
 {
     if (!webrtcBin)
         return { };
@@ -498,6 +833,9 @@ static std::optional<std::pair<RTCSdpType, String>> fetchDescription(GstElement*
             i--;
         }
     }
+
+    if (surrogates)
+        restoreIceCredentials(description->sdp, *surrogates);
 
     auto sdpString = GMallocString::unsafeAdoptFromUTF8(gst_sdp_message_as_text(description->sdp));
     return { { fromSessionDescriptionType(*description.get()), sdpString.span() } };
@@ -529,12 +867,13 @@ static std::optional<PeerConnectionBackend::DescriptionStates> descriptionsFromW
         pendingLocalDescriptionSdpType = sdpType;
         pendingLocalDescriptionSdp = WTF::move(description);
     }
-    if (auto currentRemoteDescription = fetchDescription(webrtcBin, "current-remote"_s)) {
+    auto* surrogates = iceCredentialSurrogates(webrtcBin);
+    if (auto currentRemoteDescription = fetchDescription(webrtcBin, "current-remote"_s, surrogates)) {
         auto [sdpType, description] = *currentRemoteDescription;
         currentRemoteDescriptionSdpType = sdpType;
         currentRemoteDescriptionSdp = WTF::move(description);
     }
-    if (auto pendingRemoteDescription = fetchDescription(webrtcBin, "pending-remote"_s)) {
+    if (auto pendingRemoteDescription = fetchDescription(webrtcBin, "pending-remote"_s, surrogates)) {
         auto [sdpType, description] = *pendingRemoteDescription;
         pendingRemoteDescriptionSdpType = sdpType;
         pendingRemoteDescriptionSdp = WTF::move(description);
@@ -719,6 +1058,8 @@ void GStreamerMediaEndpoint::linkOutgoingSources(GstSDPMessage* sdpMessage)
                 GST_DEBUG_OBJECT(pipeline(), "Un-matched source type");
                 return false;
             }
+            if (isSourceBoundToAnotherMLine(*source, i))
+                return false;
             if (const auto& track = source->track()) {
                 auto sourceMsid = makeString(source->mediaStreamID(), ' ', track->id());
                 if (!msid.isEmpty() && sourceMsid != msid) {
@@ -727,9 +1068,9 @@ void GStreamerMediaEndpoint::linkOutgoingSources(GstSDPMessage* sdpMessage)
                 }
             }
 
-            auto allowedCaps = capsFromSDPMedia(media);
-            source->configure(WTF::move(allowedCaps));
             if (!source->pad()) {
+                auto allowedCaps = capsFromSDPMedia(media);
+                source->configure(WTF::move(allowedCaps));
                 auto rtpCaps = source->rtpCaps();
                 auto sinkPad = requestPad(rtpCaps, source->mediaStreamID());
                 source->setSinkPad(WTF::move(sinkPad));
@@ -754,6 +1095,7 @@ void GStreamerMediaEndpoint::doSetLocalDescription(const RTCSessionDescription* 
 {
     RefPtr initialDescription = description;
     if (!initialDescription) {
+        attachPendingSenderSources();
         // Generate offer or answer. Workaround for https://gitlab.freedesktop.org/gstreamer/gstreamer/-/issues/3218.
         auto promise = gst_promise_new();
         switch (fetchSignalingState(m_webrtcBin.get())) {
@@ -1008,7 +1350,8 @@ void GStreamerMediaEndpoint::doSetRemoteDescription(const RTCSessionDescription&
             if (sdpMediaHasAttributeKey(media, "ice-lite"_s)) {
                 GRefPtr<GstWebRTCICE> ice;
                 g_object_get(m_webrtcBin.get(), "ice-agent", &ice.outPtr(), nullptr);
-                g_object_set(ice.get(), "ice-lite", TRUE, nullptr);
+                if (ice && gstObjectHasProperty(GST_OBJECT_CAST(ice.get()), "ice-lite"_s))
+                    g_object_set(ice.get(), "ice-lite", TRUE, nullptr);
             }
         });
 
@@ -1107,6 +1450,7 @@ void GStreamerMediaEndpoint::setDescription(const RTCSessionDescription* descrip
                 return;
             }
             if (descriptionType == DescriptionType::Remote) {
+                normalizeRemoteDescription(message.get(), iceCredentialSurrogates(m_webrtcBin.get()));
                 GUniqueOutPtr<GstWebRTCSessionDescription> currentDescription;
 
                 g_object_get(m_webrtcBin.get(), "current-remote-description", &currentDescription.outPtr(), nullptr);
@@ -1224,7 +1568,7 @@ void GStreamerMediaEndpoint::configureSource(RealtimeOutgoingMediaSourceGStreame
 #endif
 }
 
-GRefPtr<GstPad> GStreamerMediaEndpoint::requestPad(const GRefPtr<GstCaps>& allowedCaps, const String& mediaStreamID)
+GRefPtr<GstPad> GStreamerMediaEndpoint::requestPad(const GRefPtr<GstCaps>& allowedCaps, const String& mediaStreamID, std::optional<unsigned> mLineIndex)
 {
     GST_DEBUG_OBJECT(m_pipeline.get(), "Requesting sink pad for %" GST_PTR_FORMAT " and mediaStreamID %s", allowedCaps.get(), mediaStreamID.ascii().data());
     GRefPtr caps = adoptGRef(gst_caps_copy(allowedCaps.get()));
@@ -1258,31 +1602,37 @@ GRefPtr<GstPad> GStreamerMediaEndpoint::requestPad(const GRefPtr<GstCaps>& allow
     // https://gitlab.freedesktop.org/gstreamer/gstreamer/-/commit/09d870a39c28428dc1c8ed77006bf8ad6d3f005e
     // which is included in our SDKs.
     auto kind = webrtcKindFromCaps(caps);
-    forEachTransceiver(m_webrtcBin, [&](auto&& transceiver) -> bool {
-        GstWebRTCKind transceiverKind;
-        g_object_get(transceiver.get(), "kind", &transceiverKind, nullptr);
-        if (transceiverKind != kind)
-            return false;
+    if (!mLineIndex)
+        forEachTransceiver(m_webrtcBin, [&](auto&& transceiver) -> bool {
+            GstWebRTCKind transceiverKind;
+            g_object_get(transceiver.get(), "kind", &transceiverKind, nullptr);
+            if (transceiverKind != kind)
+                return false;
 
-        bool isTransceiverAssociated = false;
-        for (auto pad : GstIteratorAdaptor<GstPad>(gst_element_iterate_sink_pads(m_webrtcBin.get()))) {
-            GRefPtr<GstWebRTCRTPTransceiver> padTransceiver;
-            g_object_get(pad, "transceiver", &padTransceiver.outPtr(), nullptr);
-            if (padTransceiver.get() == transceiver.get()) {
-                isTransceiverAssociated = true;
-                break;
+            bool isTransceiverAssociated = false;
+            for (auto pad : GstIteratorAdaptor<GstPad>(gst_element_iterate_sink_pads(m_webrtcBin.get()))) {
+                GRefPtr<GstWebRTCRTPTransceiver> padTransceiver;
+                g_object_get(pad, "transceiver", &padTransceiver.outPtr(), nullptr);
+                if (padTransceiver.get() == transceiver.get()) {
+                    isTransceiverAssociated = true;
+                    break;
+                }
             }
-        }
-        if (isTransceiverAssociated)
-            return false;
+            if (isTransceiverAssociated)
+                return false;
 
-        g_object_set(transceiver.get(), "codec-preferences", caps.get(), nullptr);
-        GST_DEBUG_OBJECT(m_pipeline.get(), "Expecting transceiver %" GST_PTR_FORMAT " to associate to new webrtc sink pad", transceiver.get());
-        return true;
-    });
+            g_object_set(transceiver.get(), "codec-preferences", caps.get(), nullptr);
+            GST_DEBUG_OBJECT(m_pipeline.get(), "Expecting transceiver %" GST_PTR_FORMAT " to associate to new webrtc sink pad", transceiver.get());
+            return true;
+        });
 
     auto padTemplate = gst_element_get_pad_template(m_webrtcBin.get(), "sink_%u");
-    GRefPtr sinkPad = adoptGRef(gst_element_request_pad(m_webrtcBin.get(), padTemplate, nullptr, caps.get()));
+    auto padName = mLineIndex ? makeString("sink_"_s, *mLineIndex) : String();
+    GRefPtr sinkPad = adoptGRef(gst_element_request_pad(m_webrtcBin.get(), padTemplate, mLineIndex ? padName.ascii().data() : nullptr, caps.get()));
+    if (!sinkPad) {
+        GST_WARNING_OBJECT(m_pipeline.get(), "Unable to request a sink pad for %" GST_PTR_FORMAT, caps.get());
+        return nullptr;
+    }
 
     if (!mediaStreamID.isEmpty()) {
         GST_DEBUG_OBJECT(m_pipeline.get(), "Setting msid to %s on sink pad %" GST_PTR_FORMAT, mediaStreamID.ascii().data(), sinkPad.get());
@@ -1357,44 +1707,124 @@ void GStreamerMediaEndpoint::removeTrack(GStreamerRtpSenderBackend& sender)
     onNegotiationNeeded();
 }
 
-void GStreamerMediaEndpoint::recycleTransceiverForSenderTrack(GStreamerRtpTransceiverBackend* transceiverBackend, MediaStreamTrack& track, const FixedVector<String>& mediaStreamIds)
+static GRefPtr<GstPad> unlinkedSinkPadForTransceiver(GstElement* webrtcBin, GstWebRTCRTPTransceiver* transceiver)
 {
-    auto mediaStreamId = mediaStreamIds.isEmpty() ? emptyString() : mediaStreamIds[0];
+    for (auto pad : GstIteratorAdaptor<GstPad>(gst_element_iterate_sink_pads(webrtcBin))) {
+        GRefPtr<GstWebRTCRTPTransceiver> padTransceiver;
+        g_object_get(pad, "transceiver", &padTransceiver.outPtr(), nullptr);
+        if (padTransceiver.get() == transceiver && !gst_pad_is_linked(pad))
+            return pad;
+    }
+    return nullptr;
+}
 
-    auto transceiver = transceiverBackend->rtcTransceiver();
-    GST_DEBUG_OBJECT(m_pipeline.get(), "Recycling transceiver %" GST_PTR_FORMAT " for track %s", transceiver,  track.id().utf8().data());
+bool GStreamerMediaEndpoint::attachSenderSource(GStreamerRtpSenderBackend& senderBackend, MediaStreamTrack& track)
+{
+    if (senderBackend.hasSource() || !senderBackend.rtcSender())
+        return false;
 
+    GRefPtr<GstWebRTCRTPTransceiver> transceiver;
+    forEachTransceiver(m_webrtcBin, [&](auto&& candidate) -> bool {
+        GRefPtr<GstWebRTCRTPSender> sender;
+        g_object_get(candidate.get(), "sender", &sender.outPtr(), nullptr);
+        if (sender.get() != senderBackend.rtcSender())
+            return false;
+        transceiver = candidate;
+        return true;
+    });
+    if (!transceiver)
+        return false;
+
+    GstWebRTCRTPTransceiverDirection direction;
+    GstWebRTCRTPTransceiverDirection currentDirection;
     unsigned mLineIndex;
-    g_object_get(transceiver, "mlineindex", &mLineIndex, nullptr);
+    g_object_get(transceiver.get(), "direction", &direction, "current-direction", &currentDirection, "mlineindex", &mLineIndex, nullptr);
+    if (direction != GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_SENDONLY && direction != GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_SENDRECV)
+        return false;
 
-    GUniqueOutPtr<GstWebRTCSessionDescription> remoteDescription;
-    g_object_get(m_webrtcBin.get(), "remote-description", &remoteDescription.outPtr(), nullptr);
-    if (!remoteDescription)
+    std::optional<unsigned> boundMLineIndex;
+    if (mLineIndex != std::numeric_limits<unsigned>::max())
+        boundMLineIndex = mLineIndex;
+
+    auto descriptionCaps = [&](ASCIILiteral property) -> GRefPtr<GstCaps> {
+        GUniqueOutPtr<GstWebRTCSessionDescription> description;
+        g_object_get(m_webrtcBin.get(), property.characters(), &description.outPtr(), nullptr);
+        if (!description || !boundMLineIndex || *boundMLineIndex >= gst_sdp_message_medias_len(description->sdp))
+            return nullptr;
+        return capsFromSDPMedia(gst_sdp_message_get_media(description->sdp, *boundMLineIndex));
+    };
+    GRefPtr<GstCaps> allowedCaps;
+    if (currentDirection != GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_NONE)
+        allowedCaps = descriptionCaps("current-local-description"_s);
+    if (!allowedCaps)
+        allowedCaps = descriptionCaps("remote-description"_s);
+    if (!allowedCaps)
+        g_object_get(transceiver.get(), "codec-preferences", &allowedCaps.outPtr(), nullptr);
+    if (!allowedCaps || gst_caps_is_empty(allowedCaps.get()))
+        return false;
+
+    auto existingSinkPad = unlinkedSinkPadForTransceiver(m_webrtcBin.get(), transceiver.get());
+
+    auto mediaStreamId = senderBackend.mediaStreamId().isEmpty() ? track.mediaStreamId() : senderBackend.mediaStreamId();
+    auto attach = [&](RealtimeOutgoingMediaSourceGStreamer& source) -> bool {
+        configureSource(source, nullptr);
+        source.configure(WTF::move(allowedCaps));
+        auto sinkPad = WTF::move(existingSinkPad);
+        if (sinkPad && !source.mediaStreamID().isEmpty() && gstObjectHasProperty(sinkPad.get(), "msid"_s))
+            g_object_set(sinkPad.get(), "msid", source.mediaStreamID().ascii().data(), nullptr);
+        if (!sinkPad)
+            sinkPad = requestPad(source.rtpCaps(), source.mediaStreamID(), boundMLineIndex);
+        if (!sinkPad) {
+            source.teardown();
+            return false;
+        }
+        source.setSinkPad(WTF::move(sinkPad));
+        m_unlinkedOutgoingSources.append(&source);
+        return true;
+    };
+    if (track.privateTrack().isAudio()) {
+        auto source = RealtimeOutgoingAudioSourceGStreamer::create(m_ssrcGenerator, mediaStreamId, track);
+        if (!attach(source.get()))
+            return false;
+        senderBackend.setSource(WTF::move(source));
+    } else {
+        auto source = RealtimeOutgoingVideoSourceGStreamer::create(m_ssrcGenerator, mediaStreamId, track);
+        if (!attach(source.get()))
+            return false;
+        senderBackend.setSource(WTF::move(source));
+    }
+    GST_DEBUG_OBJECT(m_pipeline.get(), "Attached an outgoing source to transceiver %" GST_PTR_FORMAT, transceiver.get());
+    return true;
+}
+
+void GStreamerMediaEndpoint::linkSenderSourceIfNegotiated(GStreamerRtpSenderBackend& senderBackend)
+{
+    if (!senderBackend.rtcSender() || fetchSignalingState(m_webrtcBin.get()) != GST_WEBRTC_SIGNALING_STATE_STABLE)
         return;
 
-    const auto media = gst_sdp_message_get_media(remoteDescription->sdp, mLineIndex);
-    auto allowedCaps = capsFromSDPMedia(media);
+    bool isSending = false;
+    forEachTransceiver(m_webrtcBin, [&](auto&& transceiver) -> bool {
+        GRefPtr<GstWebRTCRTPSender> sender;
+        GstWebRTCRTPTransceiverDirection currentDirection;
+        g_object_get(transceiver.get(), "sender", &sender.outPtr(), "current-direction", &currentDirection, nullptr);
+        if (sender.get() != senderBackend.rtcSender())
+            return false;
+        isSending = currentDirection == GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_SENDONLY || currentDirection == GST_WEBRTC_RTP_TRANSCEIVER_DIRECTION_SENDRECV;
+        return true;
+    });
+    if (!isSending)
+        return;
 
-    if (track.privateTrack().isAudio()) {
-        GST_DEBUG_OBJECT(m_pipeline.get(), "Adding outgoing audio source");
-        auto source = RealtimeOutgoingAudioSourceGStreamer::create(m_ssrcGenerator, mediaStreamId, track);
-        configureSource(source.get(), nullptr);
+    GUniqueOutPtr<GstWebRTCSessionDescription> localDescription;
+    g_object_get(m_webrtcBin.get(), "current-local-description", &localDescription.outPtr(), nullptr);
+    if (localDescription)
+        linkOutgoingSources(localDescription->sdp);
+}
 
-        source->configure(WTF::move(allowedCaps));
-        auto rtpCaps = source->rtpCaps();
-        auto sinkPad = requestPad(rtpCaps, source->mediaStreamID());
-        source->setSinkPad(WTF::move(sinkPad));
-    } else {
-        ASSERT(track.privateTrack().isVideo());
-        GST_DEBUG_OBJECT(m_pipeline.get(), "Adding outgoing video source");
-        auto source = RealtimeOutgoingVideoSourceGStreamer::create(m_ssrcGenerator, mediaStreamId, track);
-        configureSource(source.get(), nullptr);
-
-        source->configure(WTF::move(allowedCaps));
-        auto rtpCaps = source->rtpCaps();
-        auto sinkPad = requestPad(rtpCaps, source->mediaStreamID());
-        source->setSinkPad(WTF::move(sinkPad));
-    }
+void GStreamerMediaEndpoint::attachPendingSenderSources()
+{
+    if (auto peerConnectionBackend = this->peerConnectionBackend())
+        peerConnectionBackend->attachSourcesToSendingSenders();
 }
 
 void GStreamerMediaEndpoint::doCreateOffer(const RTCOfferOptions& options)
@@ -1420,6 +1850,7 @@ void GStreamerMediaEndpoint::initiate(bool isInitiator, GstStructure* rawOptions
 {
     auto type = isInitiator ? "offer"_s : "answer"_s;
     GST_DEBUG_OBJECT(m_pipeline.get(), "Creating %s", type.characters());
+    attachPendingSenderSources();
     auto signalName = makeString("create-"_s, type);
     GUniquePtr<GstStructure> options(rawOptions);
     auto* holder = createGStreamerMediaEndpointHolder();
@@ -2084,6 +2515,17 @@ void GStreamerMediaEndpoint::addIceCandidate(const RTCIceCandidate& candidate, P
     if (!sdp.startsWith("candidate:"_s)) {
         callOnMainThread([task = createSharedTask<PeerConnectionBackend::AddIceCandidateCallbackFunction>(WTF::move(callback))]() mutable {
             task->run(Exception { ExceptionCode::OperationError, "Expect line: candidate:<candidate-str>"_s });
+        });
+        return;
+    }
+
+    if (isIceCandidateOnUnusableTransport(sdp)) {
+        GST_DEBUG_OBJECT(m_pipeline.get(), "Skipping ICE candidate on a transport the ICE agent cannot use: %s", sdpString.data());
+        callOnMainThread([task = createSharedTask<PeerConnectionBackend::AddIceCandidateCallbackFunction>(WTF::move(callback)), weakWebrtcBin = GThreadSafeWeakPtr { m_webrtcBin.get() }]() mutable {
+            auto webrtcBin = weakWebrtcBin.get();
+            if (!webrtcBin)
+                return;
+            task->run(descriptionsFromWebRTCBin(webrtcBin.get()));
         });
         return;
     }

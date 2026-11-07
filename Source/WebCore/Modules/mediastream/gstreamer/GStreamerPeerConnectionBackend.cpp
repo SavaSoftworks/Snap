@@ -344,8 +344,6 @@ ExceptionOr<Ref<RTCRtpSender>> GStreamerPeerConnectionBackend::addTrack(MediaStr
         if (!transceiver)
             return Exception { ExceptionCode::TypeError, "Unable to add track"_s };
 
-        m_endpoint->recycleTransceiverForSenderTrack(reinterpret_cast<GStreamerRtpTransceiverBackend*>(&transceiver->backend()), track, mediaStreamIds);
-
         // 5. If transceiver.[[Direction]] is "recvonly", set transceiver.[[Direction]] to "sendrecv".
         // 6. If transceiver.[[Direction]] is "inactive", set transceiver.[[Direction]] to "sendonly".
         auto direction = transceiver->direction();
@@ -411,6 +409,29 @@ ExceptionOr<Ref<RTCRtpTransceiver>> GStreamerPeerConnectionBackend::addTransceiv
 GStreamerRtpSenderBackend::Source GStreamerPeerConnectionBackend::createSourceForTrack(MediaStreamTrack& track)
 {
     return m_endpoint->createSourceForTrack(track);
+}
+
+void GStreamerPeerConnectionBackend::attachSourcesToSendingSenders()
+{
+    Ref peerConnection = m_peerConnection;
+    for (const auto& transceiver : peerConnection->currentTransceivers()) {
+        if (transceiver->stopped())
+            continue;
+        auto& sender = transceiver->sender();
+        RefPtr track = sender.track();
+        if (!track)
+            continue;
+        auto& senderBackend = backendFromRTPSender(sender);
+        if (senderBackend.hasSource())
+            continue;
+        m_endpoint->attachSenderSource(senderBackend, *track);
+    }
+}
+
+void GStreamerPeerConnectionBackend::attachSourceForReplacedTrack(GStreamerRtpSenderBackend& senderBackend, MediaStreamTrack& track)
+{
+    if (m_endpoint->attachSenderSource(senderBackend, track))
+        m_endpoint->linkSenderSourceIfNegotiated(senderBackend);
 }
 
 static inline GStreamerRtpTransceiverBackend& backendFromRTPTransceiver(RTCRtpTransceiver& transceiver)

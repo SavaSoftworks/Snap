@@ -97,6 +97,8 @@ private:
     ExceptionOr<Ref<RTCRtpTransceiver>> addTransceiver(Ref<MediaStreamTrack>&&, const RTCRtpTransceiverInit&) final;
 
     GStreamerRtpSenderBackend::Source createSourceForTrack(MediaStreamTrack&);
+    void attachSourcesToSendingSenders();
+    void attachSourceForReplacedTrack(GStreamerRtpSenderBackend&, MediaStreamTrack&);
 
     RefPtr<RTCRtpTransceiver> existingTransceiver(WTF::Function<bool(GStreamerRtpTransceiverBackend&)>&&);
     Ref<RTCRtpTransceiver> addInternalTransceiver(UniqueRef<GStreamerRtpTransceiverBackend>&&, RealtimeMediaSource::Type, String&&);

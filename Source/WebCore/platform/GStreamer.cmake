@@ -130,6 +130,7 @@ if (ENABLE_VIDEO)
                 ${GSTREAMER_RTP_LIBRARIES}
                 ${GSTREAMER_SDP_LIBRARIES}
                 ${GSTREAMER_WEBRTC_LIBRARIES}
+                ${GSTREAMER_WEBRTC_NICE_LIBRARIES}
             )
         endif ()
 

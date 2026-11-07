@@ -91,7 +91,9 @@ public:
     ExceptionOr<Ref<GStreamerRtpSenderBackend>> addTrack(MediaStreamTrack&, const FixedVector<String>&);
     void removeTrack(GStreamerRtpSenderBackend&);
 
-    void recycleTransceiverForSenderTrack(GStreamerRtpTransceiverBackend*, MediaStreamTrack&, const FixedVector<String>&);
+    bool attachSenderSource(GStreamerRtpSenderBackend&, MediaStreamTrack&);
+    void linkSenderSourceIfNegotiated(GStreamerRtpSenderBackend&);
+    void attachPendingSenderSources();
 
     struct Backends {
         Ref<GStreamerRtpSenderBackend> senderBackend;
@@ -170,7 +172,7 @@ private:
 
     void processSDPMessage(const GstSDPMessage*, Function<void(unsigned index, CStringView mid, const GstSDPMedia*)>);
 
-    [[nodiscard]] GRefPtr<GstPad> requestPad(const GRefPtr<GstCaps>&, const String& mediaStreamID);
+    [[nodiscard]] GRefPtr<GstPad> requestPad(const GRefPtr<GstCaps>&, const String& mediaStreamID, std::optional<unsigned> mLineIndex = std::nullopt);
 
     std::optional<bool> isIceGatheringComplete(const String& currentLocalDescription);
 
