@@ -195,8 +195,13 @@ void GStreamerVideoCaptureSource::sourceCapsChanged(const GstCaps* caps)
     if (!videoResolution)
         return;
 
+    bool followsIntrinsicSize = size().isEmpty() || size() == intrinsicSize();
     setIntrinsicSize(IntSize(*videoResolution), false);
-    if (m_deviceType == CaptureDevice::DeviceType::Screen)
+    if (m_deviceType != CaptureDevice::DeviceType::Screen && m_deviceType != CaptureDevice::DeviceType::Window)
+        return;
+    if (followsIntrinsicSize)
+        setSize(intrinsicSize());
+    else
         ensureIntrinsicSizeMaintainsAspectRatio();
 }
 
@@ -268,9 +273,16 @@ const RealtimeMediaSourceSettings& GStreamerVideoCaptureSource::settings()
         RealtimeMediaSourceSettings settings;
         settings.setDeviceId(hashedId());
 
+        bool isDisplay = m_deviceType == CaptureDevice::DeviceType::Screen || m_deviceType == CaptureDevice::DeviceType::Window;
         RealtimeMediaSourceSupportedConstraints supportedConstraints;
         supportedConstraints.setSupportsDeviceId(true);
-        supportedConstraints.setSupportsFacingMode(true);
+        supportedConstraints.setSupportsFacingMode(!isDisplay);
+        if (isDisplay) {
+            supportedConstraints.setSupportsDisplaySurface(true);
+            supportedConstraints.setSupportsLogicalSurface(true);
+            settings.setDisplaySurface(m_deviceType == CaptureDevice::DeviceType::Screen ? DisplaySurfaceType::Monitor : DisplaySurfaceType::Window);
+            settings.setLogicalSurface(false);
+        }
         supportedConstraints.setSupportsWidth(true);
         supportedConstraints.setSupportsHeight(true);
         supportedConstraints.setSupportsAspectRatio(true);
@@ -283,7 +295,8 @@ const RealtimeMediaSourceSettings& GStreamerVideoCaptureSource::settings()
     m_currentSettings->setWidth(size().width());
     m_currentSettings->setHeight(size().height());
     m_currentSettings->setFrameRate(frameRate());
-    m_currentSettings->setFacingMode(facingMode());
+    if (m_deviceType == CaptureDevice::DeviceType::Camera)
+        m_currentSettings->setFacingMode(facingMode());
     return m_currentSettings.value();
 }
 
@@ -354,10 +367,6 @@ void GStreamerVideoCaptureSource::generatePresets()
 void GStreamerVideoCaptureSource::setSizeFrameRateAndZoom(const VideoPresetConstraints& constraints)
 {
     RealtimeVideoCaptureSource::setSizeFrameRateAndZoom(constraints);
-    if (!constraints.width || !constraints.height)
-        return;
-
-    m_capturer->setSize({ *constraints.width, *constraints.height });
 }
 
 void GStreamerVideoCaptureSource::applyFrameRateAndZoomWithPreset(double requestedFrameRate, double requestedZoom, std::optional<VideoPreset>&& preset)

@@ -141,6 +141,7 @@ public:
 
     // DisplayCaptureManager interface
     bool requiresCaptureDevicesEnumeration() const final { return true; }
+    bool selectsSourceWhenCaptureStarts() const final { return true; }
 
 private:
     GStreamerDisplayCaptureDeviceManager();

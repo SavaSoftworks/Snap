@@ -39,6 +39,7 @@ public:
     };
 
     virtual bool requiresCaptureDevicesEnumeration() const { return false; }
+    virtual bool selectsSourceWhenCaptureStarts() const { return false; }
 };
 
 } // namespace WebCore

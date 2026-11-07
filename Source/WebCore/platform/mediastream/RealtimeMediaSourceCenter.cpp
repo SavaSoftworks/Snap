@@ -225,6 +225,11 @@ void RealtimeMediaSourceCenter::getDisplayMediaDevices(const MediaStreamRequest&
         if (!device.enabled())
             continue;
 
+        if (displayCaptureFactory().displayCaptureDeviceManager().selectsSourceWhenCaptureStarts()) {
+            displayDeviceInfo.append({ 1, device });
+            continue;
+        }
+
         auto sourceOrError = displayCaptureFactory().createDisplayCaptureSource(device, MediaDeviceHashSalts { hashSalts }, &request.videoConstraints, request.pageIdentifier);
         if (!sourceOrError)
             continue;
