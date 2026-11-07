@@ -317,7 +317,8 @@ void ImageBuffer::submitDrawingCommands()
 
 void ImageBuffer::prepareForDisplay()
 {
-    flushDrawingContextAsync();
+    if (!m_backend || !m_backend->preparesForDisplayWithoutFlushing())
+        flushDrawingContextAsync();
     if (auto* backend = ensureBackend())
         backend->prepareForDisplay();
 }

@@ -127,7 +127,7 @@ static Vector<uint8_t> encodeUnacceleratedImage(const SkPixmap& pixmap, const St
 
 Vector<uint8_t> platformEncodeData(const NativeImage& nativeImage, const String& mimeType, std::optional<double> quality)
 {
-    auto image = nativeImage.platformImage();
+    auto image = nativeImage.hasSkiaImageProvider() ? nativeImage.skiaRasterImage() : nativeImage.platformImage();
     if (!image)
         return { };
 

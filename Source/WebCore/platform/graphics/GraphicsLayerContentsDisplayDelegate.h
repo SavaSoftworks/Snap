@@ -64,8 +64,9 @@ public:
 #elif USE(COORDINATED_GRAPHICS)
     virtual void setDisplayBuffer(std::unique_ptr<CoordinatedPlatformLayerBuffer>&&) = 0;
     virtual bool display(CoordinatedPlatformLayer&, std::optional<Damage>&&) = 0;
+    virtual void setTargetLayer(CoordinatedPlatformLayer*) { }
 #if USE(SKIA)
-    void setThreadSafeGrContext(const sk_sp<GrContextThreadSafeProxy>&);
+    virtual void setThreadSafeGrContext(const sk_sp<GrContextThreadSafeProxy>&);
     const sk_sp<GrContextThreadSafeProxy>& threadSafeGrContext() const;
 #endif
 

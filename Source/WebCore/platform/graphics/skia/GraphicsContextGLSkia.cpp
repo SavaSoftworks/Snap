@@ -64,7 +64,7 @@ bool GraphicsContextGLImageExtractor::extractImage(bool premultiplyAlpha, bool i
     if (!nativeImage)
         return false;
 
-    auto platformImage = nativeImage->platformImage();
+    auto platformImage = nativeImage->hasSkiaImageProvider() ? nativeImage->skiaRasterImage() : nativeImage->platformImage();
     if (!platformImage)
         return false;
 
@@ -124,7 +124,7 @@ bool GraphicsContextGLImageExtractor::extractImage(bool premultiplyAlpha, bool i
         m_imagePixelData = span(pixmap);
 
         // Raster SkSurfaces have BGRA format.
-        m_imageSourceFormat = DataFormat::BGRA8;
+        m_imageSourceFormat = pixmap.colorType() == kRGBA_8888_SkColorType ? DataFormat::RGBA8 : DataFormat::BGRA8;
     }
 
     m_imageSourceUnpackAlignment = srcUnpackAlignment;

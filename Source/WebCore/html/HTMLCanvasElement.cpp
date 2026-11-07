@@ -570,17 +570,26 @@ void HTMLCanvasElement::didDraw(const std::optional<FloatRect>& rect, ShouldAppl
 {
     clearCopiedImage();
     if (CheckedPtr renderer = renderBox()) {
-        const std::optional<FloatRect> dirtyRect = computeDirtyRectangleIfNeeded(rect);
-        if (usesContentsAsLayerContents())
-            renderer->contentChanged(ContentChangeType::CanvasPixels, dirtyRect);
-        else if (dirtyRect)
-            renderer->repaintRectangle(enclosingIntRect(*dirtyRect));
+        bool layerContents = usesContentsAsLayerContents();
+        bool eligible = layerContents && is<CanvasRenderingContext2D>(m_context.get());
+        if (!eligible || m_snapFullyDirtyRenderer.get() != renderer.get()) {
+            const std::optional<FloatRect> dirtyRect = computeDirtyRectangleIfNeeded(rect);
+            if (layerContents) {
+                renderer->contentChanged(ContentChangeType::CanvasPixels, dirtyRect);
+                if (eligible && (!rect || rect->contains(FloatRect { {}, size() }))) {
+                    m_snapFullyDirtyRenderer = renderer.get();
+                }
+            } else if (dirtyRect) {
+                renderer->repaintRectangle(enclosingIntRect(*dirtyRect));
+            }
+        }
     }
     CanvasBase::didDraw(rect, shouldApplyPostProcessingToDirtyRect);
 }
 
 void HTMLCanvasElement::didUpdateSizeProperties()
 {
+    m_snapFullyDirtyRenderer = nullptr;
     if (m_ignoreDidUpdateSizeProperties)
         return;
 
@@ -617,6 +626,7 @@ bool HTMLCanvasElement::usesContentsAsLayerContents() const
 
 void HTMLCanvasElement::paint(GraphicsContext& context, const LayoutRect& r)
 {
+    m_snapFullyDirtyRenderer = nullptr;
     if (!m_context)
         return;
     m_context->clearAccumulatedDirtyRect();
@@ -869,6 +879,7 @@ void HTMLCanvasElement::eventListenersDidChange()
 
 void HTMLCanvasElement::didMoveToNewDocument(Document& oldDocument, Document& newDocument)
 {
+    m_snapFullyDirtyRenderer = nullptr;
     ActiveDOMObject::didMoveToNewDocument(newDocument);
     if (RefPtr context = renderingContext()) {
         oldDocument.removeCanvasNeedingPreparationForDisplayOrFlush(*context);
@@ -884,6 +895,7 @@ bool HTMLCanvasElement::needsPreparationForDisplay()
 
 void HTMLCanvasElement::prepareForDisplay()
 {
+    m_snapFullyDirtyRenderer = nullptr;
     ASSERT(needsPreparationForDisplay());
 
     bool shouldPrepare = true;

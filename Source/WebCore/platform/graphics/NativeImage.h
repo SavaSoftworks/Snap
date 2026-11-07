@@ -32,11 +32,21 @@
 #include <WebCore/ImageTypes.h>
 #include <WebCore/PlatformImage.h>
 #include <WebCore/RenderingResource.h>
+#include <memory>
 #include <wtf/CheckedRef.h>
+#include <wtf/Lock.h>
 #include <wtf/TZoneMalloc.h>
 
 #if USE(SKIA)
 class GrDirectContext;
+class GrContextThreadSafeProxy;
+class SkImage;
+class NativeImageSkiaImageProvider {
+public:
+    virtual ~NativeImageSkiaImageProvider() = default;
+    virtual sk_sp<SkImage> imageForThreadSafeContext(const sk_sp<GrContextThreadSafeProxy>&) const = 0;
+    virtual sk_sp<SkImage> rasterImage() const = 0;
+};
 #endif
 
 namespace WebCore {
@@ -89,6 +99,34 @@ public:
 
 #if USE(SKIA)
     GrDirectContext* grContext() const { return m_grContext; }
+    bool hasSkiaImageProvider() const
+    {
+        Locker locker { m_skiaImageProviderLock };
+        return !!m_skiaImageProvider;
+    }
+    sk_sp<SkImage> imageForThreadSafeContext(const sk_sp<GrContextThreadSafeProxy>& context) const
+    {
+        std::shared_ptr<NativeImageSkiaImageProvider> provider;
+        {
+            Locker locker { m_skiaImageProviderLock };
+            provider = m_skiaImageProvider;
+        }
+        return provider ? provider->imageForThreadSafeContext(context) : nullptr;
+    }
+    sk_sp<SkImage> skiaRasterImage() const
+    {
+        std::shared_ptr<NativeImageSkiaImageProvider> provider;
+        {
+            Locker locker { m_skiaImageProviderLock };
+            provider = m_skiaImageProvider;
+        }
+        return provider ? provider->rasterImage() : nullptr;
+    }
+    void setSkiaImageProvider(std::shared_ptr<NativeImageSkiaImageProvider>&& provider)
+    {
+        Locker locker { m_skiaImageProviderLock };
+        m_skiaImageProvider = WTF::move(provider);
+    }
 #endif
 
     void addObserver(WeakRef<RenderingResourceObserver>&& observer) const
@@ -119,6 +157,8 @@ protected:
     RenderingResourceIdentifier m_renderingResourceIdentifier { RenderingResourceIdentifier::generate() };
 #if USE(SKIA)
     GrDirectContext* m_grContext { nullptr };
+    mutable Lock m_skiaImageProviderLock;
+    mutable std::shared_ptr<NativeImageSkiaImageProvider> m_skiaImageProvider WTF_GUARDED_BY_LOCK(m_skiaImageProviderLock);
 #endif
 };
 

@@ -53,9 +53,25 @@ Ref<CoordinatedImageBackingStore> CoordinatedImageBackingStore::create(Ref<Nativ
 }
 
 CoordinatedImageBackingStore::CoordinatedImageBackingStore(Ref<NativeImage>&& nativeImage, const sk_sp<GrContextThreadSafeProxy>& threadSafeGrContext)
-    : m_buffer(CoordinatedPlatformLayerBufferSkiaImage::create(nativeImage->platformImage(), threadSafeGrContext))
-    , m_uniqueID(nativeImage->uniqueID())
+    : m_uniqueID(nativeImage->uniqueID())
 {
+    if (!nativeImage->hasSkiaImageProvider()) {
+        m_buffer = CoordinatedPlatformLayerBufferSkiaImage::create(nativeImage->platformImage(), threadSafeGrContext);
+        return;
+    }
+    auto image = nativeImage->imageForThreadSafeContext(threadSafeGrContext);
+    if (!image) {
+        auto platformImage = nativeImage->platformImage();
+        if (!platformImage || platformImage->isTextureBacked()) {
+            return;
+        }
+        image = WTF::move(platformImage);
+    }
+    OptionSet<TextureMapperFlags> flags;
+    if (!image->isOpaque()) {
+        flags.add(TextureMapperFlags::ShouldBlend);
+    }
+    m_buffer = makeUnique<CoordinatedPlatformLayerBufferSkiaImage>(WTF::move(image), flags);
 }
 #endif
 

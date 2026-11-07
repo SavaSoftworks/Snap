@@ -294,6 +294,8 @@
     "waiting": { },
     "waitingforkey": { },
     "webglcontextcreationerror": { },
+    "contextlost": { },
+    "contextrestored": { },
     "webglcontextlost": { },
     "webglcontextrestored": { },
     "webkitAnimationEnd": { "categories": ["CSSAnimation"] },

@@ -84,6 +84,9 @@ GraphicsLayerCoordinated::GraphicsLayerCoordinated(Type layerType, GraphicsLayer
 
 GraphicsLayerCoordinated::~GraphicsLayerCoordinated()
 {
+    if (m_contentsDisplayDelegate) {
+        m_contentsDisplayDelegate->setTargetLayer(nullptr);
+    }
     if (m_contentsBufferProxy)
         m_contentsBufferProxy->setTargetLayer(nullptr);
     m_platformLayer->setOwner(nullptr);
@@ -393,7 +396,10 @@ void GraphicsLayerCoordinated::setContentsToPlatformLayer(PlatformLayer* content
     EnumSet<Change> change = { Change::ContentsBuffer };
     if (m_contentsBufferProxy) {
         m_contentsBufferProxy->setTargetLayer(m_platformLayer.ptr());
-        m_contentsDisplayDelegate = nullptr;
+        if (m_contentsDisplayDelegate) {
+            m_contentsDisplayDelegate->setTargetLayer(nullptr);
+            m_contentsDisplayDelegate = nullptr;
+        }
         change.add(Change::ContentsBufferNeedsDisplay);
     }
     noteLayerPropertyChanged(change, ScheduleFlush::Yes);
@@ -404,12 +410,16 @@ void GraphicsLayerCoordinated::setContentsDisplayDelegate(RefPtr<GraphicsLayerCo
     if (m_contentsDisplayDelegate == delegate)
         return;
 
+    if (m_contentsDisplayDelegate) {
+        m_contentsDisplayDelegate->setTargetLayer(nullptr);
+    }
     m_contentsDisplayDelegate = WTF::move(delegate);
 
     EnumSet<Change> change = { Change::ContentsBuffer };
     if (m_contentsDisplayDelegate) {
 #if USE(SKIA)
         m_contentsDisplayDelegate->setThreadSafeGrContext(m_platformLayer->threadSafeGrContext());
+        m_contentsDisplayDelegate->setTargetLayer(m_platformLayer.ptr());
 #endif
         if (m_contentsBufferProxy) {
             m_contentsBufferProxy->setTargetLayer(nullptr);

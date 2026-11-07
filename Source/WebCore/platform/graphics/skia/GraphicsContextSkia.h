@@ -135,6 +135,7 @@ private:
     void trackAcceleratedRenderingFenceIfNeeded(const sk_sp<SkImage>&, GrDirectContext*);
     void trackAcceleratedRenderingFenceIfNeeded(Pattern&);
     sk_sp<SkImage> imageForCurrentThread(const sk_sp<SkImage>&) const;
+    sk_sp<SkImage> imageForCurrentThread(const NativeImage&) const;
 
     void setupFillSource(SkPaint&);
     void setupStrokeSource(SkPaint&);

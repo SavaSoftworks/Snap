@@ -32,6 +32,12 @@
 
 #include "config.h"
 #include "CanvasRenderingContext2DBase.h"
+#include "Event.h"
+#include "EventNames.h"
+#include "ScriptExecutionContext.h"
+#if USE(SKIA)
+#include "ImageBufferSkiaAcceleratedBackend.h"
+#endif
 
 #include "BitmapImage.h"
 #include "ContainerNodeInlines.h"
@@ -315,8 +321,72 @@ bool CanvasRenderingContext2DBase::hasDeferredOperations() const
 void CanvasRenderingContext2DBase::flushDeferredOperations()
 {
     m_hasDeferredOperations = false;
-    if (RefPtr buffer = this->buffer())
+    if (RefPtr buffer = this->buffer(); buffer && !buffer->preparesForDisplayWithoutFlushing())
         buffer->flushDrawingContextAsync();
+}
+
+bool CanvasRenderingContext2DBase::isContextLost() const
+{
+    return m_contextLost || (m_buffer && m_buffer->isContextLost());
+}
+
+bool CanvasRenderingContext2DBase::loseContextForTesting()
+{
+    RefPtr buffer = this->buffer();
+    return buffer && buffer->loseContextForTesting();
+}
+
+bool CanvasRenderingContext2DBase::isCanvasThreadForTesting() const
+{
+    RefPtr buffer = this->buffer();
+    return buffer && buffer->isCanvasThreadForTesting();
+}
+
+uint64_t CanvasRenderingContext2DBase::synchronousCanvasOperationsForTesting() const
+{
+    RefPtr buffer = this->buffer();
+    return buffer ? buffer->synchronousCanvasOperationsForTesting() : 0;
+}
+
+void CanvasRenderingContext2DBase::didLoseContext()
+{
+    if (m_contextLost) {
+        return;
+    }
+    m_contextLost = true;
+    didUpdateCanvasSizeProperties(true);
+    m_canDispatchContextLossEvents.store(true, std::memory_order_relaxed);
+    if (RefPtr canvasElement = dynamicDowncast<HTMLCanvasElement>(canvasBase())) {
+        canvasElement->invalidateStyleAndLayerComposition();
+    }
+    protect(canvasBase())->queueTaskKeepingObjectAlive(TaskSource::DOMManipulation, [weakThis = WeakPtr { *this }](auto& canvas) {
+        RefPtr context = weakThis.get();
+        if (!context || !context->m_contextLost) {
+            return;
+        }
+        auto event = Event::create(eventNames().contextlostEvent, Event::CanBubble::No, Event::IsCancelable::Yes);
+        canvas.dispatchEvent(event);
+        if (event->defaultPrevented()) {
+            context->m_canDispatchContextLossEvents.store(false, std::memory_order_relaxed);
+            return;
+        }
+        canvas.queueTaskKeepingObjectAlive(TaskSource::DOMManipulation, [weakThis](auto& canvas) {
+            RefPtr context = weakThis.get();
+            if (!context || !context->m_contextLost) {
+                return;
+            }
+            context->didUpdateCanvasSizeProperties(true);
+            context->m_contextLost = false;
+            if (!context->buffer()) {
+                context->m_contextLost = true;
+                context->m_canDispatchContextLossEvents.store(false, std::memory_order_relaxed);
+                return;
+            }
+            context->didDrawEntireCanvas();
+            canvas.dispatchEvent(Event::create(eventNames().contextrestoredEvent, Event::CanBubble::No, Event::IsCancelable::No));
+            context->m_canDispatchContextLossEvents.store(false, std::memory_order_relaxed);
+        });
+    });
 }
 
 void CanvasRenderingContext2DBase::reset()
@@ -333,11 +403,15 @@ void CanvasRenderingContext2DBase::didUpdateCanvasSizeProperties(bool sizeChange
     for (size_t i = 0; i < restoreCount; ++i)
         restore();
     m_stateStack.first() = State();
+    m_hasInvertibleTransform = true;
     m_path.clear();
     m_cachedContents.emplace<CachedContentsTransparent>();
     m_hasDeferredOperations = false;
     clearAccumulatedDirtyRect();
     if (sizeChanged) {
+        if (!m_contextLost && (!m_buffer || !m_buffer->isContextLost())) {
+            m_canDispatchContextLossEvents.store(false, std::memory_order_relaxed);
+        }
         m_hasCreatedImageBuffer = false;
         if (m_buffer) {
 #if ASSERT_ENABLED
@@ -3326,6 +3400,9 @@ void CanvasRenderingContext2DBase::setWordSpacing(const String& wordSpacing)
 
 ImageBuffer* CanvasRenderingContext2DBase::buffer() const
 {
+    if (isContextLost()) {
+        return nullptr;
+    }
     if (m_hasCreatedImageBuffer)
         return m_buffer;
     m_hasCreatedImageBuffer = true;
@@ -3340,6 +3417,19 @@ ImageBuffer* CanvasRenderingContext2DBase::buffer() const
     context.save();
     updateMemoryCost(buffer->memoryCost());
     m_buffer = buffer;
+    m_canDispatchContextLossEvents.store(
+        m_canDispatchContextLossEvents.load(std::memory_order_relaxed) || buffer->isCanvasThreadForTesting(),
+        std::memory_order_relaxed);
+    if (auto* scriptContext = canvasBase().scriptExecutionContext()) {
+        buffer->setContextLossHandler([identifier = scriptContext->identifier(),
+                                          weakThis = WeakPtr { const_cast<CanvasRenderingContext2DBase&>(*this) }]() mutable {
+            ScriptExecutionContext::postTaskTo(identifier, [weakThis = WTF::move(weakThis)](auto&) {
+                if (RefPtr context = weakThis.get()) {
+                    context->didLoseContext();
+                }
+            });
+        });
+    }
 
 #if USE(CA) || USE(SKIA)
     // Recalculate compositing requirements if acceleration state changed.
@@ -3366,6 +3456,15 @@ RefPtr<ImageBuffer> CanvasRenderingContext2DBase::allocateImageBuffer() const
     RenderingMode renderingMode = !willReadFrequently() && protect(canvasBase())->shouldAccelerate() ? RenderingMode::Accelerated : RenderingMode::Unaccelerated;
     if (auto renderingModeForTesting = this->renderingModeForTesting())
         renderingMode = *renderingModeForTesting;
+#if USE(SKIA)
+    if (m_settings.disableCanvasThreadForTesting && renderingMode == RenderingMode::Accelerated) {
+        ImageBufferCreationContext creationContext;
+        creationContext.canvasThreadEnabled = false;
+        if (auto buffer = ImageBuffer::create<ImageBufferSkiaAcceleratedBackend>(canvasBase().size(), 1, colorSpace(), ImageBufferFormat { pixelFormat() }, RenderingPurpose::Canvas, creationContext)) {
+            return buffer;
+        }
+    }
+#endif
     return ImageBuffer::create(canvasBase().size(), renderingMode, RenderingPurpose::Canvas, 1, colorSpace(), pixelFormat(), scriptExecutionContext->graphicsClient());
 }
 

@@ -42,6 +42,7 @@ enum RenderingMode {
     // FIXME: Add support for 'alpha'.
     // boolean alpha = true;
     boolean desynchronized = false;
+    [EnabledBySetting=DOMTestingAPIsEnabled] boolean disableCanvasThreadForTesting = false;
     boolean willReadFrequently = false;
     [EnabledBySetting=CanvasColorSpaceEnabled] PredefinedColorSpace colorSpace = "srgb";
     [EnabledBySetting=CanvasColorTypeEnabled] CanvasColorType colorType = "unorm8";

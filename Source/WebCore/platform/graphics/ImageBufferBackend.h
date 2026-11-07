@@ -37,6 +37,7 @@
 #include <WebCore/PixelBufferFormat.h>
 #include <WebCore/PlatformLayer.h>
 #include <WebCore/RenderingMode.h>
+#include <wtf/Function.h>
 #include <wtf/RefPtr.h>
 #include <wtf/TZoneMalloc.h>
 #include <wtf/Vector.h>
@@ -121,6 +122,12 @@ public:
 
     virtual GraphicsContext& context() = 0;
     virtual void flushContext() { }
+    virtual bool preparesForDisplayWithoutFlushing() const { return false; }
+    virtual bool isContextLost() const { return false; }
+    virtual bool isCanvasThreadForTesting() const { return false; }
+    virtual uint64_t synchronousCanvasOperationsForTesting() const { return 0; }
+    virtual void setContextLossHandler(Function<void()>&&) { }
+    virtual bool loseContextForTesting() { return false; }
     virtual void submitDrawingCommands() { }
 
     virtual RefPtr<NativeImage> copyNativeImage() = 0;

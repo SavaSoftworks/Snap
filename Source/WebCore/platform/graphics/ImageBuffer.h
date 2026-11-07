@@ -77,6 +77,9 @@ struct ImageBufferCreationContext {
 #endif
     ProcessIdentity resourceOwner;
 
+#if USE(SKIA)
+    bool canvasThreadEnabled { true };
+#endif
     ImageBufferCreationContext() = default;
 };
 
@@ -154,6 +157,17 @@ public:
     WEBCORE_EXPORT virtual GraphicsContext& context() const;
 
     WEBCORE_EXPORT virtual void flushDrawingContext();
+    bool isContextLost() const { return m_backend && m_backend->isContextLost(); }
+    bool isCanvasThreadForTesting() const { return m_backend && m_backend->isCanvasThreadForTesting(); }
+    uint64_t synchronousCanvasOperationsForTesting() const { return m_backend ? m_backend->synchronousCanvasOperationsForTesting() : 0; }
+    void setContextLossHandler(Function<void()>&& handler)
+    {
+        if (m_backend) {
+            m_backend->setContextLossHandler(WTF::move(handler));
+        }
+    }
+    bool loseContextForTesting() { return m_backend && m_backend->loseContextForTesting(); }
+    bool preparesForDisplayWithoutFlushing() const { return m_backend && m_backend->preparesForDisplayWithoutFlushing(); }
     WEBCORE_EXPORT virtual bool flushDrawingContextAsync();
 
     WEBCORE_EXPORT virtual void submitDrawingCommands();

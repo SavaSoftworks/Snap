@@ -40,6 +40,8 @@ class GrDirectContext;
 namespace WebCore {
 
 class GraphicsContextSkia;
+class SnapCanvasGPUState;
+class SnapCanvasPresentation;
 class SkiaSwitchableCanvas;
 
 class ImageBufferSkiaAcceleratedBackend final : public ImageBufferSkiaSurfaceBackend {
@@ -53,7 +55,13 @@ public:
     static constexpr RenderingMode renderingMode = RenderingMode::Accelerated;
 
 private:
-    ImageBufferSkiaAcceleratedBackend(const Parameters&, sk_sp<SkSurface>&&);
+    ImageBufferSkiaAcceleratedBackend(const Parameters&, sk_sp<SkSurface>&&, RefPtr<SnapCanvasGPUState>&& = nullptr);
+    bool preparesForDisplayWithoutFlushing() const final { return !!m_canvasThread; }
+    bool isContextLost() const final;
+    bool isCanvasThreadForTesting() const final;
+    uint64_t synchronousCanvasOperationsForTesting() const final;
+    void setContextLossHandler(Function<void()>&&) final;
+    bool loseContextForTesting() final;
 
     GraphicsContext& context() final;
     void flushContext() final;
@@ -68,6 +76,11 @@ private:
     GrDirectContext* grContext() const;
     void replayCanvasRecordingContextIfNeeded();
     void ensureCanvasRecordingContext();
+    sk_sp<SkPicture> finishCanvasRecording();
+    void restartCanvasRecording();
+    bool executeCanvasThreadSync(Function<bool(SkSurface&, GrDirectContext&)>&&);
+    bool readPixelBuffer(SkSurface&, const IntRect&, PixelBuffer&);
+    bool writePixelBuffer(SkSurface&, const PixelBufferSourceView&, const IntRect&, const IntPoint&, AlphaPremultiplication);
 
 #if USE(COORDINATED_GRAPHICS)
     RefPtr<GraphicsLayerContentsDisplayDelegate> layerContentsDisplayDelegate() const final;
@@ -79,6 +92,8 @@ private:
     SkPictureRecorder m_pictureRecorder;
     std::unique_ptr<SkiaSwitchableCanvas> m_switchableCanvas;
     std::unique_ptr<GraphicsContextSkia> m_canvasRecordingContext;
+    RefPtr<SnapCanvasGPUState> m_canvasThread;
+    RefPtr<SnapCanvasPresentation> m_canvasPresentation;
 };
 
 } // namespace WebCore

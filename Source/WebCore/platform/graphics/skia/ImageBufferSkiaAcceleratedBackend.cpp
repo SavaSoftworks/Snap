@@ -39,6 +39,7 @@
 #include "ProcessCapabilities.h"
 #include "SkiaRecordingResult.h"
 #include "SkiaUtilities.h"
+#include "SnapCanvasThread.h"
 WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
 #include <skia/core/SkPixmap.h>
 #include <skia/gpu/ganesh/GrBackendSurface.h>
@@ -113,6 +114,15 @@ std::unique_ptr<ImageBufferSkiaAcceleratedBackend> ImageBufferSkiaAcceleratedBac
         return nullptr;
 #endif
 
+    auto imageInfo = SkImageInfo::Make(backendSize.width(), backendSize.height(), kRGBA_8888_SkColorType, kPremul_SkAlphaType, parameters.colorSpace.platformColorSpace());
+#if USE(COORDINATED_GRAPHICS)
+    if (parameters.purpose == RenderingPurpose::Canvas && creationContext.canvasThreadEnabled && snapCanvasThreadEnabled()) {
+        auto properties = FontRenderOptions::singleton().createSurfaceProps();
+        if (auto canvasThread = SnapCanvasGPUState::create(imageInfo, properties, shouldEnableDynamicMSAA())) {
+            return std::unique_ptr<ImageBufferSkiaAcceleratedBackend>(new ImageBufferSkiaAcceleratedBackend(parameters, nullptr, WTF::move(canvasThread)));
+        }
+    }
+#endif
     auto* glContext = PlatformDisplay::sharedDisplay().skiaGLContext();
     if (!glContext || !glContext->makeContextCurrent())
         return nullptr;
@@ -120,7 +130,6 @@ std::unique_ptr<ImageBufferSkiaAcceleratedBackend> ImageBufferSkiaAcceleratedBac
     auto* grContext = PlatformDisplay::sharedDisplay().skiaGrContext();
     RELEASE_ASSERT(grContext);
 
-    auto imageInfo = SkImageInfo::Make(backendSize.width(), backendSize.height(), kRGBA_8888_SkColorType, kPremul_SkAlphaType, parameters.colorSpace.platformColorSpace());
     auto msaaSampleCount = PlatformDisplay::sharedDisplay().msaaSampleCount();
     uint32_t flags = 0;
     if (parameters.purpose == RenderingPurpose::Canvas && msaaSampleCount && shouldEnableDynamicMSAA()) {
@@ -142,18 +151,35 @@ std::unique_ptr<ImageBufferSkiaAcceleratedBackend> ImageBufferSkiaAcceleratedBac
     return std::unique_ptr<ImageBufferSkiaAcceleratedBackend>(new ImageBufferSkiaAcceleratedBackend(parameters, WTF::move(surface)));
 }
 
-ImageBufferSkiaAcceleratedBackend::ImageBufferSkiaAcceleratedBackend(const Parameters& parameters, sk_sp<SkSurface>&& surface)
+ImageBufferSkiaAcceleratedBackend::ImageBufferSkiaAcceleratedBackend(const Parameters& parameters, sk_sp<SkSurface>&& surface, RefPtr<SnapCanvasGPUState>&& canvasThread)
     : ImageBufferSkiaSurfaceBackend(parameters, WTF::move(surface), RenderingMode::Accelerated)
+    , m_canvasThread(WTF::move(canvasThread))
 {
 #if USE(COORDINATED_GRAPHICS)
     // Use a content layer for canvas.
-    if (parameters.purpose == RenderingPurpose::Canvas)
-        m_layerContentsDisplayDelegate = GraphicsLayerContentsDisplayDelegateCoordinated::create();
+    if (parameters.purpose == RenderingPurpose::Canvas) {
+        if (m_canvasThread) {
+            m_canvasPresentation = SnapCanvasPresentation::create();
+            m_canvasPresentation->setRefreshTask(createSharedTask<void(SnapCanvasPresentation::Target, Ref<SnapCanvasPresentation>)>(
+                [state = Ref { *m_canvasThread }](auto target, auto presentation) {
+                    state->submit(nullptr, WTF::move(target), WTF::move(presentation));
+                }));
+            m_layerContentsDisplayDelegate = SnapCanvasDisplayDelegate::create(Ref { *m_canvasPresentation });
+        } else {
+            m_layerContentsDisplayDelegate = GraphicsLayerContentsDisplayDelegateCoordinated::create();
+        }
+    }
 #endif
 }
 
 ImageBufferSkiaAcceleratedBackend::~ImageBufferSkiaAcceleratedBackend()
 {
+    if (m_canvasPresentation) {
+        m_canvasPresentation->invalidate();
+    }
+    if (m_canvasThread) {
+        m_canvasThread->shutdown();
+    }
     // Unwind the surface context's save/restore stack before destruction
     if (m_canvasRecordingContext)
         m_canvasRecordingContext->unwindStateStack();
@@ -170,7 +196,7 @@ GraphicsContext& ImageBufferSkiaAcceleratedBackend::context()
 
 GrDirectContext* ImageBufferSkiaAcceleratedBackend::grContext() const
 {
-    auto* recordingContext = m_surface->recordingContext();
+    auto* recordingContext = m_surface ? m_surface->recordingContext() : nullptr;
     return recordingContext ? recordingContext->asDirectContext() : nullptr;
 }
 
@@ -189,8 +215,69 @@ void ImageBufferSkiaAcceleratedBackend::ensureCanvasRecordingContext()
 
     m_canvasRecordingContext = makeUnique<GraphicsContextSkia>(static_cast<SkCanvas&>(*m_switchableCanvas), RenderingMode::Accelerated, RenderingPurpose::Canvas);
     m_canvasRecordingContext->applyDeviceScaleFactor(resolutionScale());
-    m_canvasRecordingContext->beginRecording(GraphicsContextSkia::RecordingMode::Canvas);
+    m_canvasRecordingContext->beginRecording(GraphicsContextSkia::RecordingMode::Canvas, m_canvasThread ? m_canvasThread->threadSafeProxy() : nullptr);
     m_hasActiveRecording = true;
+}
+
+sk_sp<SkPicture> ImageBufferSkiaAcceleratedBackend::finishCanvasRecording()
+{
+    if (!m_canvasRecordingContext || !m_hasActiveRecording) {
+        return nullptr;
+    }
+    m_canvasRecordingContext->endRecording();
+    m_hasActiveRecording = false;
+    return m_pictureRecorder.finishRecordingAsPicture();
+}
+
+void ImageBufferSkiaAcceleratedBackend::restartCanvasRecording()
+{
+    if (!m_canvasRecordingContext || m_hasActiveRecording) {
+        return;
+    }
+    auto* recordingCanvas = m_pictureRecorder.beginRecording(size().width(), size().height());
+    m_switchableCanvas->switchToCanvas(recordingCanvas);
+    m_canvasRecordingContext->replayStateOnCanvas(*recordingCanvas);
+    m_canvasRecordingContext->beginRecording(GraphicsContextSkia::RecordingMode::Canvas, m_canvasThread ? m_canvasThread->threadSafeProxy() : nullptr);
+    m_hasActiveRecording = true;
+}
+
+bool ImageBufferSkiaAcceleratedBackend::executeCanvasThreadSync(Function<bool(SkSurface&, GrDirectContext&)>&& operation)
+{
+    auto picture = finishCanvasRecording();
+    bool succeeded = m_canvasThread->executeSync(WTF::move(picture), WTF::move(operation));
+    restartCanvasRecording();
+    return succeeded;
+}
+
+bool ImageBufferSkiaAcceleratedBackend::isContextLost() const
+{
+    return m_canvasThread && m_canvasThread->isLost();
+}
+
+bool ImageBufferSkiaAcceleratedBackend::isCanvasThreadForTesting() const
+{
+    return !!m_canvasThread;
+}
+
+uint64_t ImageBufferSkiaAcceleratedBackend::synchronousCanvasOperationsForTesting() const
+{
+    return m_canvasThread ? m_canvasThread->synchronousOperationsForTesting() : 0;
+}
+
+void ImageBufferSkiaAcceleratedBackend::setContextLossHandler(Function<void()>&& handler)
+{
+    if (m_canvasThread) {
+        m_canvasThread->setLossHandler(WTF::move(handler));
+    }
+}
+
+bool ImageBufferSkiaAcceleratedBackend::loseContextForTesting()
+{
+    if (!m_canvasThread) {
+        return false;
+    }
+    m_canvasThread->forceLossForTesting();
+    return true;
 }
 
 void ImageBufferSkiaAcceleratedBackend::replayCanvasRecordingContextIfNeeded()
@@ -234,6 +321,14 @@ void ImageBufferSkiaAcceleratedBackend::replayCanvasRecordingContextIfNeeded()
 
 void ImageBufferSkiaAcceleratedBackend::flushContext()
 {
+    if (m_canvasThread) {
+        executeCanvasThreadSync([](SkSurface& surface, GrDirectContext& context) {
+            context.flushAndSubmit(&surface, GrSyncCpu::kNo);
+            return !context.abandoned();
+        });
+        return;
+    }
+
     replayCanvasRecordingContextIfNeeded();
 
     auto* grContext = this->grContext();
@@ -250,25 +345,40 @@ void ImageBufferSkiaAcceleratedBackend::flushContext()
 void ImageBufferSkiaAcceleratedBackend::prepareForDisplay()
 {
 #if USE(COORDINATED_GRAPHICS)
-    if (!m_layerContentsDisplayDelegate)
+    if (!m_layerContentsDisplayDelegate) {
         return;
+    }
+
+    if (m_canvasThread) {
+        auto presentationContext = m_canvasPresentation->target();
+        auto picture = finishCanvasRecording();
+        if (!picture) {
+            return;
+        }
+        m_canvasThread->submit(WTF::move(picture), WTF::move(presentationContext), Ref { *m_canvasPresentation });
+        restartCanvasRecording();
+        return;
+    }
 
     auto image = createNativeImageReference();
-    if (!image)
+    if (!image) {
         return;
+    }
 
     auto* grContext = this->grContext();
-    if (!grContext)
+    if (!grContext) {
         return;
+    }
 
-    if (!PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent())
+    if (!PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent()) {
         return;
+    }
 
     ASSERT(grContext == PlatformDisplay::sharedDisplay().skiaGrContext());
 
-    if (auto threadSafeGrContext = m_layerContentsDisplayDelegate->threadSafeGrContext())
+    if (auto threadSafeGrContext = m_layerContentsDisplayDelegate->threadSafeGrContext()) {
         m_layerContentsDisplayDelegate->setDisplayBuffer(CoordinatedPlatformLayerBufferSkiaImage::create(image->platformImage(), threadSafeGrContext));
-    else {
+    } else {
         m_layerContentsDisplayDelegate->setDisplayBuffer(CoordinatedPlatformLayerBufferNativeImage::create(image.releaseNonNull(),
             SkiaUtilities::flushAndSubmitSurfaceWithFence(grContext, m_surface.get())));
     }
@@ -278,14 +388,8 @@ void ImageBufferSkiaAcceleratedBackend::prepareForDisplay()
     if (m_canvasRecordingContext) {
         // Clean up state-replayed saves on the surface canvas before switching away.
         m_surface->getCanvas()->restoreToCount(1);
-
-        auto* recordingCanvas = m_pictureRecorder.beginRecording(size().width(), size().height());
-        m_switchableCanvas->switchToCanvas(recordingCanvas);
-
         // Replay state onto the new recording canvas to give it the exact same save/clip/CTM nesting.
-        m_canvasRecordingContext->replayStateOnCanvas(*recordingCanvas);
-        m_canvasRecordingContext->beginRecording(GraphicsContextSkia::RecordingMode::Canvas);
-        m_hasActiveRecording = true;
+        restartCanvasRecording();
     }
 #endif
 }
@@ -299,6 +403,47 @@ RefPtr<NativeImage> ImageBufferSkiaAcceleratedBackend::copyNativeImage()
 
 RefPtr<NativeImage> ImageBufferSkiaAcceleratedBackend::createNativeImageReference()
 {
+    if (m_canvasThread) {
+        GrDirectContext* consumerContext = nullptr;
+        sk_sp<GrContextThreadSafeProxy> consumerProxy;
+        if (isMainThread()) {
+            auto* consumerGLContext = PlatformDisplay::sharedDisplay().skiaGLContext();
+            if (consumerGLContext && consumerGLContext->makeContextCurrent()) {
+                consumerContext = PlatformDisplay::sharedDisplay().skiaGrContext();
+                if (consumerContext) {
+                    consumerProxy = consumerContext->threadSafeProxy();
+                }
+            }
+        }
+        sk_sp<SkImage> sourceImage;
+        if (!executeCanvasThreadSync([&](SkSurface& surface, GrDirectContext& context) {
+                context.flush(&surface);
+                sourceImage = surface.makeImageSnapshot();
+                return !!sourceImage;
+            })
+            || !sourceImage) {
+            return nullptr;
+        }
+        auto sourceProxy = m_canvasThread->threadSafeProxy();
+        auto provider = std::make_shared<SnapCanvasImageProvider>(Ref { *m_canvasThread }, sourceImage, sourceProxy);
+        sk_sp<SkImage> image = provider->imageForThreadSafeContext(consumerProxy);
+        if (!image) {
+            if (!executeCanvasThreadSync([&](SkSurface&, GrDirectContext& context) {
+                    image = sourceImage->makeRasterImage(&context);
+                    return !!image;
+                })
+                || !image) {
+                return nullptr;
+            }
+        }
+        auto* nativeImageContext = image->isTextureBacked() ? consumerContext : nullptr;
+        auto nativeImage = NativeImage::create(WTF::move(image), nativeImageContext);
+        if (nativeImage) {
+            nativeImage->setSkiaImageProvider(WTF::move(provider));
+        }
+        return nativeImage;
+    }
+
     replayCanvasRecordingContextIfNeeded();
 
     auto* grContext = this->grContext();
@@ -317,12 +462,29 @@ RefPtr<NativeImage> ImageBufferSkiaAcceleratedBackend::createNativeImageReferenc
 
 void ImageBufferSkiaAcceleratedBackend::getPixelBuffer(const IntRect& srcRect, PixelBuffer& destination)
 {
-    if (!PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent())
+    if (m_canvasThread) {
+        if (!executeCanvasThreadSync([&](SkSurface& surface, GrDirectContext&) {
+                return readPixelBuffer(surface, srcRect, destination);
+            })) {
+            destination.zeroFill();
+        }
         return;
+    }
+
+    if (!PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent()) {
+        destination.zeroFill();
+        return;
+    }
 
     // CPU needs to read pixels now, replay the recording.
     replayCanvasRecordingContextIfNeeded();
+    if (!readPixelBuffer(*m_surface, srcRect, destination)) {
+        destination.zeroFill();
+    }
+}
 
+bool ImageBufferSkiaAcceleratedBackend::readPixelBuffer(SkSurface& surface, const IntRect& srcRect, PixelBuffer& destination)
+{
     const IntRect backendRect { { }, size() };
     const auto sourceRectClipped = intersection(backendRect, srcRect);
     IntRect destinationRect { IntPoint::zero(), sourceRectClipped.size() };
@@ -347,9 +509,9 @@ void ImageBufferSkiaAcceleratedBackend::getPixelBuffer(const IntRect& srcRect, P
 
     SkPixmap dstPixmap;
     if (!pixmap.extractSubset(&dstPixmap, destinationRect)) [[unlikely]]
-        return;
+        return sourceRectClipped.isEmpty();
 
-    m_surface->readPixels(dstPixmap, sourceRectClipped.x(), sourceRectClipped.y());
+    return surface.readPixels(dstPixmap, sourceRectClipped.x(), sourceRectClipped.y());
 }
 
 static std::span<uint8_t> mutableSpan(SkData* data)
@@ -359,12 +521,24 @@ static std::span<uint8_t> mutableSpan(SkData* data)
 
 void ImageBufferSkiaAcceleratedBackend::putPixelBuffer(const PixelBufferSourceView& pixelBuffer, const IntRect& srcRect, const IntPoint& destPoint, AlphaPremultiplication destFormat)
 {
-    if (!PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent())
+    if (m_canvasThread) {
+        executeCanvasThreadSync([&](SkSurface& surface, GrDirectContext&) {
+            return writePixelBuffer(surface, pixelBuffer, srcRect, destPoint, destFormat);
+        });
         return;
+    }
+
+    if (!PlatformDisplay::sharedDisplay().skiaGLContext()->makeContextCurrent()) {
+        return;
+    }
 
     // CPU needs to write pixels now, replay the recording.
     replayCanvasRecordingContextIfNeeded();
+    writePixelBuffer(*m_surface, pixelBuffer, srcRect, destPoint, destFormat);
+}
 
+bool ImageBufferSkiaAcceleratedBackend::writePixelBuffer(SkSurface& surface, const PixelBufferSourceView& pixelBuffer, const IntRect& srcRect, const IntPoint& destPoint, AlphaPremultiplication destFormat)
+{
     UNUSED_PARAM(destFormat);
 
     ASSERT(IntRect({ 0, 0 }, pixelBuffer.size()).contains(srcRect));
@@ -396,25 +570,29 @@ void ImageBufferSkiaAcceleratedBackend::putPixelBuffer(const PixelBufferSourceVi
 
     SkPixmap srcPixmap;
     if (!pixmap.extractSubset(&srcPixmap, sourceRectClipped)) [[unlikely]]
-        return;
+        return sourceRectClipped.isEmpty();
 
     const auto destAlphaType = (destFormat == AlphaPremultiplication::Premultiplied)
         ? SkAlphaType::kPremul_SkAlphaType : SkAlphaType::kUnpremul_SkAlphaType;
 
     // If all the pixels in the source rectangle are opaque, it does not matter which kind
     // of alpha is involved: the destination pixels will be replaced by the source ones.
-    if (m_surface->imageInfo().alphaType() == destAlphaType || srcPixmap.computeIsOpaque()) {
-        m_surface->writePixels(srcPixmap, destinationRect.x(), destinationRect.y());
-        return;
+    if (surface.imageInfo().alphaType() == destAlphaType || srcPixmap.computeIsOpaque()) {
+        surface.writePixels(srcPixmap, destinationRect.x(), destinationRect.y());
+        return true;
     }
 
     // Fall back to converting, but only the part covered by sourceRectClipped/srcPixmap.
     auto data = SkData::MakeUninitialized(srcPixmap.computeByteSize());
+    if (!data) {
+        return false;
+    }
     ImageBufferBackend::putPixelBuffer(pixelBuffer, sourceRectClipped, IntPoint::zero(), destFormat, mutableSpan(data.get()));
     auto convertedSrcInfo = SkImageInfo::Make(srcPixmap.dimensions(), SkColorType::kBGRA_8888_SkColorType,
         SkAlphaType::kPremul_SkAlphaType, colorSpace().platformColorSpace());
     SkPixmap convertedSrcPixmap(convertedSrcInfo, data->writable_data(), convertedSrcInfo.minRowBytes64());
-    m_surface->writePixels(convertedSrcPixmap, destinationRect.x(), destinationRect.y());
+    surface.writePixels(convertedSrcPixmap, destinationRect.x(), destinationRect.y());
+    return true;
 }
 
 #if USE(COORDINATED_GRAPHICS)

@@ -266,15 +266,20 @@ private:
 
 sk_sp<SkImage> createPromiseImageIfNeeded(const sk_sp<SkImage>& image, const sk_sp<GrContextThreadSafeProxy>& threadSafeGrContext)
 {
+    if (!image)
+        return nullptr;
     if (!image->isTextureBacked())
         return image;
+    if (!threadSafeGrContext)
+        return nullptr;
 
     auto context = PromiseImageContext::create(image);
     if (!context)
-        return image;
+        return nullptr;
 
     auto backendFormat = threadSafeGrContext->defaultBackendFormat(image->colorType(), GrRenderable::kYes);
-    ASSERT(backendFormat.isValid());
+    if (!backendFormat.isValid())
+        return nullptr;
     return SkImages::PromiseTextureFrom(threadSafeGrContext, backendFormat, image->dimensions(), skgpu::Mipmapped::kNo,
         kTopLeft_GrSurfaceOrigin, image->colorType(), image->alphaType(), image->refColorSpace(),
         +[](void* userData) -> sk_sp<GrPromiseImageTexture> {

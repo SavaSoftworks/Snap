@@ -53,7 +53,26 @@ bool GraphicsLayerAsyncContentsDisplayDelegateCoordinated::tryCopyToLayer(ImageB
 
 #if USE(SKIA)
     if (m_threadSafeGrContext) {
-        m_delegate->setDisplayBuffer(CoordinatedPlatformLayerBufferSkiaImage::create(image->platformImage(), m_threadSafeGrContext));
+        if (image->hasSkiaImageProvider()) {
+            auto platformImage = image->platformImage();
+            auto transferredImage = image->imageForThreadSafeContext(m_threadSafeGrContext);
+            if (transferredImage) {
+                platformImage = WTF::move(transferredImage);
+            } else if (!platformImage || platformImage->isTextureBacked()) {
+                return false;
+            }
+            OptionSet<TextureMapperFlags> flags;
+            if (!platformImage->isOpaque()) {
+                flags.add(TextureMapperFlags::ShouldBlend);
+            }
+            m_delegate->setDisplayBuffer(makeUnique<CoordinatedPlatformLayerBufferSkiaImage>(WTF::move(platformImage), flags));
+            return true;
+        }
+        auto buffer = CoordinatedPlatformLayerBufferSkiaImage::create(image->platformImage(), m_threadSafeGrContext);
+        if (!buffer) {
+            return false;
+        }
+        m_delegate->setDisplayBuffer(WTF::move(buffer));
         return true;
     }
 #endif

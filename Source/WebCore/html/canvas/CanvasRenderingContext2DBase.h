@@ -51,6 +51,7 @@
 #include "StyleFilter.h"
 #include "Timer.h"
 #include "TypedArrayPixelBuffer.h"
+#include <atomic>
 #include <wtf/Vector.h>
 #include <wtf/text/WTFString.h>
 
@@ -240,6 +241,11 @@ public:
     void putImageData(ImageData&, int dx, int dy, int dirtyX, int dirtyY, int dirtyWidth, int dirtyHeight);
 
     void reset();
+    bool isContextLost() const;
+    bool loseContextForTesting();
+    bool isCanvasThreadForTesting() const;
+    uint64_t synchronousCanvasOperationsForTesting() const;
+    bool canDispatchContextLossEvents() const { return m_canDispatchContextLossEvents.load(std::memory_order_relaxed); }
 
     bool imageSmoothingEnabled() const { return state().imageSmoothingEnabled; }
     void setImageSmoothingEnabled(bool);
@@ -518,6 +524,9 @@ private:
     CanvasRenderingContext2DSettings m_settings;
     bool m_hasDeferredOperations { false };
     mutable bool m_hasCreatedImageBuffer { false };
+    mutable std::atomic<bool> m_canDispatchContextLossEvents { false };
+    bool m_contextLost { false };
+    void didLoseContext();
 };
 
 } // namespace WebCore

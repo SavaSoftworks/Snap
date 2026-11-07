@@ -44,8 +44,10 @@ interface mixin GlobalEventHandlers {
     [EnabledBySetting=CommandAttributesEnabled] attribute EventHandler oncommand;
     attribute EventHandler oncontentvisibilityautostatechange;
     // attribute EventHandler oncontextlost;
+    attribute EventHandler oncontextlost;
     attribute EventHandler oncontextmenu;
     // attribute EventHandler oncontextrestored;
+    attribute EventHandler oncontextrestored;
     attribute EventHandler oncopy;
     attribute EventHandler oncuechange;
     attribute EventHandler oncut;

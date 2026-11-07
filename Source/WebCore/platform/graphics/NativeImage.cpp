@@ -90,7 +90,15 @@ bool NativeImage::hasHDRContent() const
 void NativeImage::replacePlatformImage(PlatformImagePtr&& platformImage) const
 {
     ASSERT(platformImage);
+#if USE(SKIA)
+    {
+        Locker locker { m_skiaImageProviderLock };
+        m_platformImage = WTF::move(platformImage);
+        m_skiaImageProvider = nullptr;
+    }
+#else
     m_platformImage = WTF::move(platformImage);
+#endif
     computeHeadroom();
 }
 

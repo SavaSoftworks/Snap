@@ -61,21 +61,23 @@ size_t ImageBufferSkiaSurfaceBackend::calculateMemoryCost(const Parameters& para
 ImageBufferSkiaSurfaceBackend::ImageBufferSkiaSurfaceBackend(const Parameters& parameters, sk_sp<SkSurface>&& surface, RenderingMode renderingMode)
     : ImageBufferSkiaBackend(parameters)
     , m_surface(WTF::move(surface))
-    , m_context(*m_surface->getCanvas(), renderingMode, parameters.purpose)
 {
-    m_context.applyDeviceScaleFactor(parameters.resolutionScale);
+    if (m_surface) {
+        m_context.emplace(*m_surface->getCanvas(), renderingMode, parameters.purpose);
+        m_context->applyDeviceScaleFactor(parameters.resolutionScale);
+    }
 }
 
 ImageBufferSkiaSurfaceBackend::~ImageBufferSkiaSurfaceBackend() = default;
 
 unsigned ImageBufferSkiaSurfaceBackend::bytesPerRow() const
 {
-    return m_surface->imageInfo().minRowBytes64();
+    return calculateBytesPerRow(size());
 }
 
 bool ImageBufferSkiaSurfaceBackend::canMapBackingStore() const
 {
-    return true;
+    return !!m_surface;
 }
 
 } // namespace WebCore

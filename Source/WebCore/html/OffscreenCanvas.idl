@@ -71,6 +71,8 @@ enum OffscreenRenderingContextType {
 
     // FIXME: Add support for `oncontextlost`.
     // attribute EventHandler oncontextlost;
+    attribute EventHandler oncontextlost;
     // FIXME: Add support for `oncontextrestored`.
     // attribute EventHandler oncontextrestored;
+    attribute EventHandler oncontextrestored;
 };

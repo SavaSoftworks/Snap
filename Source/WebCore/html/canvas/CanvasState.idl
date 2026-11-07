@@ -28,5 +28,9 @@ interface mixin CanvasState {
     // state
     undefined save(); // push state on state stack
     undefined restore(); // pop state stack and restore state
+    boolean isContextLost();
+    [EnabledBySetting=DOMTestingAPIsEnabled] boolean loseContextForTesting();
+    [EnabledBySetting=DOMTestingAPIsEnabled] boolean isCanvasThreadForTesting();
+    [EnabledBySetting=DOMTestingAPIsEnabled] unsigned long long synchronousCanvasOperationsForTesting();
     undefined reset(); // reset the rendering context to its default state
 };

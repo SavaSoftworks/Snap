@@ -241,7 +241,9 @@ onclick
 onclose
 oncommand
 oncontentvisibilityautostatechange
+oncontextlost
 oncontextmenu
+oncontextrestored
 oncopy
 oncuechange
 oncut

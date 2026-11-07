@@ -38,6 +38,9 @@ std::unique_ptr<CoordinatedPlatformLayerBufferSkiaImage> CoordinatedPlatformLaye
     if (!image->isOpaque())
         flags.add(TextureMapperFlags::ShouldBlend);
     sk_sp<SkImage> skiaImage = image->isTextureBacked() ? SkiaUtilities::createPromiseImageIfNeeded(image, threadSafeGrContext) : image;
+    if (!skiaImage) {
+        return nullptr;
+    }
     return makeUnique<CoordinatedPlatformLayerBufferSkiaImage>(WTF::move(skiaImage), flags);
 }
 

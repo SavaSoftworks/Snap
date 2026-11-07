@@ -33,6 +33,7 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
 #include <skia/core/SkSurface.h>
 WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
 
+#include <optional>
 #include <wtf/Forward.h>
 
 namespace WebCore {
@@ -50,12 +51,16 @@ public:
 protected:
     ImageBufferSkiaSurfaceBackend(const Parameters&, sk_sp<SkSurface>&&, RenderingMode);
 
-    GraphicsContext& context() LIFETIME_BOUND override { return m_context; }
+    GraphicsContext& context() LIFETIME_BOUND override
+    {
+        ASSERT(m_context);
+        return *m_context;
+    }
     unsigned bytesPerRow() const final;
     bool canMapBackingStore() const final;
 
     sk_sp<SkSurface> m_surface;
-    GraphicsContextSkia m_context;
+    std::optional<GraphicsContextSkia> m_context;
 };
 
 } // namespace WebCore

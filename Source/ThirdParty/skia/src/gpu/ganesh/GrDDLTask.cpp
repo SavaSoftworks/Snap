@@ -38,6 +38,7 @@ GrDDLTask::GrDDLTask(GrDrawingManager* drawingMgr,
     }
 
     // The DDL task never accepts additional tasks
+    this->setFlag(kBlocksReordering_Flag);
     this->setFlag(kClosed_Flag);
 }
 

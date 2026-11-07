@@ -451,6 +451,12 @@ ScriptExecutionContext* OffscreenCanvas::canvasBaseScriptExecutionContext() cons
 
 bool OffscreenCanvas::virtualHasPendingActivity() const
 {
+    if (m_hasRelevantCanvasEventListener) {
+        SUPPRESS_UNCOUNTED_LOCAL auto* context = dynamicDowncast<OffscreenCanvasRenderingContext2D>(m_context.get());
+        if (context && context->canDispatchContextLossEvents()) {
+            return true;
+        }
+    }
 #if ENABLE(WEBGL)
     if (m_hasRelevantWebGLEventListener) {
         // This runs on a GC thread.
@@ -465,6 +471,8 @@ bool OffscreenCanvas::virtualHasPendingActivity() const
 
 void OffscreenCanvas::eventListenersDidChange()
 {
+    m_hasRelevantCanvasEventListener = hasEventListeners(WebCore::eventNames().contextlostEvent)
+        || hasEventListeners(WebCore::eventNames().contextrestoredEvent);
 #if ENABLE(WEBGL)
     auto& eventNames = WebCore::eventNames();
     m_hasRelevantWebGLEventListener = hasEventListeners(eventNames.webglcontextlostEvent)

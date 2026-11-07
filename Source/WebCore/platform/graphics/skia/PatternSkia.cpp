@@ -36,12 +36,13 @@ WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
 #include <skia/core/SkImage.h>
 #include <skia/core/SkMatrix.h>
 #include <skia/core/SkSamplingOptions.h>
+#include <skia/core/SkShader.h>
 #include <skia/core/SkTileMode.h>
 WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
 
 namespace WebCore {
 
-sk_sp<SkShader> Pattern::createPlatformPattern(const SkSamplingOptions& samplingOptions, const sk_sp<GrContextThreadSafeProxy>& threadSafeGrContext) const
+sk_sp<SkShader> Pattern::createPlatformPattern(const SkSamplingOptions& samplingOptions, const sk_sp<GrContextThreadSafeProxy>& threadSafeGrContext, bool isAccelerated) const
 {
     auto nativeImage = tileNativeImage();
     if (!nativeImage)
@@ -51,8 +52,23 @@ sk_sp<SkShader> Pattern::createPlatformPattern(const SkSamplingOptions& sampling
     if (!platformImage)
         return nullptr;
 
-    if (threadSafeGrContext)
+    if (nativeImage->hasSkiaImageProvider()) {
+        if (!isAccelerated) {
+            platformImage = nativeImage->skiaRasterImage();
+        } else if (threadSafeGrContext) {
+            auto providerImage = nativeImage->imageForThreadSafeContext(threadSafeGrContext);
+            if (providerImage) {
+                platformImage = WTF::move(providerImage);
+            } else if (platformImage->isTextureBacked()) {
+                return nullptr;
+            }
+        }
+    } else if (threadSafeGrContext) {
         platformImage = SkiaUtilities::createPromiseImageIfNeeded(platformImage, threadSafeGrContext);
+    }
+    if (!platformImage) {
+        return SkShaders::Color(SK_ColorTRANSPARENT);
+    }
 
     return platformImage->makeShader(repeatX() ? SkTileMode::kRepeat : SkTileMode::kDecal, repeatY() ? SkTileMode::kRepeat : SkTileMode::kDecal, samplingOptions, patternSpaceTransform());
 }

@@ -37,6 +37,7 @@
 #include <WebCore/PlatformDynamicRangeLimit.h>
 #include <memory>
 #include <wtf/Forward.h>
+#include <wtf/WeakPtr.h>
 
 #if ENABLE(WEBGL)
 #include <WebCore/WebGLContextAttributes.h>
@@ -180,6 +181,7 @@ private:
 
     std::optional<FloatRect> computeDirtyRectangleIfNeeded(const std::optional<FloatRect>&) const;
 
+    SingleThreadWeakPtr<RenderBox> m_snapFullyDirtyRenderer;
     bool m_ignoreDidUpdateSizeProperties { false };
 #if ENABLE(WEBGL)
     bool m_hasRelevantWebGLEventListener { false };
