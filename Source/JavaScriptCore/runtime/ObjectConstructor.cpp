@@ -20,6 +20,8 @@
 
 #include "config.h"
 #include "ObjectConstructor.h"
+#include <cstdlib>
+#include <cstring>
 
 #include "BuiltinNames.h"
 #include "JSArray.h"
@@ -348,7 +350,15 @@ JSC_DEFINE_HOST_FUNCTION(objectConstructorAssign, (JSGlobalObject* globalObject,
             Vector<UniquedStringImpl*, 32> properties; // structures ensures the lifetimes of these strings.
             MarkedArgumentBufferWithSize<32> values;
             MarkedArgumentBuffer structures;
-            for (unsigned i = 1; i < argsCount; ++i) {
+            static const bool cloneFirstSource = [] {
+                const char* value = std::getenv("WEBKIT_SNAP_JSC_ASSIGN_CLONE");
+                return !value || std::strcmp(value, "0");
+            }();
+            unsigned startIndex = 1;
+            if (cloneFirstSource && objectCloneFast(vm, targetObject, asObject(callFrame->uncheckedArgument(1)))) {
+                startIndex = 2;
+            }
+            for (unsigned i = startIndex; i < argsCount; ++i) {
                 JSValue sourceValue = callFrame->uncheckedArgument(i);
                 JSObject* source = asObject(sourceValue);
                 auto sourceStructure = source->structure();
