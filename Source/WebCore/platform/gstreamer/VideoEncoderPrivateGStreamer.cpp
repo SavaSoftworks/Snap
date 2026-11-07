@@ -29,11 +29,13 @@
 #include "IntSize.h"
 #include "NotImplemented.h"
 #include <algorithm>
+#include <cmath>
 #include <gst/video/gstvideoencoder.h>
 #include <wtf/Lock.h>
 #include <wtf/MonotonicTime.h>
 #include <wtf/StdMap.h>
 #include <wtf/TZoneMallocInlines.h>
+#include <wtf/glib/GUniquePtr.h>
 #include <wtf/glib/WTFGType.h>
 #include <wtf/text/MakeString.h>
 #include <wtf/text/StringToIntegerConversion.h>
@@ -242,6 +244,9 @@ struct _WebKitVideoEncoderPrivate {
     RefPtr<WebKitVideoEncoderBitRateAllocation> bitRateAllocation;
     double scaleResolutionDownBy;
     bool enableVideoFlip;
+    bool acceptsDMABuf;
+    bool hasScaledInputCaps;
+    GRefPtr<GstElement> postProcessor;
 };
 
 WEBKIT_DEFINE_TYPE_WITH_CODE(WebKitVideoEncoder, webkit_video_encoder, GST_TYPE_BIN,
@@ -440,6 +445,101 @@ static void videoEncoderSetBitrate(WebKitVideoEncoder* self, guint bitrate)
     videoEncoderApplyBitrate(self, priv->encoder.get(), false);
 }
 
+static std::optional<IntSize> minimumEncoderInputSize(GstElement* encoder)
+{
+    GRefPtr pad = adoptGRef(gst_element_get_static_pad(encoder, "sink"));
+    GRefPtr caps = pad ? adoptGRef(gst_pad_query_caps(pad.get(), nullptr)) : nullptr;
+    if (!caps || !gst_caps_get_size(caps.get()))
+        return std::nullopt;
+    auto minimum = [&](const char* field) -> std::optional<int> {
+        auto* value = gst_structure_get_value(gst_caps_get_structure(caps.get(), 0), field);
+        if (value && GST_VALUE_HOLDS_INT_RANGE(value))
+            return gst_value_get_int_range_min(value);
+        return std::nullopt;
+    };
+    auto width = minimum("width");
+    auto height = minimum("height");
+    if (!width || !height)
+        return std::nullopt;
+    return IntSize { *width, *height };
+}
+
+static void videoEncoderScaleInputWithVideoAcceleration(WebKitVideoEncoder* self, GstEvent* event)
+{
+    auto* priv = self->priv;
+    GstCaps* caps = nullptr;
+    gst_event_parse_caps(event, &caps);
+    GRefPtr inputCapsFilter = adoptGRef(gst_bin_get_by_name(GST_BIN_CAST(self), "input-capsfilter"));
+    if (!caps || !gst_caps_get_size(caps) || !inputCapsFilter)
+        return;
+
+    GRefPtr<GstCaps> filterCaps;
+    g_object_get(inputCapsFilter.get(), "caps", &filterCaps.outPtr(), nullptr);
+    if (!filterCaps || !gst_caps_get_size(filterCaps.get()))
+        return;
+
+    auto* structure = gst_caps_get_structure(caps, 0);
+    auto width = gstStructureGet<int>(structure, "width"_s);
+    auto height = gstStructureGet<int>(structure, "height"_s);
+    filterCaps = adoptGRef(gst_caps_make_writable(filterCaps.leakRef()));
+    auto* filterStructure = gst_caps_get_structure(filterCaps.get(), 0);
+    if (priv->scaleResolutionDownBy > 1.0 && width && height) {
+        double scale = 1 / priv->scaleResolutionDownBy;
+        if (auto minimum = minimumEncoderInputSize(priv->encoder.get()))
+            scale = std::max({ scale, static_cast<double>(minimum->width()) / *width, static_cast<double>(minimum->height()) / *height });
+        int scaledWidth = std::max(2, static_cast<int>(std::lround(*width * scale)) & ~1);
+        int scaledHeight = std::max(2, static_cast<int>(std::lround(*height * scale)) & ~1);
+        gst_structure_set(filterStructure, "width", G_TYPE_INT, scaledWidth, "height", G_TYPE_INT, scaledHeight, nullptr);
+        priv->hasScaledInputCaps = true;
+    } else if (priv->hasScaledInputCaps) {
+        gst_structure_remove_fields(filterStructure, "width", "height", nullptr);
+        priv->hasScaledInputCaps = false;
+    } else
+        return;
+    GST_DEBUG_OBJECT(self, "Scaling hardware encoder input to %" GST_PTR_FORMAT, filterCaps.get());
+    g_object_set(inputCapsFilter.get(), "caps", filterCaps.get(), nullptr);
+}
+
+static void videoEncoderRefreshPostProcessorPool(WebKitVideoEncoder* self, GstCaps* caps)
+{
+    if (!self->priv->postProcessor)
+        return;
+    GRefPtr pad = adoptGRef(gst_element_get_static_pad(self->priv->postProcessor.get(), "sink"));
+    GRefPtr query = adoptGRef(gst_query_new_allocation(caps, TRUE));
+    if (!pad || !gst_pad_query(pad.get(), query.get()))
+        GST_DEBUG_OBJECT(self, "The video post-processor answered no allocation query for %" GST_PTR_FORMAT, caps);
+}
+
+static bool encoderAcceptsFrameSize(GstElementFactory* factory, GstCaps* encodedCaps)
+{
+    if (!encodedCaps || !gst_caps_get_size(encodedCaps))
+        return true;
+    auto* structure = gst_caps_get_structure(encodedCaps, 0);
+    auto width = gstStructureGet<int>(structure, "width"_s);
+    auto height = gstStructureGet<int>(structure, "height"_s);
+    if (!width || !height)
+        return true;
+
+    GUniquePtr<GstStructure> size(gst_structure_new("video/x-raw", "width", G_TYPE_INT, *width, "height", G_TYPE_INT, *height, nullptr));
+    for (auto* item = gst_element_factory_get_static_pad_templates(factory); item; item = item->next) {
+        auto* padTemplate = static_cast<GstStaticPadTemplate*>(item->data);
+        if (padTemplate->direction != GST_PAD_SINK)
+            continue;
+        GRefPtr templateCaps = adoptGRef(gst_static_caps_get(&padTemplate->static_caps));
+        for (unsigned index = 0; index < gst_caps_get_size(templateCaps.get()); ++index) {
+            auto* templateStructure = gst_caps_get_structure(templateCaps.get(), index);
+            GUniquePtr<GstStructure> bounds(gst_structure_new_empty("video/x-raw"));
+            for (const char* field : { "width", "height" }) {
+                if (auto* value = gst_structure_get_value(templateStructure, field))
+                    gst_structure_set_value(bounds.get(), field, value);
+            }
+            if (gst_structure_can_intersect(size.get(), bounds.get()))
+                return true;
+        }
+    }
+    return false;
+}
+
 static bool videoEncoderSetEncoder(WebKitVideoEncoder* self, EncoderId encoderId, GRefPtr<GstCaps>&& inputCaps, GRefPtr<GstCaps>&& encodedCaps, bool useAnnexB)
 {
     ASSERT(encoderId != EncoderId::None);
@@ -473,14 +573,32 @@ static bool videoEncoderSetEncoder(WebKitVideoEncoder* self, EncoderId encoderId
     g_object_set(inputCapsFilter, "caps", inputCaps.get(), nullptr);
     gst_bin_add_many(bin, priv->encoder.get(), inputCapsFilter, nullptr);
 
-    auto videoConvert = createVideoConvertScaleElement();
+    GRefPtr<GstElement> videoConvert;
+    priv->acceptsDMABuf = false;
+    priv->hasScaledInputCaps = false;
+    priv->postProcessor = nullptr;
+    if (encoderUsesVideoAcceleration(encoderId)) {
+        videoConvert = makeGStreamerElement("vapostproc"_s);
+        if (videoConvert) {
+            priv->acceptsDMABuf = true;
+            priv->postProcessor = videoConvert;
+            GRefPtr videoAccelerationCaps = adoptGRef(gst_caps_copy(inputCaps.get()));
+            gst_caps_set_features(videoAccelerationCaps.get(), 0, gst_caps_features_new("memory:VAMemory", nullptr));
+            gst_structure_remove_field(gst_caps_get_structure(videoAccelerationCaps.get(), 0), "format");
+            g_object_set(inputCapsFilter, "caps", videoAccelerationCaps.get(), nullptr);
+            inputCaps = WTF::move(videoAccelerationCaps);
+            GST_INFO_OBJECT(self, "Feeding %s through the video post-processor", encoderDefinition->name.characters());
+        }
+    }
+    if (!videoConvert)
+        videoConvert = createVideoConvertScaleElement();
     if (!videoConvert)
         return false;
 
     gst_bin_add(bin, videoConvert.get());
 
     GRefPtr<GstElement> videoFlip;
-    if (priv->enableVideoFlip) {
+    if (priv->enableVideoFlip && !priv->acceptsDMABuf) {
         videoFlip = makeGStreamerElement("autovideoflip"_s);
         if (videoFlip) {
             gst_util_set_object_arg(G_OBJECT(videoFlip.get()), "video-direction", "auto");
@@ -587,7 +705,7 @@ EncoderId videoEncoderFindForFormat([[maybe_unused]] WebKitVideoEncoder* self, c
     Vector<std::pair<EncoderId, const EncoderDefinition*>> candidates;
     GST_DEBUG_OBJECT(self, "Looking for an encoder matching caps %" GST_PTR_FORMAT, caps.get());
     for (const auto& [id, encoder] : Encoders::singleton()) {
-        if (gst_element_factory_can_src_any_caps(encoder.factory.get(), caps.get())) {
+        if (gst_element_factory_can_src_any_caps(encoder.factory.get(), caps.get()) && encoderAcceptsFrameSize(encoder.factory.get(), caps.get())) {
             GST_DEBUG_OBJECT(self, "Compatible encoder found: %s", encoder.name.characters());
             candidates.append(std::make_pair(id, &encoder));
         }
@@ -631,6 +749,11 @@ bool videoEncoderSetCodec(WebKitVideoEncoder* self, const CodecConfig& config, c
     }
 
     return videoEncoderSetEncoder(self, encoderId, WTF::move(inputCaps), WTF::move(outputCaps), config.useAnnexB);
+}
+
+bool videoEncoderAcceptsDMABuf(WebKitVideoEncoder* self)
+{
+    return self->priv->acceptsDMABuf;
 }
 
 void videoEncoderSetBitRateAllocation(WebKitVideoEncoder* self, RefPtr<WebKitVideoEncoderBitRateAllocation>&& allocation)
@@ -785,8 +908,29 @@ static void videoEncoderConstructed(GObject* encoder)
             }
         }
 
+        if (GST_EVENT_TYPE(event) == GST_EVENT_TAG) {
+            auto self = WEBKIT_VIDEO_ENCODER(parent);
+            GstTagList* tags = nullptr;
+            gst_event_parse_tag(event, &tags);
+            GUniqueOutPtr<char> orientation;
+            if (self->priv->postProcessor && self->priv->enableVideoFlip && tags && gst_tag_list_get_string(tags, GST_TAG_IMAGE_ORIENTATION, &orientation.outPtr()) && g_strcmp0(orientation.get(), "rotate-0")) {
+                GST_INFO_OBJECT(self, "Asking the video post-processor to apply orientation %s", orientation.get());
+                gst_util_set_object_arg(G_OBJECT(self->priv->postProcessor.get()), "video-direction", "auto");
+            }
+        }
+
         if (GST_EVENT_TYPE(event) == GST_EVENT_CAPS) {
             auto self = WEBKIT_VIDEO_ENCODER(parent);
+            if (self->priv->acceptsDMABuf) {
+                videoEncoderScaleInputWithVideoAcceleration(self, event);
+                GstCaps* caps = nullptr;
+                gst_event_parse_caps(event, &caps);
+                GRefPtr<GstCaps> inputCaps = caps;
+                bool handled = gst_pad_event_default(pad, parent, event);
+                if (handled && inputCaps)
+                    videoEncoderRefreshPostProcessorPool(self, inputCaps.get());
+                return handled;
+            }
             auto scaleResolutionDownBy = self->priv->scaleResolutionDownBy;
             if (scaleResolutionDownBy > 1.0) {
                 GST_DEBUG_OBJECT(self, "Applying scale factor: %f", scaleResolutionDownBy);

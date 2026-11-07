@@ -51,6 +51,7 @@ public:
     void setKeyFrameIntervalSync(unsigned);
     bool isHardwareAccelerated() const;
     Ref<GenericPromise> setBitRateAllocation(RefPtr<WebKitVideoEncoderBitRateAllocation>&&, double frameRate);
+    bool acceptsDMABuf() const;
 
 private:
     Ref<GStreamerInternalVideoEncoder> m_internalEncoder;

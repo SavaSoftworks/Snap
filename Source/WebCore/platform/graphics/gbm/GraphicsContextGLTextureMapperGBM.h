@@ -26,6 +26,7 @@
 #pragma once
 
 #if ENABLE(WEBGL) && USE(COORDINATED_GRAPHICS) && USE(GBM)
+#include "DMABufBuffer.h"
 #include "GraphicsContextGLTextureMapperANGLE.h"
 #include "GraphicsLayerContentsDisplayDelegate.h"
 #include <wtf/unix/UnixFileDescriptor.h>
@@ -46,6 +47,17 @@ public:
     WTF::UnixFileDescriptor createExportedFence() const;
     void prepareForDisplayWithFinishedSignal(Function<void()>&&);
     DMABufBuffer* displayBuffer() { return m_displayBuffer.dmabuf.get(); }
+#if ENABLE(MEDIA_STREAM) || ENABLE(WEB_CODECS)
+    struct VideoFrameBufferCopy {
+        RefPtr<DMABufBuffer> buffer;
+        bool isNewBuffer { false };
+        Vector<uint64_t> retiredBufferIDs;
+    };
+    VideoFrameBufferCopy copySurfaceBufferToVideoFrameBuffer(SurfaceBuffer, std::span<const uint64_t> releasedBufferIDs, std::span<const uint64_t> preferredModifiers);
+#if USE(GSTREAMER)
+    RefPtr<VideoFrame> surfaceBufferToVideoFrame(SurfaceBuffer) final;
+#endif
+#endif
 
 #if ENABLE(WEBXR)
     GCGLExternalImage createExternalImage(ExternalImageSource&&, GCGLenum internalFormat, GCGLint layer) final;
@@ -70,6 +82,7 @@ private:
     struct DrawingBuffer {
         RefPtr<DMABufBuffer> dmabuf;
         EGLImageKHR image { nullptr };
+        GCGLuint readTexture { 0 };
     };
     DrawingBuffer createDrawingBuffer() const;
 
@@ -80,6 +93,29 @@ private:
 
     DrawingBuffer m_drawingBuffer;
     DrawingBuffer m_displayBuffer;
+#if ENABLE(MEDIA_STREAM) || ENABLE(WEB_CODECS)
+    struct VideoFrameBuffer {
+        RefPtr<DMABufBuffer> dmabuf;
+        EGLImageKHR image { nullptr };
+        GCGLuint texture { 0 };
+        bool isInUse { false };
+        bool wasDelivered { false };
+    };
+    VideoFrameBuffer createVideoFrameBuffer(const IntSize&, uint32_t fourcc, std::span<const uint64_t> modifiers);
+    void destroyVideoFrameBuffer(VideoFrameBuffer&);
+    void freeVideoFrameBuffers();
+    std::optional<size_t> acquireVideoFrameBuffer(const IntSize&, uint32_t fourcc, std::span<const uint64_t> preferredModifiers, Vector<uint64_t>& retiredBufferIDs);
+    GCGLuint videoFrameSourceTexture(SurfaceBuffer);
+    void publishVideoFrameBufferContents(const VideoFrameBuffer&);
+
+    Vector<VideoFrameBuffer> m_videoFrameBuffers;
+    bool m_canCopyVideoFrames { false };
+    bool m_hasReportedVideoFramePoolExhaustion { false };
+    bool m_videoFrameModifiersAreUnusable { false };
+#if USE(GSTREAMER)
+    RefPtr<DMABufBufferReleaseQueue> m_videoFrameReleaseQueue;
+#endif
+#endif
 };
 
 } // namespace WebCore

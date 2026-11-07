@@ -44,6 +44,9 @@ public:
 private:
     void platformWorkQueueInitialize(WebCore::GraphicsContextGLAttributes&&) final;
     void prepareForDisplay(CompletionHandler<void(uint64_t, std::optional<WebCore::DMABufBuffer::Attributes>&&, UnixFileDescriptor&&)>&&) final;
+#if (ENABLE(MEDIA_STREAM) || ENABLE(WEB_CODECS)) && USE(GSTREAMER)
+    void copySurfaceBufferToVideoFrameBuffer(WebCore::GraphicsContextGL::SurfaceBuffer, Vector<uint64_t>&&, Vector<uint64_t>&&, CompletionHandler<void(uint64_t, std::optional<WebCore::DMABufBuffer::Attributes>&&, Vector<uint64_t>&&)>&&) final;
+#endif
 };
 
 WTF_MAKE_TZONE_ALLOCATED_IMPL(RemoteGraphicsContextGLGBM);
@@ -78,6 +81,30 @@ void RemoteGraphicsContextGLGBM::prepareForDisplay(CompletionHandler<void(uint64
 
     completionHandler(buffer->id(), buffer->takeAttributes(), WTF::move(fenceFD));
 }
+
+#if (ENABLE(MEDIA_STREAM) || ENABLE(WEB_CODECS)) && USE(GSTREAMER)
+void RemoteGraphicsContextGLGBM::copySurfaceBufferToVideoFrameBuffer(WebCore::GraphicsContextGL::SurfaceBuffer buffer, Vector<uint64_t>&& releasedBufferIDs, Vector<uint64_t>&& preferredModifiers, CompletionHandler<void(uint64_t, std::optional<WebCore::DMABufBuffer::Attributes>&&, Vector<uint64_t>&&)>&& completionHandler)
+{
+    assertIsCurrent(workQueue());
+    if (!m_context) {
+        completionHandler(0, std::nullopt, {});
+        return;
+    }
+
+    auto copy = m_context->copySurfaceBufferToVideoFrameBuffer(buffer, releasedBufferIDs.span(), preferredModifiers.span());
+    if (!copy.buffer) {
+        completionHandler(0, std::nullopt, WTF::move(copy.retiredBufferIDs));
+        return;
+    }
+
+    std::optional<WebCore::DMABufBuffer::Attributes> attributes;
+    if (copy.isNewBuffer) {
+        const auto& source = copy.buffer->attributes();
+        attributes = WebCore::DMABufBuffer::Attributes { source.size, source.fourcc, source.fds.map([](const auto& fd) { return fd.duplicate(); }), source.offsets, source.strides, source.modifier };
+    }
+    completionHandler(copy.buffer->id(), WTF::move(attributes), WTF::move(copy.retiredBufferIDs));
+}
+#endif
 
 Ref<RemoteGraphicsContextGL> RemoteGraphicsContextGL::create(GPUConnectionToWebProcess& connection, WebCore::GraphicsContextGLAttributes&& attributes, RemoteGraphicsContextGLIdentifier identifier, RemoteRenderingBackend& renderingBackend, Ref<IPC::StreamServerConnection>&& streamConnection)
 {

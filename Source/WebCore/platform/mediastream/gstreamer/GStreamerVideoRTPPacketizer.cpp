@@ -205,6 +205,7 @@ void GStreamerVideoRTPPacketizer::configure(const GstStructure* encodingParamete
             gst_util_double_to_fraction(maxFrameRate, &numerator, &denominator);
 
             GRefPtr caps = adoptGRef(gst_caps_new_simple("video/x-raw", "framerate", GST_TYPE_FRACTION, numerator, denominator, nullptr));
+            gst_caps_set_features(caps.get(), 0, gst_caps_features_new_any());
             g_object_set(m_frameRateCapsFilter.get(), "caps", caps.get(), nullptr);
         }
     }

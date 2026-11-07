@@ -39,6 +39,16 @@
 #include "TextureMapperFlags.h"
 #include <drm_fourcc.h>
 #include <wtf/unix/UnixFileDescriptor.h>
+#if ENABLE(MEDIA_STREAM) || ENABLE(WEB_CODECS)
+#include <algorithm>
+#include <array>
+#include <errno.h>
+#include <linux/dma-buf.h>
+#include <sys/ioctl.h>
+#if USE(GSTREAMER)
+#include "VideoFrame.h"
+#endif
+#endif
 
 namespace WebCore {
 
@@ -72,6 +82,17 @@ GraphicsContextGLTextureMapperGBM::GraphicsContextGLTextureMapperGBM(GraphicsCon
 
 GraphicsContextGLTextureMapperGBM::~GraphicsContextGLTextureMapperGBM()
 {
+    if (!makeContextCurrent()) {
+        m_drawingBuffer.readTexture = 0;
+        m_displayBuffer.readTexture = 0;
+#if ENABLE(MEDIA_STREAM) || ENABLE(WEB_CODECS)
+        for (auto& buffer : m_videoFrameBuffers)
+            buffer.texture = 0;
+#endif
+    }
+#if ENABLE(MEDIA_STREAM) || ENABLE(WEB_CODECS)
+    freeVideoFrameBuffers();
+#endif
     freeDrawingBuffers();
 }
 
@@ -111,6 +132,9 @@ bool GraphicsContextGLTextureMapperGBM::platformInitializeExtensions()
 {
     if (!enableExtensionsImpl({ "GL_OES_EGL_image"_s }))
         return false;
+#if ENABLE(MEDIA_STREAM) || ENABLE(WEB_CODECS)
+    m_canCopyVideoFrames = supportsExtensionImpl("GL_CHROMIUM_copy_texture"_s);
+#endif
 
 #if ENABLE(WEBXR)
     if (contextAttributes().xrCompatible && !enableRequiredWebXRExtensionsImpl())
@@ -161,6 +185,10 @@ GraphicsContextGLTextureMapperGBM::DrawingBuffer GraphicsContextGLTextureMapperG
 void GraphicsContextGLTextureMapperGBM::freeDrawingBuffers()
 {
     auto destroyBuffer = [this](DrawingBuffer& buffer) {
+        if (buffer.readTexture) {
+            GL_DeleteTextures(1, &buffer.readTexture);
+            buffer.readTexture = 0;
+        }
         if (!buffer.image)
             return;
 
@@ -255,6 +283,214 @@ void GraphicsContextGLTextureMapperGBM::prepareForDisplayWithFinishedSignal(Func
         return;
     }
 }
+
+#if ENABLE(MEDIA_STREAM) || ENABLE(WEB_CODECS)
+static constexpr size_t maximumVideoFrameBuffers = 6;
+
+GraphicsContextGLTextureMapperGBM::VideoFrameBuffer GraphicsContextGLTextureMapperGBM::createVideoFrameBuffer(const IntSize& size, uint32_t fourcc, std::span<const uint64_t> modifiers)
+{
+    auto gbmDevice = DRMDeviceManager::singleton().mainGBMDevice(DRMDeviceManager::NodeType::Render);
+    if (!gbmDevice || modifiers.empty())
+        return {};
+
+    bool isLinear = modifiers.size() == 1 && modifiers[0] == DRM_FORMAT_MOD_LINEAR;
+    struct gbm_bo* bo = gbm_bo_create_with_modifiers2(gbmDevice->device(), size.width(), size.height(), fourcc, modifiers.data(), modifiers.size(), GBM_BO_USE_RENDERING);
+    if (!bo && isLinear)
+        bo = gbm_bo_create(gbmDevice->device(), size.width(), size.height(), fourcc, GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
+    if (!bo)
+        return {};
+
+    auto dmaBufAttributes = DMABufBufferAttributes::fromGBMBufferObject(bo);
+    gbm_bo_destroy(bo);
+    if (!dmaBufAttributes || dmaBufAttributes->fds.size() != 1)
+        return {};
+    if (isLinear)
+        dmaBufAttributes->modifier = DRM_FORMAT_MOD_LINEAR;
+    else if (std::ranges::find(modifiers, dmaBufAttributes->modifier) == modifiers.end())
+        return {};
+
+    Ref dmabuf = DMABufBuffer::create(WTF::move(*dmaBufAttributes));
+    auto enableModifiers = PlatformDisplay::sharedDisplay().eglExtensions().EXT_image_dma_buf_import_modifiers
+        ? DMABufBufferAttributes::EnableModifiers::Yes
+        : DMABufBufferAttributes::EnableModifiers::No;
+    auto eglAttributes = DMABufBuffer::buildEGLImageAttributes(dmabuf->attributes(), enableModifiers);
+    if (!eglAttributes)
+        return {};
+
+    auto image = EGL_CreateImageKHR(m_displayObj, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, eglAttributes->span().data());
+    if (!image)
+        return {};
+
+    GCGLuint texture = 0;
+    {
+        ScopedRestoreTextureBinding restoreBinding(TEXTURE_BINDING_2D, TEXTURE_2D);
+        GL_GenTextures(1, &texture);
+        GL_BindTexture(GL_TEXTURE_2D, texture);
+        GL_EGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
+    }
+    return { WTF::move(dmabuf), image, texture };
+}
+
+void GraphicsContextGLTextureMapperGBM::destroyVideoFrameBuffer(VideoFrameBuffer& buffer)
+{
+    if (buffer.texture)
+        GL_DeleteTextures(1, &buffer.texture);
+    if (buffer.image)
+        EGL_DestroyImageKHR(m_displayObj, buffer.image);
+    buffer = {};
+}
+
+void GraphicsContextGLTextureMapperGBM::freeVideoFrameBuffers()
+{
+    for (auto& buffer : m_videoFrameBuffers)
+        destroyVideoFrameBuffer(buffer);
+    m_videoFrameBuffers.clear();
+}
+
+std::optional<size_t> GraphicsContextGLTextureMapperGBM::acquireVideoFrameBuffer(const IntSize& size, uint32_t fourcc, std::span<const uint64_t> preferredModifiers, Vector<uint64_t>& retiredBufferIDs)
+{
+    for (size_t index = m_videoFrameBuffers.size(); index--;) {
+        auto& buffer = m_videoFrameBuffers[index];
+        const auto& attributes = buffer.dmabuf->attributes();
+        if (attributes.size == size && attributes.fourcc.value == fourcc)
+            continue;
+        retiredBufferIDs.append(buffer.dmabuf->id());
+        destroyVideoFrameBuffer(buffer);
+        m_videoFrameBuffers.removeAt(index);
+    }
+
+    for (size_t index = 0; index < m_videoFrameBuffers.size(); ++index) {
+        if (!m_videoFrameBuffers[index].isInUse)
+            return index;
+    }
+
+    if (m_videoFrameBuffers.size() >= maximumVideoFrameBuffers) {
+        if (!m_hasReportedVideoFramePoolExhaustion) {
+            RELEASE_LOG(WebGL, "All %zu WebGL video frame buffers are held by consumers, copying frames through the CPU until one is released", maximumVideoFrameBuffers);
+            m_hasReportedVideoFramePoolExhaustion = true;
+        }
+        return std::nullopt;
+    }
+
+    VideoFrameBuffer buffer;
+    if (!preferredModifiers.empty() && !m_videoFrameModifiersAreUnusable) {
+        buffer = createVideoFrameBuffer(size, fourcc, preferredModifiers);
+        if (!buffer.dmabuf) {
+            RELEASE_LOG(WebGL, "None of the %zu DMA-BUF layouts the video post-processor imports can hold a %dx%d WebGL video frame, using linear buffers", preferredModifiers.size(), size.width(), size.height());
+            m_videoFrameModifiersAreUnusable = true;
+        }
+    }
+    if (!buffer.dmabuf) {
+        const std::array<uint64_t, 1> linearModifier { DRM_FORMAT_MOD_LINEAR };
+        buffer = createVideoFrameBuffer(size, fourcc, linearModifier);
+    }
+    if (!buffer.dmabuf) {
+        RELEASE_LOG_ERROR(WebGL, "Unable to allocate a %dx%d DMA-BUF for WebGL video frames, copying them through the CPU", size.width(), size.height());
+        m_canCopyVideoFrames = false;
+        return std::nullopt;
+    }
+    m_videoFrameBuffers.append(WTF::move(buffer));
+    return m_videoFrameBuffers.size() - 1;
+}
+
+GCGLuint GraphicsContextGLTextureMapperGBM::videoFrameSourceTexture(SurfaceBuffer source)
+{
+    if (source == SurfaceBuffer::DisplayBuffer && m_displayBuffer.image) {
+        if (!m_displayBuffer.readTexture) {
+            ScopedRestoreTextureBinding restoreBinding(TEXTURE_BINDING_2D, TEXTURE_2D);
+            GL_GenTextures(1, &m_displayBuffer.readTexture);
+            GL_BindTexture(GL_TEXTURE_2D, m_displayBuffer.readTexture);
+            GL_EGLImageTargetTexture2DOES(GL_TEXTURE_2D, m_displayBuffer.image);
+        }
+        return m_displayBuffer.readTexture;
+    }
+
+    if (!m_drawingBuffer.dmabuf)
+        return 0;
+    if (contextAttributes().antialias)
+        resolveMultisamplingIfNecessary();
+    return m_preserveDrawingBufferTexture ? m_preserveDrawingBufferTexture : m_texture;
+}
+
+void GraphicsContextGLTextureMapperGBM::publishVideoFrameBufferContents(const VideoFrameBuffer& buffer)
+{
+    auto fence = createExportedFence();
+#if defined(DMA_BUF_IOCTL_IMPORT_SYNC_FILE)
+    if (fence) {
+        struct dma_buf_import_sync_file request { DMA_BUF_SYNC_WRITE, fence.value() };
+        int result;
+        do
+            result = ioctl(buffer.dmabuf->attributes().fds[0].value(), DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &request);
+        while (result == -1 && (errno == EINTR || errno == EAGAIN));
+        if (!result)
+            return;
+    }
+#else
+    UNUSED_PARAM(buffer);
+#endif
+    GL_Finish();
+}
+
+auto GraphicsContextGLTextureMapperGBM::copySurfaceBufferToVideoFrameBuffer(SurfaceBuffer source, std::span<const uint64_t> releasedBufferIDs, std::span<const uint64_t> preferredModifiers) -> VideoFrameBufferCopy
+{
+    VideoFrameBufferCopy copy;
+    for (auto bufferID : releasedBufferIDs) {
+        for (auto& buffer : m_videoFrameBuffers) {
+            if (buffer.dmabuf->id() == bufferID)
+                buffer.isInUse = false;
+        }
+    }
+
+    if (!m_canCopyVideoFrames || !makeContextCurrent())
+        return copy;
+
+    auto size = getInternalFramebufferSize();
+    if (size.isEmpty())
+        return copy;
+
+    updateErrors();
+    auto sourceTexture = videoFrameSourceTexture(source);
+    if (!sourceTexture)
+        return copy;
+
+    const auto& attributes = contextAttributes();
+    auto index = acquireVideoFrameBuffer(size, attributes.alpha ? DRM_FORMAT_ARGB8888 : DRM_FORMAT_XRGB8888, preferredModifiers, copy.retiredBufferIDs);
+    if (!index)
+        return copy;
+
+    auto& buffer = m_videoFrameBuffers[*index];
+    bool shouldUnmultiply = attributes.alpha && attributes.premultipliedAlpha;
+    GL_CopySubTextureCHROMIUM(sourceTexture, 0, GL_TEXTURE_2D, buffer.texture, 0, 0, 0, 0, 0, size.width(), size.height(), GL_TRUE, GL_FALSE, shouldUnmultiply ? GL_TRUE : GL_FALSE);
+    if (auto error = GL_GetError(); error != GL_NO_ERROR) {
+        RELEASE_LOG_ERROR(WebGL, "Copying a WebGL surface into a video frame buffer failed with GL error 0x%x, copying frames through the CPU", error);
+        m_canCopyVideoFrames = false;
+        return copy;
+    }
+
+    publishVideoFrameBufferContents(buffer);
+    buffer.isInUse = true;
+    copy.buffer = buffer.dmabuf;
+    copy.isNewBuffer = !std::exchange(buffer.wasDelivered, true);
+    return copy;
+}
+
+#if USE(GSTREAMER)
+RefPtr<VideoFrame> GraphicsContextGLTextureMapperGBM::surfaceBufferToVideoFrame(SurfaceBuffer source)
+{
+    if (!m_videoFrameReleaseQueue)
+        m_videoFrameReleaseQueue = DMABufBufferReleaseQueue::create();
+    auto releasedBufferIDs = m_videoFrameReleaseQueue->take();
+    auto preferredModifiers = VideoFrame::preferredDMABufModifiers(contextAttributes().alpha);
+    auto copy = copySurfaceBufferToVideoFrameBuffer(source, releasedBufferIDs.span(), preferredModifiers.span());
+    if (!copy.buffer)
+        return nullptr;
+    RefPtr frame = VideoFrame::createFromDMABufBuffer(*copy.buffer, *m_videoFrameReleaseQueue);
+    if (!frame)
+        m_videoFrameReleaseQueue->add(copy.buffer->id());
+    return frame;
+}
+#endif
+#endif
 
 #if ENABLE(WEBXR)
 GCGLExternalImage GraphicsContextGLTextureMapperGBM::createExternalImage(ExternalImageSource&& source, GCGLenum, GCGLint)

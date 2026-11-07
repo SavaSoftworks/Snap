@@ -48,6 +48,9 @@ messages -> RemoteGraphicsContextGL Stream {
     void copyNativeImageYFlipped(enum:bool WebCore::GraphicsContextGLSurfaceBuffer buffer, WebCore::RenderingResourceIdentifier nativeImageIdentifier)
 #if ENABLE(MEDIA_STREAM) || ENABLE(WEB_CODECS)
     void SurfaceBufferToVideoFrame(enum:bool WebCore::GraphicsContextGLSurfaceBuffer buffer) -> (struct std::optional<WebKit::RemoteVideoFrameProxyProperties> properties) Synchronous
+#if USE(GBM) && USE(GSTREAMER)
+    void CopySurfaceBufferToVideoFrameBuffer(enum:bool WebCore::GraphicsContextGLSurfaceBuffer buffer, Vector<uint64_t> releasedBufferIDs, Vector<uint64_t> preferredModifiers) -> (uint64_t bufferID, std::optional<WebCore::DMABufBufferAttributes> dmabufAttributes, Vector<uint64_t> retiredBufferIDs) Synchronous NotStreamEncodableReply
+#endif
 #endif
 #if ENABLE(VIDEO) && PLATFORM(COCOA)
     void CopyTextureFromVideoFrame(struct WebKit::SharedVideoFrame frame, PlatformGLObject texture, uint32_t target, int32_t level, uint32_t internalFormat, uint32_t format, uint32_t type, bool premultiplyAlpha, bool flipY) -> (bool success) Synchronous NotStreamEncodable

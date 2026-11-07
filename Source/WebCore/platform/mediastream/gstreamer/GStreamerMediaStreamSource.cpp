@@ -34,6 +34,7 @@
 #include "VideoFrameGStreamer.h"
 #include "VideoFrameMetadataGStreamer.h"
 #include "VideoTrackPrivateMediaStream.h"
+#include <atomic>
 #include <wtf/CheckedRef.h>
 #include <wtf/HashMap.h>
 #include <wtf/TZoneMallocInlines.h>
@@ -103,7 +104,6 @@ static void webkitMediaStreamSrcCharacteristicsChanged(WebKitMediaStreamSrc*);
 
 class WebKitMediaStreamObserver : public MediaStreamPrivateObserver, public RefCounted<WebKitMediaStreamObserver> {
     WTF_MAKE_TZONE_ALLOCATED_INLINE(WebKitMediaStreamObserver);
-
 public:
     static Ref<WebKitMediaStreamObserver> create(GstElement* src)
     {
@@ -147,15 +147,15 @@ private:
 
 static void webkitMediaStreamSrcEnsureStreamCollectionPosted(WebKitMediaStreamSrc*, bool isEmpty = false);
 
+
 class InternalSource final : public MediaStreamTrackPrivateObserver,
-                             public ThreadSafeRefCountedAndCanMakeThreadSafeWeakPtr<InternalSource>,
-                             public RealtimeMediaSourceObserver,
-                             public RealtimeMediaSource::AudioSampleObserver,
-                             public RealtimeMediaSource::VideoFrameObserver,
-                             public CanMakeCheckedPtr<InternalSource> {
+    public ThreadSafeRefCountedAndCanMakeThreadSafeWeakPtr<InternalSource>,
+    public RealtimeMediaSourceObserver,
+    public RealtimeMediaSource::AudioSampleObserver,
+    public RealtimeMediaSource::VideoFrameObserver,
+    public CanMakeCheckedPtr<InternalSource> {
     WTF_MAKE_TZONE_ALLOCATED_INLINE(InternalSource);
     WTF_OVERRIDE_DELETE_FOR_CHECKED_PTR(InternalSource);
-
 public:
     static Ref<InternalSource> create(GstElement* parent, MediaStreamTrackPrivate& track, const String& padName, bool consumerIsVideoPlayer)
     {
@@ -463,11 +463,18 @@ public:
         auto gstVideoFrame = static_cast<VideoFrameGStreamer*>(&videoFrame);
         GRefPtr<GstSample> sample = gstVideoFrame->sample();
 
-        // Video encoders require a multiple of two frame size. At least x264enc does anyway.
-        if (!m_consumerIsVideoPlayer && !m_isIncomingVideoSource && (captureSize.width() % 2 || captureSize.height() % 2)) {
+        bool needsEvenSize = !m_consumerIsVideoPlayer && !m_isIncomingVideoSource && (captureSize.width() % 2 || captureSize.height() % 2);
+        if (needsEvenSize) {
             captureSize.setWidth(roundUpToMultipleOf(2, captureSize.width()));
             captureSize.setHeight(roundUpToMultipleOf(2, captureSize.height()));
+        }
+        if (auto format = systemMemoryFormatForDownstream(*gstVideoFrame, needsEvenSize))
+            sample = gstVideoFrame->convert(*format, captureSize);
+        else if (needsEvenSize)
             sample = gstVideoFrame->resizedSample(captureSize);
+        if (!sample) {
+            GST_WARNING_OBJECT(m_src.get(), "Dropping a %dx%d video frame that could not be prepared for downstream", captureSize.width(), captureSize.height());
+            return;
         }
 
         if (!m_track)
@@ -509,6 +516,49 @@ public:
         }
 
         pushBlackFrame(GST_BUFFER_PTS(gst_sample_get_buffer(sample.get())));
+    }
+
+    std::optional<GstVideoFormat> systemMemoryFormatForDownstream(VideoFrameGStreamer& frame, bool needsResize)
+    {
+        if (frame.memoryType() == VideoFrameGStreamer::MemoryType::System || m_consumerIsVideoPlayer)
+            return std::nullopt;
+
+        auto* caps = gst_sample_get_caps(frame.sample().get());
+        if (!caps || !gst_caps_get_size(caps))
+            return std::nullopt;
+
+        auto frameFormat = static_cast<GstVideoFormat>(frame.pixelFormat());
+        if (m_needsDownstreamMemoryCheck.exchange(false) || !m_checkedDownstreamCaps || !gst_caps_is_equal(m_checkedDownstreamCaps.get(), caps)) {
+            m_checkedDownstreamCaps = caps;
+            GRefPtr pad = adoptGRef(gst_element_get_static_pad(m_src.get(), "src"));
+            GRefPtr allowed = adoptGRef(gst_pad_peer_query_caps(pad.get(), nullptr));
+            bool isExplicit = allowed && !gst_caps_is_any(allowed.get()) && !gst_caps_is_empty(allowed.get());
+            if (isExplicit && gst_caps_can_intersect(allowed.get(), caps))
+                m_downstreamSystemMemoryFormat = std::nullopt;
+            else {
+                m_downstreamSystemMemoryFormat = GST_VIDEO_FORMAT_I420;
+                if (isExplicit) {
+                    auto* structure = gst_caps_get_structure(caps, 0);
+                    for (auto format : { GST_VIDEO_FORMAT_I420, frameFormat }) {
+                        GRefPtr candidate = adoptGRef(gst_caps_new_simple("video/x-raw", "format", G_TYPE_STRING, gst_video_format_to_string(format), nullptr));
+                        auto* candidateStructure = gst_caps_get_structure(candidate.get(), 0);
+                        for (const char* field : { "width", "height" }) {
+                            if (auto* value = gst_structure_get_value(structure, field))
+                                gst_structure_set_value(candidateStructure, field, value);
+                        }
+                        if (gst_caps_can_intersect(allowed.get(), candidate.get())) {
+                            m_downstreamSystemMemoryFormat = format;
+                            break;
+                        }
+                    }
+                }
+            }
+            GST_DEBUG_OBJECT(m_src.get(), "Downstream %s %" GST_PTR_FORMAT, m_downstreamSystemMemoryFormat ? "needs system memory instead of" : "takes", caps);
+        }
+
+        if (!m_downstreamSystemMemoryFormat && needsResize)
+            return frameFormat;
+        return m_downstreamSystemMemoryFormat;
     }
 
     void audioSamplesAvailable(const MediaTime&, const PlatformAudioData& audioData, const AudioStreamDescription&, size_t) final
@@ -677,6 +727,14 @@ private:
             return GST_PAD_PROBE_OK;
         });
 
+        if (m_isVideoTrack) {
+            m_reconfigurePadProbeHandle = PadProbeHandle<InternalSource>::create(*this, adoptGRef(gst_element_get_static_pad(m_src.get(), "src")), GST_PAD_PROBE_TYPE_EVENT_UPSTREAM, [](const auto& self, const auto&, auto info) -> GstPadProbeReturn {
+                if (GST_EVENT_TYPE(GST_PAD_PROBE_INFO_EVENT(info)) == GST_EVENT_RECONFIGURE)
+                    self->m_needsDownstreamMemoryCheck = true;
+                return GST_PAD_PROBE_OK;
+            });
+        }
+
         if (!trackSource.isIncomingAudioSource() && !trackSource.isIncomingVideoSource())
             return;
 
@@ -776,8 +834,7 @@ private:
             GST_DEBUG_OBJECT(self->m_src.get(), "Pushing tags for %" GST_PTR_FORMAT, self->m_stream.get());
             gst_pad_push_event(pad.get(), gst_event_new_tag(gst_stream_get_tags(self->m_stream.get())));
             self->m_hasPushedInitialTags = true;
-        }),
-            this);
+        }), this);
     }
 
     void updateStats(const GRefPtr<GstSample>& sample)
@@ -879,6 +936,10 @@ private:
     RefPtr<PadProbeHandle<RealtimeIncomingSourceGStreamer>> m_incomingPadProbeHandle;
 #endif
     RefPtr<PadProbeHandle<InternalSource>> m_upstreamQueryPadProbeHandle;
+    RefPtr<PadProbeHandle<InternalSource>> m_reconfigurePadProbeHandle;
+    std::atomic<bool> m_needsDownstreamMemoryCheck { true };
+    GRefPtr<GstCaps> m_checkedDownstreamCaps;
+    std::optional<GstVideoFormat> m_downstreamSystemMemoryFormat;
 };
 
 class PadProbeData final : public ThreadSafeRefCountedAndCanMakeThreadSafeWeakPtr<PadProbeData> {
@@ -1097,7 +1158,7 @@ static void webkitMediaStreamSrcUriHandlerInit(gpointer gIface, gpointer)
     iface->set_uri = webkitMediaStreamSrcUriSetUri;
 }
 
-#define doInit                                                                       \
+#define doInit \
     G_IMPLEMENT_INTERFACE(GST_TYPE_URI_HANDLER, webkitMediaStreamSrcUriHandlerInit); \
     GST_DEBUG_CATEGORY_INIT(webkitMediaStreamSrcDebug, "webkitmediastreamsrc", 0, "mediastreamsrc element");
 
@@ -1229,7 +1290,8 @@ static void webkit_media_stream_src_class_init(WebKitMediaStreamSrcClass* klass)
     gobjectClass->get_property = webkitMediaStreamSrcGetProperty;
     gobjectClass->set_property = webkitMediaStreamSrcSetProperty;
 
-    g_object_class_install_property(gobjectClass, WEBKIT_MEDIASTREAM_SRC_PROP_IS_LIVE, g_param_spec_boolean("is-live", nullptr, nullptr, TRUE, static_cast<GParamFlags>(G_PARAM_READABLE | G_PARAM_STATIC_STRINGS)));
+    g_object_class_install_property(gobjectClass, WEBKIT_MEDIASTREAM_SRC_PROP_IS_LIVE, g_param_spec_boolean("is-live", nullptr, nullptr,
+        TRUE, static_cast<GParamFlags>(G_PARAM_READABLE | G_PARAM_STATIC_STRINGS)));
 
     gstElementClass->change_state = GST_DEBUG_FUNCPTR(webkitMediaStreamSrcChangeState);
 

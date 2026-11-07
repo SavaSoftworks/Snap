@@ -27,6 +27,7 @@
 
 #if USE(COORDINATED_GRAPHICS)
 #include "DMABufBufferAttributes.h"
+#include <wtf/Lock.h>
 #include <wtf/ThreadSafeRefCounted.h>
 
 typedef int32_t EGLint;
@@ -79,6 +80,29 @@ private:
     std::optional<ColorSpace> m_colorSpace;
     std::optional<TransferFunction> m_transferFunction;
     std::unique_ptr<CoordinatedPlatformLayerBuffer> m_buffer;
+};
+
+class DMABufBufferReleaseQueue final : public ThreadSafeRefCounted<DMABufBufferReleaseQueue> {
+public:
+    static Ref<DMABufBufferReleaseQueue> create() { return adoptRef(*new DMABufBufferReleaseQueue); }
+
+    void add(uint64_t bufferID)
+    {
+        Locker locker { m_lock };
+        m_releasedBufferIDs.append(bufferID);
+    }
+
+    Vector<uint64_t> take()
+    {
+        Locker locker { m_lock };
+        return std::exchange(m_releasedBufferIDs, {});
+    }
+
+private:
+    DMABufBufferReleaseQueue() = default;
+
+    Lock m_lock;
+    Vector<uint64_t> m_releasedBufferIDs WTF_GUARDED_BY_LOCK(m_lock);
 };
 
 } // namespace WebCore

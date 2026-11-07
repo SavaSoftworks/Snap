@@ -40,10 +40,6 @@
 
 #if ENABLE(MEDIA_STREAM) || ENABLE(WEB_CODECS)
 #include "VideoFrame.h"
-#if USE(GSTREAMER)
-#include "VideoFrameContentHint.h"
-#include "VideoFrameGStreamer.h"
-#endif
 #endif
 
 #if USE(COORDINATED_GRAPHICS)
@@ -217,14 +213,6 @@ bool GraphicsContextGLTextureMapperANGLE::copyTextureFromVideoFrame(VideoFrame&,
 #if ENABLE(MEDIA_STREAM) || ENABLE(WEB_CODECS)
 RefPtr<VideoFrame> GraphicsContextGLTextureMapperANGLE::surfaceBufferToVideoFrame(SurfaceBuffer)
 {
-#if USE(GSTREAMER)
-    if (auto pixelBuffer = readCompositedResults()) {
-        VideoFrameGStreamer::CreateOptions options;
-        options.rotation = VideoFrameGStreamer::Rotation::UpsideDown;
-        options.isMirrored = true;
-        return VideoFrameGStreamer::createFromPixelBuffer(pixelBuffer.releaseNonNull(), { }, 30, options);
-    }
-#endif
     return nullptr;
 }
 #endif

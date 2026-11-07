@@ -51,6 +51,10 @@ class ProcessIdentity;
 #if USE(AVFOUNDATION) && PLATFORM(COCOA)
 class VideoFrameCV;
 #endif
+#if USE(GSTREAMER) && USE(GBM)
+class DMABufBuffer;
+class DMABufBufferReleaseQueue;
+#endif
 
 struct ImageOrientation;
 struct PlatformVideoColorSpace;
@@ -83,6 +87,10 @@ public:
     static RefPtr<VideoFrame> createBGRA(std::span<const uint8_t>, size_t width, size_t height, const ComputedPlaneLayout&, PlatformVideoColorSpace&&);
     static RefPtr<VideoFrame> createI420(std::span<const uint8_t>, size_t width, size_t height, const ComputedPlaneLayout&, const ComputedPlaneLayout&, const ComputedPlaneLayout&, PlatformVideoColorSpace&&);
     static RefPtr<VideoFrame> createI420A(std::span<const uint8_t>, size_t width, size_t height, const ComputedPlaneLayout&, const ComputedPlaneLayout&, const ComputedPlaneLayout&, const ComputedPlaneLayout&, PlatformVideoColorSpace&&);
+#if USE(GSTREAMER) && USE(GBM)
+    WEBCORE_EXPORT static RefPtr<VideoFrame> createFromDMABufBuffer(DMABufBuffer&, DMABufBufferReleaseQueue&);
+    WEBCORE_EXPORT static Vector<uint64_t> preferredDMABufModifiers(bool hasAlpha);
+#endif
 
     using Rotation = VideoFrameRotation;
 

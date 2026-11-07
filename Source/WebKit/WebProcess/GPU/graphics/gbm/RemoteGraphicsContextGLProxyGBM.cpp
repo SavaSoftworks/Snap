@@ -31,6 +31,7 @@
 #include <WebCore/DMABufBuffer.h>
 #include <WebCore/GraphicsLayerContentsDisplayDelegateCoordinated.h>
 #include <WebCore/TextureMapperFlags.h>
+#include <WebCore/VideoFrame.h>
 
 namespace WebKit {
 using namespace WebCore;
@@ -52,10 +53,17 @@ private:
     // WebCore::GraphicsContextGL
     RefPtr<GraphicsLayerContentsDisplayDelegate> layerContentsDisplayDelegate() final { return m_layerContentsDisplayDelegate.copyRef(); }
     void prepareForDisplay() final;
+#if (ENABLE(MEDIA_STREAM) || ENABLE(WEB_CODECS)) && USE(GSTREAMER)
+    RefPtr<VideoFrame> surfaceBufferToVideoFrame(SurfaceBuffer) final;
+#endif
 
     const Ref<GraphicsLayerContentsDisplayDelegate> m_layerContentsDisplayDelegate;
     RefPtr<DMABufBuffer> m_drawingBuffer;
     RefPtr<DMABufBuffer> m_displayBuffer;
+#if (ENABLE(MEDIA_STREAM) || ENABLE(WEB_CODECS)) && USE(GSTREAMER)
+    HashMap<uint64_t, Ref<DMABufBuffer>> m_videoFrameBuffers;
+    const Ref<DMABufBufferReleaseQueue> m_videoFrameReleaseQueue { DMABufBufferReleaseQueue::create() };
+#endif
 };
 
 void RemoteGraphicsContextGLProxyGBM::prepareForDisplay()
@@ -87,6 +95,38 @@ void RemoteGraphicsContextGLProxyGBM::prepareForDisplay()
     m_layerContentsDisplayDelegate->setDisplayBuffer(CoordinatedPlatformLayerBufferDMABuf::create(protect(*m_displayBuffer), flags, WTF::move(fenceFD)));
     m_hasPreparedForDisplay = true;
 }
+
+#if (ENABLE(MEDIA_STREAM) || ENABLE(WEB_CODECS)) && USE(GSTREAMER)
+RefPtr<VideoFrame> RemoteGraphicsContextGLProxyGBM::surfaceBufferToVideoFrame(SurfaceBuffer buffer)
+{
+    if (isContextLost())
+        return nullptr;
+
+    auto releasedBufferIDs = m_videoFrameReleaseQueue->take();
+    auto preferredModifiers = VideoFrame::preferredDMABufModifiers(contextAttributes().alpha);
+    auto sendResult = sendSync(Messages::RemoteGraphicsContextGL::CopySurfaceBufferToVideoFrameBuffer(buffer, releasedBufferIDs, preferredModifiers));
+    if (!sendResult.succeeded()) {
+        markContextLost();
+        return nullptr;
+    }
+
+    auto [bufferID, bufferAttributes, retiredBufferIDs] = sendResult.takeReply();
+    for (auto retiredBufferID : retiredBufferIDs)
+        m_videoFrameBuffers.remove(retiredBufferID);
+    if (!bufferID)
+        return nullptr;
+
+    if (bufferAttributes)
+        m_videoFrameBuffers.set(bufferID, DMABufBuffer::create(bufferID, WTF::move(*bufferAttributes)));
+
+    RefPtr<VideoFrame> frame;
+    if (RefPtr dmabuf = m_videoFrameBuffers.get(bufferID))
+        frame = VideoFrame::createFromDMABufBuffer(*dmabuf, m_videoFrameReleaseQueue);
+    if (!frame)
+        m_videoFrameReleaseQueue->add(bufferID);
+    return frame;
+}
+#endif
 
 Ref<RemoteGraphicsContextGLProxy> RemoteGraphicsContextGLProxy::platformCreate(const GraphicsContextGLAttributes& attributes, RemoteRenderingBackendProxy& renderingBackend)
 {

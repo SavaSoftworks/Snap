@@ -93,7 +93,7 @@ public:
 
     RefPtr<WebCore::NativeImage> copyNativeImageYFlipped(SurfaceBuffer) final;
 #if ENABLE(MEDIA_STREAM) || ENABLE(WEB_CODECS)
-    RefPtr<WebCore::VideoFrame> surfaceBufferToVideoFrame(SurfaceBuffer) final;
+    RefPtr<WebCore::VideoFrame> surfaceBufferToVideoFrame(SurfaceBuffer) override;
 #endif
     GCGLErrorCodeSet getErrors() final;
 #if ENABLE(VIDEO)

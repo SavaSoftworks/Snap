@@ -75,6 +75,7 @@ public:
 
     const RefPtr<GStreamerElementHarness> harness() const { return m_harness; }
     bool isClosed() const { return m_isClosed; }
+    bool acceptsDMABuf() const;
 
 private:
     GStreamerInternalVideoEncoder(const VideoEncoder::Config&, VideoEncoder::DescriptionCallback&&, VideoEncoder::OutputCallback&&);
@@ -202,6 +203,11 @@ Ref<GenericPromise> GStreamerVideoEncoder::setBitRateAllocation(RefPtr<WebKitVid
         encoder->setBitRateAllocation(WTF::move(bitrateAllocation), frameRate);
         return GenericPromise::createAndResolve();
     });
+}
+
+bool GStreamerVideoEncoder::acceptsDMABuf() const
+{
+    return m_internalEncoder->acceptsDMABuf();
 }
 
 void GStreamerVideoEncoder::reset()
@@ -333,6 +339,31 @@ String GStreamerInternalVideoEncoder::initialize(const String& codecName)
     return emptyString();
 }
 
+static bool encoderTakesFrameMemory(VideoFrameGStreamer::MemoryType memoryType, bool acceptsDMABuf)
+{
+    switch (memoryType) {
+    case VideoFrameGStreamer::MemoryType::System:
+        return true;
+#if USE(GSTREAMER_GL)
+    case VideoFrameGStreamer::MemoryType::GL:
+        return false;
+#if USE(GBM)
+    case VideoFrameGStreamer::MemoryType::DMABuf:
+        return acceptsDMABuf;
+#endif
+#endif
+    case VideoFrameGStreamer::MemoryType::Unsupported:
+        break;
+    }
+    UNUSED_PARAM(acceptsDMABuf);
+    return false;
+}
+
+bool GStreamerInternalVideoEncoder::acceptsDMABuf() const
+{
+    return m_isInitialized && videoEncoderAcceptsDMABuf(WEBKIT_VIDEO_ENCODER(m_harness->element()));
+}
+
 bool GStreamerInternalVideoEncoder::encode(VideoEncoder::RawFrame&& rawFrame, bool shouldGenerateKeyFrame)
 {
     if (!m_isInitialized) {
@@ -350,6 +381,16 @@ bool GStreamerInternalVideoEncoder::encode(VideoEncoder::RawFrame&& rawFrame, bo
 
     auto& gstVideoFrame = downcast<VideoFrameGStreamer>(rawFrame.frame.get());
     GRefPtr sample = gstVideoFrame.sample();
+    if (!encoderTakesFrameMemory(gstVideoFrame.memoryType(), acceptsDMABuf())) {
+        IntSize size { static_cast<int>(m_config.width), static_cast<int>(m_config.height) };
+        if (size.isEmpty())
+            size = gstVideoFrame.presentationSize();
+        sample = gstVideoFrame.convert(GST_VIDEO_FORMAT_I420, size);
+        if (!sample) {
+            GST_WARNING_OBJECT(m_harness->element(), "Unable to bring a %dx%d frame into system memory for encoding", size.width(), size.height());
+            return false;
+        }
+    }
 
     auto orientation = makeString(gstVideoFrame.isMirrored() ? "flip-"_s : ""_s, "rotate-"_s, gstVideoFrame.rotation());
     if (orientation != m_orientation) {

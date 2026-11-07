@@ -124,6 +124,9 @@ protected:
     virtual void prepareForDisplay(CompletionHandler<void(std::optional<WCContentBufferIdentifier>)>&&) = 0;
 #elif USE(GBM)
     virtual void prepareForDisplay(CompletionHandler<void(uint64_t, std::optional<WebCore::DMABufBuffer::Attributes>&&, UnixFileDescriptor&&)>&&) = 0;
+#if (ENABLE(MEDIA_STREAM) || ENABLE(WEB_CODECS)) && USE(GSTREAMER)
+    virtual void copySurfaceBufferToVideoFrameBuffer(WebCore::GraphicsContextGL::SurfaceBuffer, Vector<uint64_t>&& releasedBufferIDs, Vector<uint64_t>&& preferredModifiers, CompletionHandler<void(uint64_t, std::optional<WebCore::DMABufBuffer::Attributes>&&, Vector<uint64_t>&&)>&&) = 0;
+#endif
 #else
     void prepareForDisplay(CompletionHandler<void()>&&);
 #endif

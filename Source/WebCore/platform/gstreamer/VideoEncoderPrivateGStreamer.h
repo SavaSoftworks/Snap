@@ -97,6 +97,7 @@ struct CodecConfig {
 
 bool videoEncoderSupportsCodec(WebKitVideoEncoder*, const String&);
 bool videoEncoderSetCodec(WebKitVideoEncoder*, const WebCore::CodecConfig&, const WebCore::IntSize&, std::optional<double> frameRate = std::nullopt, bool enableVideoFlip = false);
+bool videoEncoderAcceptsDMABuf(WebKitVideoEncoder*);
 void videoEncoderSetBitRateAllocation(WebKitVideoEncoder*, RefPtr<WebCore::WebKitVideoEncoderBitRateAllocation>&&);
 void videoEncoderSetFrameRate(WebKitVideoEncoder*, double frameRate);
 void teardownVideoEncoderSingleton();

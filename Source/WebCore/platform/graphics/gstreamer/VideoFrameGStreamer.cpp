@@ -45,6 +45,9 @@
 
 #if USE(GBM)
 #include <drm_fourcc.h>
+#include <gst/allocators/gstdmabuf.h>
+#include <unistd.h>
+#include <wtf/NeverDestroyed.h>
 #if GST_CHECK_VERSION(1, 24, 0)
 #include <gst/video/video-info-dma.h>
 #endif // GST_CHECK_VERSION(1, 24, 0)
@@ -545,6 +548,152 @@ RefPtr<VideoFrameGStreamer> VideoFrameGStreamer::createFromPixelBuffer(Ref<Pixel
     newOptions.presentationSize = IntSize(width, height);
     return adoptRef(*new VideoFrameGStreamer(WTF::move(sample), newOptions, WTF::move(colorSpace)));
 }
+
+#if USE(GBM)
+struct DMABufVideoFrameRelease {
+    Ref<DMABufBufferReleaseQueue> queue;
+    uint64_t bufferID { 0 };
+};
+
+static GstAllocator* dmabufVideoFrameAllocator()
+{
+    static GstAllocator* allocator = [] {
+        auto* allocator = gst_dmabuf_allocator_new();
+        GST_OBJECT_FLAG_SET(allocator, GST_OBJECT_FLAG_MAY_BE_LEAKED);
+        return allocator;
+    }();
+    return allocator;
+}
+
+Vector<uint64_t> VideoFrame::preferredDMABufModifiers(bool hasAlpha)
+{
+#if GST_CHECK_VERSION(1, 24, 0)
+    static std::once_flag onceFlag;
+    static NeverDestroyed<std::array<Vector<uint64_t>, 2>> modifiers;
+    std::call_once(onceFlag, [] {
+        ensureVideoFrameDebugCategoryInitialized();
+        GRefPtr factory = adoptGRef(gst_element_factory_find("vapostproc"));
+        if (!factory)
+            return;
+        auto addModifier = [](const char* drmFormat) {
+            guint64 modifier = DRM_FORMAT_MOD_INVALID;
+            auto fourcc = drmFormat ? gst_video_dma_drm_fourcc_from_string(drmFormat, &modifier) : 0;
+            if (modifier == DRM_FORMAT_MOD_LINEAR || modifier == DRM_FORMAT_MOD_INVALID)
+                return;
+            if (fourcc == DRM_FORMAT_ARGB8888 && !modifiers.get()[1].contains(modifier))
+                modifiers.get()[1].append(modifier);
+            if (fourcc == DRM_FORMAT_XRGB8888 && !modifiers.get()[0].contains(modifier))
+                modifiers.get()[0].append(modifier);
+        };
+        for (auto* item = gst_element_factory_get_static_pad_templates(factory.get()); item; item = item->next) {
+            auto* padTemplate = static_cast<GstStaticPadTemplate*>(item->data);
+            if (padTemplate->direction != GST_PAD_SINK)
+                continue;
+            GRefPtr caps = adoptGRef(gst_static_caps_get(&padTemplate->static_caps));
+            for (unsigned index = 0; index < gst_caps_get_size(caps.get()); ++index) {
+                auto* features = gst_caps_get_features(caps.get(), index);
+                if (!features || !gst_caps_features_contains(features, GST_CAPS_FEATURE_MEMORY_DMABUF))
+                    continue;
+                auto* value = gst_structure_get_value(gst_caps_get_structure(caps.get(), index), "drm-format");
+                if (value && G_VALUE_HOLDS_STRING(value))
+                    addModifier(g_value_get_string(value));
+                else if (value && GST_VALUE_HOLDS_LIST(value)) {
+                    for (unsigned entry = 0; entry < gst_value_list_get_size(value); ++entry) {
+                        auto* format = gst_value_list_get_value(value, entry);
+                        if (G_VALUE_HOLDS_STRING(format))
+                            addModifier(g_value_get_string(format));
+                    }
+                }
+            }
+        }
+        GST_DEBUG("The video post-processor imports %zu opaque and %zu translucent DMA-BUF layouts", modifiers.get()[0].size(), modifiers.get()[1].size());
+    });
+    return modifiers.get()[hasAlpha ? 1 : 0];
+#else
+    UNUSED_PARAM(hasAlpha);
+    return {};
+#endif
+}
+
+RefPtr<VideoFrame> VideoFrame::createFromDMABufBuffer(DMABufBuffer& dmabuf, DMABufBufferReleaseQueue& releaseQueue)
+{
+#if GST_CHECK_VERSION(1, 24, 0)
+    ensureVideoFrameDebugCategoryInitialized();
+    const auto& attributes = dmabuf.attributes();
+    if (attributes.size.isEmpty() || attributes.fds.size() != 1 || attributes.offsets.size() != 1 || attributes.strides.size() != 1)
+        return nullptr;
+
+    GstVideoFormat format;
+    switch (attributes.fourcc.value) {
+    case DRM_FORMAT_ARGB8888:
+        format = GST_VIDEO_FORMAT_BGRA;
+        break;
+    case DRM_FORMAT_XRGB8888:
+        format = GST_VIDEO_FORMAT_BGRx;
+        break;
+    default:
+        GST_WARNING("DMA-BUF video frames in format %" GST_FOURCC_FORMAT " are not supported", GST_FOURCC_ARGS(attributes.fourcc.value));
+        return nullptr;
+    }
+
+    int width = attributes.size.width();
+    int height = attributes.size.height();
+    GstVideoInfo info;
+    if (!gst_video_info_set_format(&info, format, width, height))
+        return nullptr;
+    GST_VIDEO_INFO_FPS_N(&info) = 30;
+    GST_VIDEO_INFO_FPS_D(&info) = 1;
+    GstVideoInfoDmaDrm drmInfo;
+    if (!gst_video_info_dma_drm_from_video_info(&drmInfo, &info, attributes.modifier))
+        return nullptr;
+    GRefPtr caps = adoptGRef(gst_video_info_dma_drm_to_caps(&drmInfo));
+    if (!caps)
+        return nullptr;
+
+    auto fd = attributes.fds[0].duplicate();
+    if (!fd)
+        return nullptr;
+    gsize requiredSize = static_cast<gsize>(attributes.offsets[0]) + static_cast<gsize>(attributes.strides[0]) * height;
+    auto end = lseek(fd.value(), 0, SEEK_END);
+    if (end > 0 && static_cast<gsize>(end) < requiredSize) {
+        GST_WARNING("A %dx%d DMA-BUF video frame needs %" G_GSIZE_FORMAT " bytes but the buffer holds %" G_GINT64_FORMAT, width, height, requiredSize, static_cast<gint64>(end));
+        return nullptr;
+    }
+    auto* memory = gst_dmabuf_allocator_alloc(dmabufVideoFrameAllocator(), fd.value(), end > 0 ? static_cast<gsize>(end) : requiredSize);
+    if (!memory)
+        return nullptr;
+    [[maybe_unused]] int memoryFD = fd.release();
+    GST_MINI_OBJECT_FLAG_SET(memory, GST_MEMORY_FLAG_READONLY);
+
+    static GQuark releaseQuark = g_quark_from_static_string("webkit-dmabuf-video-frame-release");
+    gst_mini_object_set_qdata(GST_MINI_OBJECT_CAST(memory), releaseQuark, new DMABufVideoFrameRelease { releaseQueue, dmabuf.id() }, [](gpointer data) {
+        std::unique_ptr<DMABufVideoFrameRelease> release(static_cast<DMABufVideoFrameRelease*>(data));
+        release->queue->add(release->bufferID);
+    });
+    static GQuark dmabufQuark = g_quark_from_static_string("wk-dmabuf-buffer");
+    dmabuf.ref();
+    gst_mini_object_set_qdata(GST_MINI_OBJECT_CAST(memory), dmabufQuark, &dmabuf, [](gpointer data) {
+        static_cast<DMABufBuffer*>(data)->deref();
+    });
+
+    GRefPtr buffer = adoptGRef(gst_buffer_new());
+    gst_buffer_append_memory(buffer.get(), memory);
+    gsize offsets[GST_VIDEO_MAX_PLANES] = { attributes.offsets[0] };
+    gint strides[GST_VIDEO_MAX_PLANES] = { static_cast<gint>(attributes.strides[0]) };
+    gst_buffer_add_video_meta_full(buffer.get(), GST_VIDEO_FRAME_FLAG_NONE, format, width, height, 1, offsets, strides);
+    setBufferFields(buffer.get(), MediaTime::invalidTime(), 30);
+    GST_DEBUG("Wrapped DMA-BUF pool buffer %" G_GUINT64_FORMAT " as a %dx%d %s video frame with modifier 0x%" G_GINT64_MODIFIER "x", dmabuf.id(), width, height, gst_video_format_to_string(format), attributes.modifier);
+
+    GRefPtr sample = adoptGRef(gst_sample_new(buffer.get(), caps.get(), nullptr, nullptr));
+    VideoFrameGStreamer::CreateOptions options(IntSize(width, height), VideoFrameGStreamer::infoFromCaps(caps));
+    return VideoFrameGStreamer::create(WTF::move(sample), options);
+#else
+    UNUSED_PARAM(dmabuf);
+    UNUSED_PARAM(releaseQueue);
+    return nullptr;
+#endif
+}
+#endif
 
 VideoFrameGStreamer::VideoFrameGStreamer(GRefPtr<GstSample>&& sample, const CreateOptions& options, PlatformVideoColorSpace&& colorSpace)
     : VideoFrame(options.presentationTime, options.isMirrored, options.rotation, WTF::move(colorSpace))
