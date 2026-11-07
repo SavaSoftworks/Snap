@@ -35,25 +35,60 @@
 #include <JavaScriptCore/HeapInlines.h>
 #include <JavaScriptCore/JSGlobalObject.h>
 #include <wtf/DataLog.h>
+#include <wtf/Scope.h>
 #include <wtf/SystemTracing.h>
+#if PLATFORM(WPE) && USE(GLIB_EVENT_LOOP)
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <wtf/glib/RunLoopSourcePriority.h>
+#endif
 
 namespace WebCore {
+
+static bool snapOpportunisticYieldEnabled()
+{
+#if PLATFORM(WPE) && USE(GLIB_EVENT_LOOP)
+    static const bool enabled = [] {
+        const char* value = std::getenv("WEBKIT_SNAP_OPPORTUNISTIC_YIELD");
+        return !value || std::strcmp(value, "0");
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
 
 OpportunisticTaskScheduler::OpportunisticTaskScheduler(Page& page)
     : m_page(&page)
     , m_runLoopObserver(makeUniqueRef<RunLoopObserver>(RunLoopObserver::WellKnownOrder::OpportunisticTask, [weakThis = WeakPtr { this }] {
         if (RefPtr protectedThis = weakThis.get())
-            protectedThis->runLoopObserverFired();
-    }, RunLoopObserver::Type::OneShot))
+            protectedThis->runLoopObserverFired(); }, snapOpportunisticYieldEnabled() ? RunLoopObserver::Type::Repeating : RunLoopObserver::Type::OneShot))
 {
 }
 
-OpportunisticTaskScheduler::~OpportunisticTaskScheduler() = default;
+OpportunisticTaskScheduler::~OpportunisticTaskScheduler()
+{
+    cancelPendingTask();
+}
+
+void OpportunisticTaskScheduler::cancelPendingTask()
+{
+#if PLATFORM(WPE) && USE(GLIB_EVENT_LOOP)
+    if (snapOpportunisticYieldEnabled()) {
+        if (m_retryTimer)
+            m_retryTimer->stop();
+        m_runLoopObserver->invalidate();
+        m_currentDeadline = MonotonicTime {};
+    }
+#endif
+}
 
 void OpportunisticTaskScheduler::rescheduleIfNeeded(MonotonicTime deadline)
 {
+    cancelPendingTask();
     RefPtr page = m_page.get();
-    if (page->isWaitingForLoadToFinish() || !page->isVisibleAndActive())
+    if (!page || page->isWaitingForLoadToFinish() || !page->isVisibleAndActive())
         return;
 
     auto hasIdleCallbacks = page->findMatchingLocalDocument([](const Document& document) {
@@ -77,6 +112,9 @@ Ref<ImminentlyScheduledWorkScope> OpportunisticTaskScheduler::makeScheduledWorkS
 void OpportunisticTaskScheduler::runLoopObserverFired()
 {
     constexpr bool verbose = false;
+    auto cancelOnReturn = makeScopeExit([this] {
+        cancelPendingTask();
+    });
 
     if (!m_currentDeadline)
         return;
@@ -121,8 +159,26 @@ void OpportunisticTaskScheduler::runLoopObserverFired()
 
     if (!shouldRunTask) {
         dataLogLnIf(verbose, "[OPPORTUNISTIC TASK] GaveUp: task gets rescheduled ", remainingTime, " ", hasImminentlyScheduledWork(), " ", page->preferredRenderingUpdateInterval(), " ", m_runloopCountAfterBeingScheduled, " signpost:(", JSC::activeJSGlobalObjectSignpostIntervalCount.load(), ")");
-        m_runLoopObserver->invalidate();
-        m_runLoopObserver->schedule();
+#if PLATFORM(WPE) && USE(GLIB_EVENT_LOOP)
+        if (snapOpportunisticYieldEnabled()) {
+            if (!m_retryTimer) {
+                m_retryTimer = makeUnique<RunLoop::Timer>(RunLoop::currentSingleton(), "OpportunisticTaskScheduler::retryTimer"_s, [] { });
+                constexpr auto priority = std::max({ RunLoopSourcePriority::RunLoopDispatcher,
+                                              RunLoopSourcePriority::MainThreadSharedTimer,
+                                              RunLoopSourcePriority::JavascriptTimer,
+                                              RunLoopSourcePriority::AsyncIONetwork })
+                    + 1;
+                m_retryTimer->setPriority(priority);
+            }
+            if (!m_retryTimer->isActive())
+                m_retryTimer->startOneShot(0_ms);
+        } else
+#endif
+        {
+            m_runLoopObserver->invalidate();
+            m_runLoopObserver->schedule();
+        }
+        cancelOnReturn.release();
         return;
     }
 
@@ -133,6 +189,8 @@ void OpportunisticTaskScheduler::runLoopObserverFired()
     };
 
     auto deadline = std::exchange(m_currentDeadline, MonotonicTime { });
+    cancelPendingTask();
+    cancelOnReturn.release();
     page->opportunisticallyRunIdleCallbacks(deadline);
 
     if (!page->settings().opportunisticSweepingAndGarbageCollectionEnabled()) {
@@ -189,7 +247,7 @@ OpportunisticTaskScheduler::FullGCActivityCallback::FullGCActivityCallback(JSC::
 {
 }
 
-// We would like to keep FullGCActivityCallback::doCollection and EdenGCActivityCallback::doCollection separate
+// We would like to keep FullGCActivityCallback::doCollection and SnapGCActivityCallback::doCollection separate
 // since we would like to encode more and more different heuristics for them.
 void OpportunisticTaskScheduler::FullGCActivityCallback::doCollection(JSC::VM& vm)
 {
@@ -223,26 +281,25 @@ void OpportunisticTaskScheduler::FullGCActivityCallback::doCollection(JSC::VM& v
     Base::doCollection(vm);
 }
 
-OpportunisticTaskScheduler::EdenGCActivityCallback::EdenGCActivityCallback(JSC::Heap& heap)
+OpportunisticTaskScheduler::SnapGCActivityCallback::SnapGCActivityCallback(JSC::Heap& heap)
     : Base(heap, JSC::Synchronousness::Sync)
     , m_vm(heap.vm())
     , m_runLoopObserver(makeUniqueRef<RunLoopObserver>(RunLoopObserver::WellKnownOrder::PostRenderingUpdate, [this] {
         JSC::JSLockHolder locker(m_vm);
         m_version = 0;
         m_deferCount = 0;
-        Base::doCollection(m_vm);
-    }, RunLoopObserver::Type::OneShot))
+        Base::doCollection(m_vm); }, RunLoopObserver::Type::OneShot))
 {
 }
 
-void OpportunisticTaskScheduler::EdenGCActivityCallback::doCollection(JSC::VM& vm)
+void OpportunisticTaskScheduler::SnapGCActivityCallback::doCollection(JSC::VM& vm)
 {
     constexpr Seconds delay { 10_ms };
     constexpr unsigned deferCountThreshold = 5;
 
     if (isBusyForTimerBasedGC(vm)) {
-        if (!m_version || m_version != vm.heap.objectSpace().edenVersion()) {
-            m_version = vm.heap.objectSpace().edenVersion();
+        if (!m_version || m_version != vm.heap.objectSpace().snapVersion()) {
+            m_version = vm.heap.objectSpace().snapVersion();
             m_deferCount = 0;
             m_delay = delay;
             setTimeUntilFire(delay);

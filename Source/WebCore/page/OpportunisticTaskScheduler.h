@@ -26,12 +26,14 @@
 #pragma once
 
 #include "RunLoopObserver.h"
-#include <JavaScriptCore/EdenGCActivityCallback.h>
 #include <JavaScriptCore/FullGCActivityCallback.h>
 #include <JavaScriptCore/MarkedSpace.h>
+#include <JavaScriptCore/SnapGCActivityCallback.h>
+#include <memory>
 #include <wtf/CheckedPtr.h>
 #include <wtf/MonotonicTime.h>
 #include <wtf/RefCountedAndCanMakeWeakPtr.h>
+#include <wtf/RunLoop.h>
 #include <wtf/WeakPtr.h>
 
 namespace WebCore {
@@ -89,19 +91,19 @@ public:
         unsigned m_deferCount { 0 };
     };
 
-    class EdenGCActivityCallback final : public JSC::EdenGCActivityCallback {
+    class SnapGCActivityCallback final : public JSC::SnapGCActivityCallback {
     public:
-        using Base = JSC::EdenGCActivityCallback;
+        using Base = JSC::SnapGCActivityCallback;
 
-        static Ref<EdenGCActivityCallback> create(JSC::Heap& heap)
+        static Ref<SnapGCActivityCallback> create(JSC::Heap& heap)
         {
-            return adoptRef(*new EdenGCActivityCallback(heap));
+            return adoptRef(*new SnapGCActivityCallback(heap));
         }
 
         void doCollection(JSC::VM&) final;
 
     private:
-        EdenGCActivityCallback(JSC::Heap&);
+        SnapGCActivityCallback(JSC::Heap&);
 
         JSC::VM& m_vm;
         const UniqueRef<RunLoopObserver> m_runLoopObserver;
@@ -114,6 +116,7 @@ private:
 
     OpportunisticTaskScheduler(Page&);
     void runLoopObserverFired();
+    void cancelPendingTask();
 
     bool isPageInactiveOrLoading() const;
 
@@ -124,6 +127,9 @@ private:
     uint64_t m_runloopCountAfterBeingScheduled { 0 };
     MonotonicTime m_currentDeadline;
     const UniqueRef<RunLoopObserver> m_runLoopObserver;
+#if PLATFORM(WPE) && USE(GLIB_EVENT_LOOP)
+    std::unique_ptr<RunLoop::Timer> m_retryTimer;
+#endif
 };
 
 } // namespace WebCore
