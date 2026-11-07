@@ -440,12 +440,8 @@ std::string ClspvGetCompilerOptions(const CLDeviceVk *device)
     std::string options{""};
     std::vector<std::string> featureMacros;
 
-    cl_uint addressBits;
-    if (IsError(device->getInfoUInt(cl::DeviceInfo::AddressBits, &addressBits)))
-    {
-        // This shouldn't fail here
-        ASSERT(false);
-    }
+    cl_uint addressBits = device->getCaps().addressBits;
+
     options += addressBits == 64 ? " -arch=spir64" : " -arch=spir";
     if (rendererVk->getFeatures().supportsBufferDeviceAddress.enabled)
     {
@@ -456,13 +452,8 @@ std::string ClspvGetCompilerOptions(const CLDeviceVk *device)
     // select SPIR-V version target
     options += " --spv-version=" + GetSpvVersionAsClspvString(device->getSpirvVersion());
 
-    cl_uint nonUniformNDRangeSupport;
-    if (IsError(device->getInfoUInt(cl::DeviceInfo::NonUniformWorkGroupSupport,
-                                    &nonUniformNDRangeSupport)))
-    {
-        // This shouldn't fail here
-        ASSERT(false);
-    }
+    cl_uint nonUniformNDRangeSupport = device->getCaps().nonUniformWorkGroupSupport;
+
     // This "cl-arm-non-uniform-work-group-size" flag is needed to generate region reflection
     // instructions since clspv builtin pass is conditionally dependant on it:
     /*
@@ -544,7 +535,7 @@ std::string ClspvGetCompilerOptions(const CLDeviceVk *device)
     {
         rteModes.push_back("32");
     }
-    if (rendererVk->getFeatures().supportsShaderFloat16.enabled)
+    if (rendererVk->getFeatures().supportsClFp16.enabled)
     {
         options += " --fp16";
         if (rendererVk->getFeatures().supportsRoundingModeRteFp16.enabled)
@@ -552,7 +543,7 @@ std::string ClspvGetCompilerOptions(const CLDeviceVk *device)
             rteModes.push_back("16");
         }
     }
-    if (rendererVk->getFeatures().supportsShaderFloat64.enabled)
+    if (rendererVk->getFeatures().supportsClFp64.enabled)
     {
         options += " --fp64";
         featureMacros.push_back("__opencl_c_fp64");
@@ -756,7 +747,7 @@ bool ClspvParseReflection(vk::Renderer *rendererVk,
                             std::string functionName =
                                 reflectionDataOut.spvStrLookup[instruction.words[6]];
                             uint32_t numArgs = reflectionDataOut.spvIntLookup[instruction.words[7]];
-                            reflectionDataOut.kernelArgsMap[functionName] = CLKernelArguments();
+                            reflectionDataOut.kernelArgsMap[functionName] = ClspvKernelArguments();
                             reflectionDataOut.kernelArgsMap[functionName].resize(numArgs);
 
                             // Store kernel flags and attributes
@@ -785,7 +776,7 @@ bool ClspvParseReflection(vk::Renderer *rendererVk,
                         }
                         case NonSemanticClspvReflectionArgumentInfo:
                         {
-                            CLKernelVk::ArgInfo kernelArgInfo;
+                            ClspvArgumentInfo kernelArgInfo;
                             kernelArgInfo.name =
                                 reflectionDataOut.spvStrLookup[instruction.words[5]];
                             // If instruction has more than 5 instruction operands (minus
@@ -814,10 +805,10 @@ bool ClspvParseReflection(vk::Renderer *rendererVk,
                         case NonSemanticClspvReflectionArgumentPointerUniform:
                         case NonSemanticClspvReflectionArgumentPodStorageBuffer:
                         {
-                            CLKernelArgument kernelArg;
+                            ClspvKernelArgument kernelArg;
                             if (instruction.num_operands == 11)
                             {
-                                const CLKernelVk::ArgInfo &kernelArgInfo =
+                                const ClspvArgumentInfo &kernelArgInfo =
                                     reflectionDataOut.kernelArgInfos[instruction.words[11]];
                                 kernelArg.info.name             = kernelArgInfo.name;
                                 kernelArg.info.typeName         = kernelArgInfo.typeName;
@@ -836,7 +827,7 @@ bool ClspvParseReflection(vk::Renderer *rendererVk,
 
                             if (reflectionDataOut.kernelIDs.contains(instruction.words[5]))
                             {
-                                CLKernelArguments &kernelArgs =
+                                ClspvKernelArguments &kernelArgs =
                                     reflectionDataOut.kernelArgsMap
                                         [reflectionDataOut.spvStrLookup[instruction.words[5]]];
                                 kernelArgs.at(kernelArg.ordinal) = std::move(kernelArg);
@@ -862,10 +853,10 @@ bool ClspvParseReflection(vk::Renderer *rendererVk,
                         case NonSemanticClspvReflectionArgumentPodPushConstant:
                         case NonSemanticClspvReflectionArgumentPointerPushConstant:
                         {
-                            CLKernelArgument kernelArg;
+                            ClspvKernelArgument kernelArg;
                             if (instruction.num_operands == 9)
                             {
-                                const CLKernelVk::ArgInfo &kernelArgInfo =
+                                const ClspvArgumentInfo &kernelArgInfo =
                                     reflectionDataOut.kernelArgInfos[instruction.words[9]];
                                 kernelArg.info.name             = kernelArgInfo.name;
                                 kernelArg.info.typeName         = kernelArgInfo.typeName;
@@ -883,7 +874,7 @@ bool ClspvParseReflection(vk::Renderer *rendererVk,
 
                             if (reflectionDataOut.kernelIDs.contains(instruction.words[5]))
                             {
-                                CLKernelArguments &kernelArgs =
+                                ClspvKernelArguments &kernelArgs =
                                     reflectionDataOut.kernelArgsMap
                                         [reflectionDataOut.spvStrLookup[instruction.words[5]]];
                                 kernelArgs.at(kernelArg.ordinal) = std::move(kernelArg);

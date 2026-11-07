@@ -2,6 +2,7 @@
 <html>
 <head>
 <script src="../../../resources/js-test.js"></script>
+<script src="../../../resources/ui-helper.js"></script>
 <!--
   Touch tests that involve the ontouchstart, ontouchmove, ontouchend or ontouchcancel callbacks
   should be written in an asynchronous fashion so they can be run on mobile platforms like Android.
@@ -106,29 +107,31 @@ function verifyTouch(which) {
     }
 }
 
-function sendTouchSequence()
+async function sendTouchSequence()
 {
     eventSender.mouseMoveTo(22, 25);
     eventSender.mouseDown();
     eventSender.mouseUp();
 
     eventSender.addTouchPoint(22, 25);
-    eventSender.touchStart();
+    await eventSender.asyncTouchStart();
 
     eventSender.releaseTouchPoint(0);
-    eventSender.touchEnd();
+    await eventSender.asyncTouchEnd();
 }
 
+description("This tests pageX and pageY coordinates on touch events and touches.");
+window.jsTestIsAsync = true;
 
-if (window.eventSender) {
-    description("This tests pageX and pageY coordinates on touch events and touches.");
-    window.jsTestIsAsync = true;
+onload = async () => {
+    await UIHelper.renderingComplete();
 
-    lastEvent = null;
-    sendTouchSequence();
-
-} else {
-    debug("This test requires DumpRenderTree.  Tap on the blue rect to log.")
+    if (window.eventSender) {
+        lastEvent = null;
+        await sendTouchSequence();
+    } else {
+        debug("This test requires DumpRenderTree.  Tap on the blue rect to log.")
+    }
 }
 
 

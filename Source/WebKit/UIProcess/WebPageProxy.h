@@ -1880,6 +1880,10 @@ public:
 
     ProcessID NODELETE legacyMainFrameProcessID() const;
 
+    // Grants a process this page's first-party cookie access and records that the process may reference this
+    // page's WebPageProxyIdentifier over IPC. Call this for any process that begins hosting a frame of the page.
+    void addAllowedFirstPartyForCookies(WebProcessProxy&, const WebCore::RegistrableDomain&, LoadedWebArchive, CompletionHandler<void()>&&);
+
     ProcessID gpuProcessID() const;
     ProcessID NODELETE modelProcessID() const;
 
@@ -3479,6 +3483,9 @@ private:
 #endif
     void updateWheelEventActivityAfterProcessSwap();
 
+#if ENABLE(COORDINATED_TOUCH_EVENTS)
+    void processNextQueuedTouchEvent();
+#endif
 #if ENABLE(TOUCH_EVENTS)
     void touchEventHandlingCompleted(IPC::Connection*, std::optional<WebEventType>, bool handled);
     void updateTouchEventTracking(const WebTouchEvent&);

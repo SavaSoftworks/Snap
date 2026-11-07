@@ -1816,15 +1816,15 @@ ANGLED3D11DeviceType GetDeviceType(ID3D11Device *device)
     // Note that this function returns an ANGLED3D11DeviceType rather than a D3D_DRIVER_TYPE value,
     // since it is difficult to tell Software and Reference devices apart
 
-    IDXGIDevice *dxgiDevice   = nullptr;
-    IDXGIAdapter *dxgiAdapter = nullptr;
+    angle::ComPtr<IDXGIDevice> dxgiDevice;
+    angle::ComPtr<IDXGIAdapter> dxgiAdapter;
 
     ANGLED3D11DeviceType retDeviceType = ANGLE_D3D11_DEVICE_TYPE_UNKNOWN;
 
-    HRESULT hr = device->QueryInterface(__uuidof(IDXGIDevice), (void **)&dxgiDevice);
+    HRESULT hr = device->QueryInterface(IID_PPV_ARGS(&dxgiDevice));
     if (SUCCEEDED(hr))
     {
-        hr = dxgiDevice->GetParent(__uuidof(IDXGIAdapter), (void **)&dxgiAdapter);
+        hr = dxgiDevice->GetParent(IID_PPV_ARGS(&dxgiAdapter));
         if (SUCCEEDED(hr))
         {
             DXGI_ADAPTER_DESC adapterDesc;
@@ -1854,17 +1854,16 @@ ANGLED3D11DeviceType GetDeviceType(ID3D11Device *device)
         }
     }
 
-    SafeRelease(dxgiDevice);
-    SafeRelease(dxgiAdapter);
-
     return retDeviceType;
 }
 
 void MakeValidSize(bool isImage,
                    DXGI_FORMAT format,
-                   GLsizei *requestWidth,
-                   GLsizei *requestHeight,
-                   int *levelOffset)
+                   gl::TextureType type,
+                   GLsizei &requestWidth,
+                   GLsizei &requestHeight,
+                   GLsizei &requestDepth,
+                   int &levelOffset)
 {
     const DXGIFormatSize &dxgiFormatInfo = d3d11::GetDXGIFormatSizeInfo(format);
     bool validFormat                     = format != DXGI_FORMAT_UNKNOWN;
@@ -1872,35 +1871,36 @@ void MakeValidSize(bool isImage,
 
     int upsampleCount = 0;
     // Don't expand the size of full textures that are at least (blockWidth x blockHeight) already.
-    if (validImage || *requestWidth < static_cast<GLsizei>(dxgiFormatInfo.blockWidth) ||
-        *requestHeight < static_cast<GLsizei>(dxgiFormatInfo.blockHeight))
+    if (validImage || requestWidth < static_cast<GLsizei>(dxgiFormatInfo.blockWidth) ||
+        requestHeight < static_cast<GLsizei>(dxgiFormatInfo.blockHeight))
     {
-        while (*requestWidth % dxgiFormatInfo.blockWidth != 0 ||
-               *requestHeight % dxgiFormatInfo.blockHeight != 0)
+        while (requestWidth % dxgiFormatInfo.blockWidth != 0 ||
+               requestHeight % dxgiFormatInfo.blockHeight != 0)
         {
-            *requestWidth <<= 1;
-            *requestHeight <<= 1;
+            requestWidth <<= 1;
+            requestHeight <<= 1;
+            if (type == gl::TextureType::_3D)
+            {
+                requestDepth <<= 1;
+            }
             upsampleCount++;
         }
     }
     else if (validFormat)
     {
-        if (*requestWidth % dxgiFormatInfo.blockWidth != 0)
+        if (requestWidth % dxgiFormatInfo.blockWidth != 0)
         {
-            *requestWidth = roundUp(*requestWidth, static_cast<GLsizei>(dxgiFormatInfo.blockWidth));
+            requestWidth = roundUp(requestWidth, static_cast<GLsizei>(dxgiFormatInfo.blockWidth));
         }
 
-        if (*requestHeight % dxgiFormatInfo.blockHeight != 0)
+        if (requestHeight % dxgiFormatInfo.blockHeight != 0)
         {
-            *requestHeight =
-                roundUp(*requestHeight, static_cast<GLsizei>(dxgiFormatInfo.blockHeight));
+            requestHeight =
+                roundUp(requestHeight, static_cast<GLsizei>(dxgiFormatInfo.blockHeight));
         }
     }
 
-    if (levelOffset)
-    {
-        *levelOffset = upsampleCount;
-    }
+    levelOffset = upsampleCount;
 }
 
 angle::Result GenerateInitialTextureData(

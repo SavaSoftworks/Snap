@@ -30,8 +30,11 @@
 #include "AcceleratedSurfaceMessages.h"
 #include "DRMMainDevice.h"
 #include "Display.h"
+#include "DrawingAreaMessages.h"
+#include "DrawingAreaProxy.h"
 #include "HardwareAccelerationManager.h"
 #include "LayerTreeContext.h"
+#include "MessageSenderInlines.h"
 #include "RendererBufferTransportMode.h"
 #include "WebPageProxy.h"
 #include "WebProcessProxy.h"
@@ -282,6 +285,9 @@ void AcceleratedBackingStore::Buffer::paint(cairo_t* cr, const IntRect& clipRect
 
     if (auto* surface = this->surface()) {
         cairo_save(cr);
+        // Clip in widget coordinates, before the flip below, so that only clipRect is painted.
+        cairo_rectangle(cr, clipRect.x(), clipRect.y(), clipRect.width(), clipRect.height());
+        cairo_clip(cr);
 #if USE(GBM)
         if (type() == Type::Gbm) {
             cairo_matrix_t transform;
@@ -289,10 +295,9 @@ void AcceleratedBackingStore::Buffer::paint(cairo_t* cr, const IntRect& clipRect
             cairo_transform(cr, &transform);
         }
 #endif
-        cairo_rectangle(cr, clipRect.x(), clipRect.y(), clipRect.width(), clipRect.height());
         cairo_set_source_surface(cr, surface, 0, 0);
         cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
-        cairo_fill(cr);
+        cairo_paint(cr);
         cairo_restore(cr);
     }
 }
@@ -770,6 +775,14 @@ void AcceleratedBackingStore::frame(uint64_t bufferID, Rects&& damageRects, WTF:
     }
 
     m_pendingBuffer = buffer;
+#if !USE(GTK4)
+    // GTK 3 only paints a window with GL if the window already has a GL context when the frame starts. Creating the
+    // context while painting this buffer would switch the window to GL in the middle of a frame: GDK creates the
+    // EGL window surface but still commits that frame from shared memory, which the compositor rejects when the EGL
+    // surface uses explicit sync (NVIDIA). Create it now, before the frame that paints the buffer.
+    if (buffer->type() == Buffer::Type::EglImage)
+        ensureGLContext();
+#endif
     m_pendingDamageRects = WTF::move(damageRects);
     m_fenceMonitor.addFileDescriptor(WTF::move(renderingFenceFD));
 }
@@ -782,11 +795,23 @@ void AcceleratedBackingStore::frameDone()
 
 void AcceleratedBackingStore::realize()
 {
+    if (!std::exchange(m_needsFrame, false) || m_pendingBuffer)
+        return;
+
+    RefPtr webPage = m_webPage.get();
+    if (!webPage)
+        return;
+
+    if (RefPtr drawingArea = webPage->drawingArea())
+        drawingArea->send(Messages::DrawingArea::DidDiscardBackingStore());
 }
 
 void AcceleratedBackingStore::unrealize()
 {
-    m_committedBuffer = nullptr;
+    if (auto buffer = std::exchange(m_committedBuffer, nullptr)) {
+        m_needsFrame = true;
+        buffer->release();
+    }
 
     if (m_gdkGLContext && m_gdkGLContext.get() == gdk_gl_context_get_current())
         gdk_gl_context_clear_current();

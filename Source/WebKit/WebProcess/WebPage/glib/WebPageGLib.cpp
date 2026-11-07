@@ -225,10 +225,18 @@ static std::optional<InputMethodState> inputMethodStateForElement(Element* eleme
     if (!element || !element->shouldUseInputMethod())
         return std::nullopt;
 
+    if (auto* textControl = dynamicDowncast<HTMLTextFormControlElement>(*element); textControl && textControl->isReadOnly())
+        return std::nullopt;
+
     InputMethodState state;
     if (is<HTMLInputElement>(*element)) {
         auto& inputElement = downcast<HTMLInputElement>(*element);
         state.setPurposeForInputElement(inputElement);
+        // A missing inputmode attribute keeps the purpose derived from the type. A password
+        // field keeps its purpose too, because the state has no way to say "secret" separately.
+        auto inputMode = inputElement.canonicalInputMode();
+        if (inputMode == InputMode::None || (inputMode != InputMode::Unspecified && !inputElement.isPasswordField()))
+            state.setPurposeOrHintForInputMode(inputMode);
 #if ENABLE(AUTOCAPITALIZE)
         state.addHintsForAutocapitalizeType(inputElement.autocapitalizeType());
 #endif
@@ -258,6 +266,14 @@ void WebPage::setInputMethodState(Element* element)
 
     m_inputMethodState = state;
     send(Messages::WebPageProxy::SetInputMethodState(state));
+}
+
+void WebPage::focusedElementDidChangeReadOnly(Element& element)
+{
+    if (m_focusedElement != &element)
+        return;
+
+    setInputMethodState(&element);
 }
 
 String WebPage::platformUserAgent(const URL& url) const

@@ -643,7 +643,7 @@ void ANGLEPerfTest::processResults()
             GLuint64 sum =
                 std::accumulate(samples.begin(), samples.end(), static_cast<GLuint64>(0));
 
-            std::string sumName = "." + counterName + "_max";
+            std::string sumName = "." + counterName + "_sum";
             recordIntegerMetric(sumName.c_str(), static_cast<size_t>(sum), "count");
             addHistogramSample(sumName.c_str(), static_cast<double>(sum), "count");
         }
@@ -1566,7 +1566,7 @@ GLWindowBase *ANGLERenderTest::getGLWindow()
 
 void ANGLERenderTest::skipTestIfMissingExtensionPrerequisites()
 {
-    for (std::string extension : mExtensionPrerequisites)
+    for (const std::string &extension : mExtensionPrerequisites)
     {
         if (!CheckExtensionExists(reinterpret_cast<const char *>(glGetString(GL_EXTENSIONS)),
                                   extension))

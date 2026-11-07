@@ -12,7 +12,7 @@
 
 #include "libANGLE/renderer/d3d/d3d11/NativeWindow11.h"
 
-#include <DispatcherQueue.h>
+#include <dispatcherqueue.h>
 #include <windows.foundation.metadata.h>
 #include <windows.ui.composition.h>
 #include <windows.ui.composition.interop.h>
@@ -88,7 +88,7 @@ class CompositorNativeWindow11 : public NativeWindow11
                             UINT width,
                             UINT height,
                             UINT samples,
-                            IDXGISwapChain **swapChain) override;
+                            angle::ComPtr<IDXGISwapChain> *swapChain) override;
 
     void commitChange() override;
 

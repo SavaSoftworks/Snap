@@ -294,7 +294,7 @@ static void bindPulse(Vector<CString>& args)
     if (pulseServer) {
         auto pulseServerString = CStringView::unsafeFromUTF8(pulseServer);
         if (startsWith(pulseServerString.span(), "unix:"_s))
-            bindIfExists(args, CStringView::fromUTF8(pulseServerString.span().subspan(5)), BindFlags::ReadWrite);
+            bindIfExists(args, CStringView::fromUTF8(pulseServerString.spanIncludingNullTerminator().subspan(5)), BindFlags::ReadWrite);
         // else it uses tcp
     } else {
         const char* runtimeDir = g_get_user_runtime_dir();
@@ -483,6 +483,8 @@ static void bindOpenGL(Vector<CString>& args)
         // Adreno
         "--dev-bind-try", "/dev/kgsl-3d0", "/dev/kgsl-3d0",
         "--dev-bind-try", "/dev/ion", "/dev/ion",
+        // WSL2 (Mesa d3d12)
+        "--dev-bind-try", "/dev/dxg", "/dev/dxg",
 #if PLATFORM(WPE)
         "--dev-bind-try", "/dev/fb0", "/dev/fb0",
         "--dev-bind-try", "/dev/fb1", "/dev/fb1",
@@ -760,7 +762,7 @@ static std::optional<CString> directoryContainingDBusSocket(const char* dbusAddr
     if (!dbusAddressString.startsWith("unix:"_s))
         return std::nullopt;
 
-    if (auto pathStart = dbusAddressString.find("path="_s)) {
+    if (auto pathStart = dbusAddressString.find("path="_s); pathStart != notFound) {
         pathStart += strlen("path=");
 
         auto pathEnd = dbusAddressString.find(',', pathStart);

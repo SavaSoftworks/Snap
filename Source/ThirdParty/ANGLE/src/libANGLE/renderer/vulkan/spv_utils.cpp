@@ -770,10 +770,8 @@ void AssignInterfaceBlockBindings(const SpvSourceOptions &options,
                                   SpvProgramInterfaceInfo *programInterfaceInfo,
                                   ShaderInterfaceVariableInfoMap *variableInfoMapOut)
 {
-    for (uint32_t blockIndex = 0; blockIndex < blocks.size(); ++blockIndex)
+    for (const gl::InterfaceBlock &block : blocks)
     {
-        const gl::InterfaceBlock &block = blocks[blockIndex];
-
         // TODO: http://anglebug.com/42263134: All blocks should be active
         const gl::ShaderBitSet activeShaders =
             programExecutable.getLinkedShaderStages() & block.activeShaders();
@@ -1856,8 +1854,8 @@ class SpirvTransformFeedbackCodeGenerator final : angle::NonCopyable
                                GLenum componentType,
                                spirv::Blob *blobOut);
 
-    static constexpr size_t kXfbDecorationCount                           = 3;
-    static constexpr spv::Decoration kXfbDecorations[kXfbDecorationCount] = {
+    static constexpr size_t kXfbDecorationCount                                       = 3;
+    static constexpr std::array<spv::Decoration, kXfbDecorationCount> kXfbDecorations = {
         spv::DecorationXfbBuffer,
         spv::DecorationXfbStride,
         spv::DecorationOffset,
@@ -1909,8 +1907,8 @@ class SpirvTransformFeedbackCodeGenerator final : angle::NonCopyable
     gl::TransformFeedbackBuffersArray<std::vector<XfbVarying>> mXfbVaryings;
 };
 
-constexpr size_t SpirvTransformFeedbackCodeGenerator::kXfbDecorationCount;
-constexpr spv::Decoration SpirvTransformFeedbackCodeGenerator::kXfbDecorations[kXfbDecorationCount];
+constexpr std::array<spv::Decoration, SpirvTransformFeedbackCodeGenerator::kXfbDecorationCount>
+    SpirvTransformFeedbackCodeGenerator::kXfbDecorations;
 
 void SpirvTransformFeedbackCodeGenerator::visitVariable(const ShaderInterfaceVariableInfo &info,
                                                         const XFBInterfaceVariableInfo &xfbInfo,
@@ -2401,9 +2399,8 @@ void SpirvTransformFeedbackCodeGenerator::writeTransformFeedbackEmulationOutput(
 
         // Go over the varyings of this buffer in order.
         const std::vector<XfbVarying> &varyings = mXfbVaryings[bufferIndex];
-        for (size_t varyingIndex = 0; varyingIndex < varyings.size(); ++varyingIndex)
+        for (const XfbVarying &varying : varyings)
         {
-            const XfbVarying &varying                  = varyings[varyingIndex];
             const ShaderInterfaceVariableXfbInfo *info = varying.info;
             ASSERT(info->pod.buffer == bufferIndex);
 
@@ -2655,7 +2652,7 @@ void SpirvTransformFeedbackCodeGenerator::addMemberDecorate(const XFBInterfaceVa
         for (size_t i = 0; i < kXfbDecorationCount; ++i)
         {
             spirv::WriteMemberDecorate(blobOut, id, spirv::LiteralInteger(fieldIndex),
-                                       ANGLE_UNSAFE_TODO(kXfbDecorations[i]),
+                                       kXfbDecorations[i],
                                        {spirv::LiteralInteger(xfbDecorationValues[i])});
         }
     }
@@ -2686,7 +2683,7 @@ void SpirvTransformFeedbackCodeGenerator::addDecorate(const XFBInterfaceVariable
     //     OpDecorate %id Offset xfb.offset
     for (size_t i = 0; i < kXfbDecorationCount; ++i)
     {
-        spirv::WriteDecorate(blobOut, id, ANGLE_UNSAFE_TODO(kXfbDecorations[i]),
+        spirv::WriteDecorate(blobOut, id, kXfbDecorations[i],
                              {spirv::LiteralInteger(xfbDecorationValues[i])});
     }
 }
@@ -6099,10 +6096,9 @@ void SpvAssignTransformFeedbackLocations(gl::ShaderType shaderType,
 
     if (isTransformFeedbackStage)
     {
-        for (uint32_t varyingIndex = 0; varyingIndex < tfVaryings.size(); ++varyingIndex)
+        for (const gl::TransformFeedbackVarying &tfVarying : tfVaryings)
         {
-            const gl::TransformFeedbackVarying &tfVarying = tfVaryings[varyingIndex];
-            const std::string &tfVaryingName              = tfVarying.name;
+            const std::string &tfVaryingName = tfVarying.name;
 
             if (tfVaryingName == "gl_Position")
             {

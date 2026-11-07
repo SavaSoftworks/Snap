@@ -190,6 +190,7 @@ int main(int argc, char *argv[])
                                 break;
                             case 'h':
                                 output = SH_HLSL_4_1_OUTPUT;
+                                compileOptions.removeInactiveVariables = true;
                                 break;
                             case 'm':
                                 output = SH_MSL_METAL_OUTPUT;
@@ -906,9 +907,9 @@ static bool ReadShaderSource(const char *fileName, ShaderSource &source)
 
 static void FreeShaderSource(ShaderSource &source)
 {
-    for (ShaderSource::size_type i = 0; i < source.size(); ++i)
+    for (char *shader : source)
     {
-        delete[] source[i];
+        delete[] shader;
     }
     source.clear();
 }

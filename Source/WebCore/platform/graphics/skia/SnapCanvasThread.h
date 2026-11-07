@@ -400,6 +400,7 @@ public:
             budget.condition.notifyAll();
         }
         m_queue->dispatchSync([this] {
+            PlatformDisplay::makeSkiaGLContextCurrentIfExists();
             liveStates().remove(this);
             m_lossHandler = nullptr;
             m_surface = nullptr;

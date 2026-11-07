@@ -1964,12 +1964,13 @@ void main()
     color = vec4(float(gl_LastFragStencilARM)/255.0, gl_LastFragDepthARM, 0, 1);
 })";
 
-        GLRenderbuffer color[4], depthStencil;
+        std::array<GLRenderbuffer, kMaxColorBuffer> color;
+        GLRenderbuffer depthStencil;
         GLFramebuffer fbo;
 
         stateReset();
         // Create FBO with depth/stencil
-        createFboWithDepthStencilAndMRT(1, 1, 0, depthStencilFormat, &fbo, color, &depthStencil);
+        createFboWithDepthStencilAndMRT(1, 1, 0, depthStencilFormat, &fbo, &color, &depthStencil);
         ANGLE_GL_PROGRAM(program, essl31_shaders::vs::Passthrough(), kFS);
         ASSERT_GL_NO_ERROR();
 
@@ -2109,17 +2110,17 @@ void main()
                                          int samples,
                                          GLenum depthStencilFormat,
                                          GLFramebuffer *fbo,
-                                         GLRenderbuffer *color,
+                                         std::array<GLRenderbuffer, kMaxColorBuffer> *color,
                                          GLRenderbuffer *depthStencil)
     {
         glBindFramebuffer(GL_FRAMEBUFFER, *fbo);
         ASSERT_GL_NO_ERROR();
         for (GLuint i = 0; i < kMaxColorBuffer; ++i)
         {
-            glBindRenderbuffer(GL_RENDERBUFFER, ANGLE_UNSAFE_TODO(color[i]));
+            glBindRenderbuffer(GL_RENDERBUFFER, (*color)[i]);
             glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples, GL_RGBA8, width, height);
             glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_RENDERBUFFER,
-                                      ANGLE_UNSAFE_TODO(color[i]));
+                                      (*color)[i]);
             ASSERT_GL_NO_ERROR();
         }
         glBindRenderbuffer(GL_RENDERBUFFER, *depthStencil);
@@ -5567,14 +5568,15 @@ TEST_P(FramebufferFetchES31, DrawFetchPerFragmentAndWriteOut_ARM)
     for (auto depthStencilFormat : kDSFormat)
     {
         GLFramebuffer fbo, resolveFbo;
-        GLRenderbuffer color[kMaxColorBuffer], depthStencil, resolve;
+        std::array<GLRenderbuffer, kMaxColorBuffer> color;
+        GLRenderbuffer depthStencil, resolve;
 
         bindResolveFboAndVerify(&resolve, &resolveFbo, kViewportWidth, kViewportHeight, false,
                                 false, &fbo, depthStencilFormat);
 
         stateReset();
         createFboWithDepthStencilAndMRT(kViewportWidth, kViewportHeight, 0, depthStencilFormat,
-                                        &fbo, color, &depthStencil);
+                                        &fbo, &color, &depthStencil);
         ASSERT_GL_NO_ERROR();
 
         ANGLE_GL_PROGRAM(programDS, essl31_shaders::vs::Passthrough(),
@@ -5614,12 +5616,13 @@ void main()
 })";
 
     GLFramebuffer fbo, resolveFbo;
-    GLRenderbuffer color[kMaxColorBuffer], depthStencil, resolve;
+    std::array<GLRenderbuffer, kMaxColorBuffer> color;
+    GLRenderbuffer depthStencil, resolve;
 
     bindResolveFboAndVerify(&resolve, &resolveFbo, 2, 2, false, true, &fbo, GL_DEPTH_COMPONENT24);
 
     stateReset();
-    createFboWithDepthStencilAndMRT(2, 2, 0, GL_DEPTH_COMPONENT24, &fbo, color, &depthStencil);
+    createFboWithDepthStencilAndMRT(2, 2, 0, GL_DEPTH_COMPONENT24, &fbo, &color, &depthStencil);
     ASSERT_GL_NO_ERROR();
 
     ANGLE_GL_PROGRAM(programColorDiscard, essl31_shaders::vs::Passthrough(), colorDiscard);
@@ -5648,14 +5651,15 @@ TEST_P(FramebufferFetchES31, DrawFetchPerFragmentAndWriteOutWithMultisample_ARM)
             }
 
             GLFramebuffer fbo, resolveFbo;
-            GLRenderbuffer color[kMaxColorBuffer], depthStencil, resolve;
+            std::array<GLRenderbuffer, kMaxColorBuffer> color;
+            GLRenderbuffer depthStencil, resolve;
 
             bindResolveFboAndVerify(&resolve, &resolveFbo, kViewportWidth, kViewportHeight, false,
                                     false, &fbo, depthStencilFormat);
 
             stateReset();
             createFboWithDepthStencilAndMRT(kViewportWidth, kViewportHeight, samples,
-                                            depthStencilFormat, &fbo, color, &depthStencil);
+                                            depthStencilFormat, &fbo, &color, &depthStencil);
             ASSERT_GL_NO_ERROR();
 
             ANGLE_GL_PROGRAM(programDS, essl31_shaders::vs::Passthrough(),
@@ -5688,14 +5692,15 @@ TEST_P(FramebufferFetchES31, DrawFetchPerSampleAndWriteOutWithMultisample_ARM)
             }
 
             GLFramebuffer fbo, resolveFbo;
-            GLRenderbuffer color[kMaxColorBuffer], depthStencil, resolve;
+            std::array<GLRenderbuffer, kMaxColorBuffer> color;
+            GLRenderbuffer depthStencil, resolve;
 
             bindResolveFboAndVerify(&resolve, &resolveFbo, kViewportWidth, kViewportHeight, false,
                                     false, &fbo, depthStencilFormat);
 
             stateReset();
             createFboWithDepthStencilAndMRT(kViewportWidth, kViewportHeight, samples,
-                                            depthStencilFormat, &fbo, color, &depthStencil);
+                                            depthStencilFormat, &fbo, &color, &depthStencil);
             ASSERT_GL_NO_ERROR();
 
             ANGLE_GL_PROGRAM(programDS, essl31_shaders::vs::Passthrough(),
@@ -5743,13 +5748,14 @@ void main()
         }
 
         GLFramebuffer fbo, resolveFbo;
-        GLRenderbuffer color[kMaxColorBuffer], depthStencil, resolve;
+        std::array<GLRenderbuffer, kMaxColorBuffer> color;
+        GLRenderbuffer depthStencil, resolve;
 
         bindResolveFboAndVerify(&resolve, &resolveFbo, 2, 2, false, true, &fbo,
                                 GL_DEPTH_COMPONENT24);
 
         stateReset();
-        createFboWithDepthStencilAndMRT(2, 2, samples, GL_DEPTH_COMPONENT24, &fbo, color,
+        createFboWithDepthStencilAndMRT(2, 2, samples, GL_DEPTH_COMPONENT24, &fbo, &color,
                                         &depthStencil);
         ASSERT_GL_NO_ERROR();
 
@@ -5796,13 +5802,14 @@ void main()
         }
 
         GLFramebuffer fbo, resolveFbo;
-        GLRenderbuffer color[kMaxColorBuffer], depthStencil, resolve;
+        std::array<GLRenderbuffer, kMaxColorBuffer> color;
+        GLRenderbuffer depthStencil, resolve;
 
         bindResolveFboAndVerify(&resolve, &resolveFbo, 2, 2, false, true, &fbo,
                                 GL_DEPTH_COMPONENT24);
 
         stateReset();
-        createFboWithDepthStencilAndMRT(2, 2, samples, GL_DEPTH_COMPONENT24, &fbo, color,
+        createFboWithDepthStencilAndMRT(2, 2, samples, GL_DEPTH_COMPONENT24, &fbo, &color,
                                         &depthStencil);
         ASSERT_GL_NO_ERROR();
 

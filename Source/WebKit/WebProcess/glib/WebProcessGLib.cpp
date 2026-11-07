@@ -50,6 +50,7 @@
 
 #include <WebCore/ApplicationGLib.h>
 #include <WebCore/MemoryCache.h>
+#include <wtf/SetForScope.h>
 
 #if USE(WPE_RENDERER)
 #include <WebCore/PlatformDisplayLibWPE.h>
@@ -83,7 +84,7 @@
 #endif
 
 #if OS(LINUX)
-#include <wtf/linux/RealTimeThreads.h>
+#include <wtf/linux/HighPriorityThreads.h>
 #endif
 
 #if USE(ATSPI)
@@ -105,6 +106,11 @@ using namespace WebCore;
 
 void WebProcess::stopRunLoop()
 {
+    // Closing the last page terminates the process, which calls back here.
+    if (m_isStoppingRunLoop)
+        return;
+    SetForScope isStoppingRunLoop(m_isStoppingRunLoop, true);
+
     // Pages are normally closed after Close message is received from the UI
     // process, but it can happen that the connection is closed before the
     // Close message is processed because the UI process close the socket
@@ -114,8 +120,7 @@ void WebProcess::stopRunLoop()
     for (auto& webPage : copyToVector(m_pageMap.values()))
         webPage->close([] { });
 
-    if (auto* display = PlatformDisplay::sharedDisplayIfExists())
-        display->clearGLContexts();
+    PlatformDisplay::destroySharedDisplay();
 
 #if USE(ATSPI)
     AccessibilityAtspi::singleton().disconnect();
@@ -132,8 +137,8 @@ void WebProcess::platformSetCacheModel(CacheModel cacheModel)
 void WebProcess::platformInitializeProcess(const AuxiliaryProcessInitializationParameters&)
 {
 #if OS(LINUX)
-    // Disable RealTimeThreads in WebProcess initially, since it depends on having a visible web page.
-    RealTimeThreads::singleton().setEnabled(false);
+    // Disable HighPriorityThreads in WebProcess initially, since it depends on having a visible web page.
+    HighPriorityThreads::singleton().setEnabled(false);
 #endif
 
     addSupplementWithoutRefCountedCheck<SystemSettingsManager>();

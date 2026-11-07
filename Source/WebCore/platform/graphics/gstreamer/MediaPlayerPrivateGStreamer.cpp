@@ -2711,7 +2711,7 @@ void MediaPlayerPrivateGStreamer::configureParsebin(GstElement* parsebin)
             static auto skipAutoPlug = *gstGetAutoplugSelectResult("skip"_s);
 
             auto name = StringView::fromLatin1(gst_plugin_feature_get_name(GST_PLUGIN_FEATURE_CAST(factory)));
-            if (name == "webkitthunderparser"_s && player->m_url.protocolIsBlob())
+            if (name == "webkitthunderparser"_s && !player->isMediaSource())
                 return skipAutoPlug;
 
             auto* structure = gst_caps_get_structure(caps, 0);
@@ -2806,7 +2806,7 @@ void MediaPlayerPrivateGStreamer::configureElement(GstElement* element)
     // mode. Some demuxers (matroskademux) don't work as well in push mode.
     if (startsWith(name.span(), "urisourcebin"_s) && !m_isLegacyPlaybin && m_preload == MediaPlayer::Preload::Auto) {
         if (isBlob)
-            g_object_set(element, "ring-buffer-max-size", 2 * MB, nullptr);
+            g_object_set(element, "ring-buffer-max-size", static_cast<guint64>(2 * MB), nullptr);
         else if (!isMediaSource() && !isMediaStreamPlayer())
             g_object_set(element, "download", TRUE, nullptr);
     }
@@ -4256,8 +4256,10 @@ void MediaPlayerPrivateGStreamer::managePlayerSuspend()
         GstState actualState = pendingState != GST_STATE_VOID_PENDING ? pendingState : currentState;
         m_isSuspended = true;
         auto targetState = suspendTargetState();
-        if (actualState == targetState) {
-            GST_DEBUG_OBJECT(pipeline(), "Pipeline is already in %s state, no need to suspend playback.", gst_state_get_name(actualState));
+        // Suspending must never raise the state: an MSE pipeline still in GST_STATE_NULL has no URI yet,
+        // so setting it to GST_STATE_PAUSED fails and breaks the later preroll.
+        if (actualState <= targetState) {
+            GST_DEBUG_OBJECT(pipeline(), "Pipeline is in %s state, no need to suspend playback.", gst_state_get_name(actualState));
             return;
         }
         m_stateToResume = actualState;

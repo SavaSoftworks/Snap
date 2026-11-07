@@ -34,6 +34,7 @@
 #include "FloatPoint3D.h"
 #include "FloatRect.h"
 #include "FloatRoundedRect.h"
+#include "IntRect.h"
 #include "IntSize.h"
 #include "SkiaCompositingLayer3DRenderingContext.h"
 #include "SkiaCompositingLayerImageSetBatch.h"
@@ -44,7 +45,9 @@
 WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_BEGIN
 #include <skia/core/SkCanvas.h>
 #include <skia/core/SkColorFilter.h>
+#include <skia/core/SkImage.h>
 #include <skia/core/SkM44.h>
+#include <skia/core/SkMatrix.h>
 #include <skia/core/SkPath.h>
 #include <skia/effects/SkImageFilters.h>
 WTF_IGNORE_WARNINGS_IN_THIRD_PARTY_CODE_END
@@ -61,6 +64,9 @@ class CoordinatedImageBackingStore;
 class CoordinatedPlatformLayerBuffer;
 class FilterOperations;
 class SkiaBackingStore;
+
+enum class FilterSurfaceAlignment : bool { LocalCoordinates, DevicePixels };
+enum class ShouldReuseFilteredBackdrop : bool { No, Yes };
 
 class SkiaCompositingLayer final : public RefCountedAndCanMakeWeakPtr<SkiaCompositingLayer> {
     WTF_MAKE_TZONE_ALLOCATED(SkiaCompositingLayer);
@@ -180,6 +186,12 @@ private:
     };
 #endif
 
+    struct FilteredImage {
+        sk_sp<SkImage> image;
+        SkIRect subset;
+        SkIPoint offset;
+    };
+
     // The damage-collecting walk gathers damage and draws nothing. The painting walk is the reverse.
     struct PaintContext {
 #if ENABLE(DAMAGE_TRACKING)
@@ -199,17 +211,53 @@ private:
         const SkiaDamageRegion* damageRegionOrNull() const { return compositingDamageRegion ? &*compositingDamageRegion : nullptr; }
         float opacity { 1 };
         std::optional<SkBlendMode> blendMode;
-        IntSize offset;
         sk_sp<SkColorFilter> colorFilter;
         TransformationMatrix accumulatedReplicaTransform;
         RefPtr<SkiaCompositingLayer> paintingBackdropForLayer;
         bool skipAfterBackdrop { false };
         SkiaCompositingLayerImageSetBatch imageSetBatch;
+
+        // Painting a backdrop walks the backdrop root's subtree, which reaches the earlier backdrop-filter
+        // layers again. Keep their filtered backdrops for the rest of the frame instead of filtering them again.
+        struct FilteredBackdrop {
+            struct Key {
+                const SkiaCompositingLayer* layer { nullptr };
+                TransformationMatrix layerTransform;
+                SkMatrix layerToScaled;
+                FloatRect localBounds;
+                IntRect outputRect;
+
+                bool operator==(const Key&) const = default;
+            };
+
+            Key key;
+            FilteredImage filtered;
+        };
+        Vector<FilteredBackdrop> filteredBackdrops;
     };
 
     struct Filter {
         sk_sp<SkImageFilter> filter;
         IntOutsets outsets;
+    };
+
+    enum class IncludesReplica : bool { No, Yes };
+    enum class IncludesFilterOutsets : bool { No, Yes };
+
+    struct AnimationsState {
+        std::optional<TransformationMatrix> transform;
+        std::optional<TransformationMatrix> futureTransform;
+        std::optional<float> opacity;
+        std::optional<Filter> filter;
+        std::optional<FilterOperations> filterOperations;
+        bool isRunning { false };
+    };
+
+    struct DebugBorder {
+        Color color;
+        float width { 0 };
+
+        friend bool operator==(const DebugBorder&, const DebugBorder&) = default;
     };
     using PaintFunction = Function<void(SkCanvas&, PaintContext&)>;
 
@@ -230,24 +278,24 @@ private:
     void addGroupDamage(SkCanvas&, PaintContext&, const Vector<IntRect, 1>& overlapRects);
     static void resolveBackdropDamage(const Vector<FloatRect>& backdropRectsInFrame, Damage&);
 #endif
+    bool stopPaintingIntoBackdropIfNeeded(PaintContext&);
     void paintSelfAndChildren(SkCanvas&, PaintContext&);
     void paintWithIntermediateSurface(SkCanvas&, PaintContext&, const IntRect&, SkPaint*, PaintFunction&&);
+    void paintWithFilter(SkCanvas&, PaintContext&, const TransformationMatrix& layerTransform, const TransformationMatrix& inverseLayerTransform, const FloatRect& localBounds, const SkPaint&, FilterSurfaceAlignment, PaintFunction&&, ShouldReuseFilteredBackdrop = ShouldReuseFilteredBackdrop::No);
+    FloatSize filterSurfaceScale(const PaintContext&) const;
     void paintWith3DRenderingContext(SkCanvas&, PaintContext&);
     void paintBackdrop(SkCanvas&, PaintContext&);
     Vector<IntRect, 1> computeConsolidatedOverlapRegionRects(const SkCanvas&, const PaintContext&, ComputeOverlapRegionMode);
     TransformationMatrix replicaTransform() const;
     TransformationMatrix combinedTransform(const PaintContext&) const;
-    IntRect clipBounds(const SkCanvas&, const PaintContext&) const;
     sk_sp<SkImage> maskImage();
-    FloatPolygon3D geometryFor3DRenderingContext() const;
+    Polygon4D geometryFor3DRenderingContext() const;
     FloatRect transformedFlattenedBounds() const;
     void collect3DRenderingContextLayers(Vector<SkiaCompositingLayer3DRenderingContext::Layer>&);
     void recursiveCleanUpAfterPaint();
 
     void clipRect(SkCanvas&, const FloatRoundedRect&, const TransformationMatrix& = { });
-
-    enum class IncludesReplica : bool { No, Yes };
-    void computeOverlapRegions(ComputeOverlapRegionData&, const TransformationMatrix& accumulatedReplicaTransform, IncludesReplica = IncludesReplica::Yes);
+    void computeOverlapRegions(ComputeOverlapRegionData&, const TransformationMatrix& accumulatedReplicaTransform, IncludesReplica = IncludesReplica::Yes, IncludesFilterOutsets = IncludesFilterOutsets::Yes);
 
     void damageWholeLayer()
     {
@@ -272,16 +320,10 @@ private:
 #if ENABLE(DAMAGE_TRACKING)
     bool damagePropagationEnabled() const { return m_damagePropagationEnabled; }
     bool hasLayerDamage() const { return m_layerDamage && !m_layerDamage->isEmpty(); }
+    bool hasGroupPropertyDamage() const;
+    bool hasDamageInSubtree() const;
     void trackLayerRect(PaintContext&, const FloatRect& layerRectInFrame);
 #endif
-
-    struct AnimationsState {
-        std::optional<TransformationMatrix> transform;
-        std::optional<TransformationMatrix> futureTransform;
-        std::optional<float> opacity;
-        std::optional<Filter> filter;
-        bool isRunning { false };
-    };
     std::optional<AnimationsState> syncAnimations(MonotonicTime);
 
     const TransformationMatrix& localTransform() const;
@@ -289,13 +331,7 @@ private:
     float opacity() const;
     float opacityForAnimationsState(const AnimationsState*) const;
     const std::optional<Filter> filter() const;
-
-    struct DebugBorder {
-        Color color;
-        float width { 0 };
-
-        friend bool operator==(const DebugBorder&, const DebugBorder&) = default;
-    };
+    IntOutsets unclippedFilterOutsets() const;
 
     Vector<Ref<SkiaCompositingLayer>> m_children;
     WeakPtr<SkiaCompositingLayer> m_parent;

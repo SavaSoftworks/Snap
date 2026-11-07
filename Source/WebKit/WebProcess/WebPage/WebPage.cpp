@@ -4411,6 +4411,17 @@ void WebPage::touchEvent(const WebTouchEvent& touchEvent, CompletionHandler<void
 }
 #endif
 
+#if ENABLE(COORDINATED_TOUCH_EVENTS)
+bool WebPage::dispatchTouchEvent(const WebTouchEvent& event)
+{
+    bool result = false;
+    touchEvent(event, [&](std::optional<WebEventType>, bool handled) {
+        result = handled;
+    });
+    return result;
+}
+#endif
+
 void WebPage::cancelPointer(WebCore::PointerID pointerId, const WebCore::IntPoint& documentPoint)
 {
     m_page->pointerCaptureController().cancelPointer(pointerId, documentPoint);
@@ -7550,13 +7561,18 @@ void WebPage::deleteSurrounding(int64_t offset, unsigned characterCount)
         return;
 
     auto selectionStart = selection.visibleStart();
-    auto surroundingRange = makeSimpleRange(startOfEditableContent(selectionStart), selectionStart);
-    if (!surroundingRange)
+    auto surroundingStart = startOfEditableContent(selectionStart);
+    auto surroundingRange = makeSimpleRange(surroundingStart, endOfEditableContent(selectionStart));
+    auto cursorPositionRange = makeSimpleRange(surroundingStart, selectionStart);
+    if (!surroundingRange || !cursorPositionRange)
         return;
 
-    Ref rootNode = surroundingRange->start.container->treeScope().rootNode();
-    auto characterRange = WebCore::CharacterRange(WebCore::characterCount(*surroundingRange) + offset, characterCount);
-    auto selectionRange = resolveCharacterRange(makeRangeSelectingNodeContents(rootNode), characterRange);
+    auto cursorPosition = WebCore::characterCount(*cursorPositionRange);
+    if (offset < -static_cast<int64_t>(cursorPosition))
+        return;
+
+    auto characterRange = WebCore::CharacterRange(cursorPosition + offset, characterCount);
+    auto selectionRange = resolveCharacterRange(*surroundingRange, characterRange);
 
     targetFrame->editor().setIgnoreSelectionChanges(true);
     protect(targetFrame->selection())->setSelection(VisibleSelection(selectionRange));
@@ -7892,22 +7908,23 @@ void WebPage::focusedElementDidChangeInputMode(WebCore::Element& element, WebCor
         return;
 
     send(Messages::WebPageProxy::FocusedElementDidChangeInputMode(mode));
+#elif PLATFORM(GTK) || PLATFORM(WPE)
+    UNUSED_PARAM(mode);
+    setInputMethodState(&element);
 #else
     UNUSED_PARAM(mode);
 #endif
 }
 
+#if PLATFORM(IOS_FAMILY)
 void WebPage::focusedSelectElementDidChangeOptions(const WebCore::HTMLSelectElement& element)
 {
-#if PLATFORM(IOS_FAMILY)
     if (m_focusedElement != &element)
         return;
 
     m_updateFocusedElementInformationTimer.restart();
-#else
-    UNUSED_PARAM(element);
-#endif
 }
+#endif
 
 void WebPage::didUpdateComposition()
 {
@@ -8888,10 +8905,8 @@ void WebPage::stopAllURLSchemeTasks()
 void WebPage::registerURLSchemeHandler(WebURLSchemeHandlerIdentifier handlerIdentifier, const String& scheme)
 {
     WEBPAGE_RELEASE_LOG(Process, "registerURLSchemeHandler: Registered handler %" PRIu64 " for the '%s' scheme", handlerIdentifier.toUInt64(), scheme.utf8().data());
-
     WebCore::LegacySchemeRegistry::registerURLSchemeAsHandledBySchemeHandler(scheme);
-    WebProcess::singleton().registerURLSchemeAsCORSEnabled(scheme);
-
+    WebCore::LegacySchemeRegistry::registerURLSchemeAsCORSEnabled(scheme);
     auto schemeResult = m_schemeToURLSchemeHandlerProxyMap.add(scheme, WebURLSchemeHandlerProxy::create(*this, handlerIdentifier));
     m_identifierToURLSchemeHandlerProxyMap.add(handlerIdentifier, Ref { schemeResult.iterator->value }.get());
 }

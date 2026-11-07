@@ -1670,6 +1670,12 @@ struct FeaturesVk : FeatureSetBase
         &members,
     };
 
+    FeatureInfo simulateTileMemoryTransferSrcForTesting = {
+        "simulateTileMemoryTransferSrcForTesting",
+        FeatureCategory::VulkanFeatures,
+        &members,
+    };
+
     FeatureInfo supportsClKhrSubgroups = {
         "supportsClKhrSubgroups",
         FeatureCategory::VulkanFeatures,
@@ -1709,6 +1715,30 @@ struct FeaturesVk : FeatureSetBase
     FeatureInfo enableAlphaChannelImages = {
         "enableAlphaChannelImages",
         FeatureCategory::VulkanWorkarounds,
+        &members,
+    };
+
+    FeatureInfo preferPrecomputedVertexTransform = {
+        "preferPrecomputedVertexTransform",
+        FeatureCategory::VulkanFeatures,
+        &members,
+    };
+
+    FeatureInfo debugSupportsClFp64 = {
+        "debugSupportsClFp64",
+        FeatureCategory::VulkanFeatures,
+        &members,
+    };
+
+    FeatureInfo supportsClFp16 = {
+        "supportsClFp16",
+        FeatureCategory::VulkanFeatures,
+        &members,
+    };
+
+    FeatureInfo supportsClFp64 = {
+        "supportsClFp64",
+        FeatureCategory::VulkanFeatures,
         &members,
     };
 

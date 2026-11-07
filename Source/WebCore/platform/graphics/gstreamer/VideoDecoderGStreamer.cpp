@@ -90,6 +90,10 @@ private:
     bool m_isClosed { false };
     GRefPtr<GstCaps> m_inputCaps;
     std::optional<VideoFrameGStreamer::Info> m_videoInfo;
+
+    // Each chunk's own timestamp and duration, carried by a meta on its buffer to the frame it decodes to: a decoder
+    // rewrites a PTS it judges out of order, as it does when chunks share a timestamp.
+    const GRefPtr<GstCaps> m_chunkTimestampCaps { adoptGRef(gst_caps_new_empty_simple("timestamp/x-webkit-webcodecs-chunk")) };
 };
 
 void GStreamerVideoDecoder::create(const String& codecName, const Config& config, CreateCallback&& callback, OutputCallback&& outputCallback)
@@ -197,9 +201,12 @@ GStreamerInternalVideoDecoder::GStreamerInternalVideoDecoder(const String& codec
             gst_caps_set_simple(m_inputCaps.get(), "codec_data", GST_TYPE_BUFFER, codecData.get(), nullptr);
         if (!gst_element_factory_can_sink_all_caps(factory, m_inputCaps.get()))
             parser = "h264parse"_s;
-    } else if (codecName.startsWith("av01"_s))
+    } else if (codecName.startsWith("av01"_s)) {
         m_inputCaps = adoptGRef(gst_caps_new_simple("video/x-av1", "stream-format", G_TYPE_STRING, "obu-stream", "alignment", G_TYPE_STRING, "frame", nullptr));
-    else if (codecName.startsWith("vp8"_s))
+        // vaav1dec requires a profile field and av1dec (libaom) requires TU alignment; av1parse provides both.
+        if (!gst_element_factory_can_sink_all_caps(factory, m_inputCaps.get()))
+            parser = "av1parse"_s;
+    } else if (codecName.startsWith("vp8"_s))
         m_inputCaps = adoptGRef(gst_caps_new_empty_simple("video/x-vp8"));
     else if (codecName.startsWith("vp09"_s)) {
         m_inputCaps = adoptGRef(gst_caps_new_empty_simple("video/x-vp9"));
@@ -272,6 +279,11 @@ GStreamerInternalVideoDecoder::GStreamerInternalVideoDecoder(const String& codec
         auto timestamp = static_cast<int64_t>(GST_BUFFER_PTS(outputBuffer));
         if (timestamp == -1)
             timestamp = m_timestamp;
+        if (auto* meta = gst_buffer_get_reference_timestamp_meta(outputBuffer, m_chunkTimestampCaps.get())) {
+            timestamp = static_cast<int64_t>(meta->timestamp);
+            if (GST_CLOCK_TIME_IS_VALID(meta->duration))
+                duration = meta->duration;
+        }
 
         if (!m_videoInfo)
             m_videoInfo = VideoFrameGStreamer::infoFromCaps(GRefPtr(gst_sample_get_caps(outputSample.get())));
@@ -283,6 +295,10 @@ GStreamerInternalVideoDecoder::GStreamerInternalVideoDecoder(const String& codec
         auto videoFrame = VideoFrameGStreamer::create(WTF::move(outputSample), options);
         m_outputCallback(VideoDecoder::DecodedFrame { WTF::move(videoFrame), timestamp, duration });
     }, std::nullopt, WTF::move(allowedSinkCaps));
+
+    // A page hands chunks over as they arrive. Told so, a decoder outputs each picture as soon as the stream's
+    // reordering allows, rather than once its decoded picture buffer is full.
+    m_harness->setIsLive(true);
 
     const auto& stream = m_harness->outputStreams().first();
     const auto& pad = stream->targetPad();
@@ -308,6 +324,8 @@ Ref<VideoDecoder::DecodePromise> GStreamerInternalVideoDecoder::decode(std::span
     GST_BUFFER_DTS(buffer.get()) = GST_BUFFER_PTS(buffer.get()) = timestamp;
     if (duration)
         GST_BUFFER_DURATION(buffer.get()) = *duration;
+    if (timestamp != -1)
+        gst_buffer_add_reference_timestamp_meta(buffer.get(), m_chunkTimestampCaps.get(), static_cast<GstClockTime>(timestamp), duration.value_or(GST_CLOCK_TIME_NONE));
 
     if (!isKeyFrame)
         GST_BUFFER_FLAG_SET(buffer.get(), GST_BUFFER_FLAG_DELTA_UNIT);

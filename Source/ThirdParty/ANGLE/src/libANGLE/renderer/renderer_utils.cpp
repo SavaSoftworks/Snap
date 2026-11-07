@@ -898,12 +898,12 @@ angle::Result IncompleteTextureSet::getIncompleteTexture(
     {
         // We need to provide enough pixel data to fill the array of six faces
         GLubyte incompleteCubeArrayPixels[kCubeMapArraySize][4];
-        for (int i = 0; i < kCubeMapArraySize; ++i)
+        for (GLubyte *incompleteCubeArrayPixel : incompleteCubeArrayPixels)
         {
-            incompleteCubeArrayPixels[i][0] = incompleteTextureParam.clearColor[0];
-            incompleteCubeArrayPixels[i][1] = incompleteTextureParam.clearColor[1];
-            incompleteCubeArrayPixels[i][2] = incompleteTextureParam.clearColor[2];
-            incompleteCubeArrayPixels[i][3] = incompleteTextureParam.clearColor[3];
+            incompleteCubeArrayPixel[0] = incompleteTextureParam.clearColor[0];
+            incompleteCubeArrayPixel[1] = incompleteTextureParam.clearColor[1];
+            incompleteCubeArrayPixel[2] = incompleteTextureParam.clearColor[2];
+            incompleteCubeArrayPixel[3] = incompleteTextureParam.clearColor[3];
         }
 
         ANGLE_TRY(t->setSubImage(mutableContext, unpack, nullptr,
@@ -1613,7 +1613,7 @@ std::string GetExtractedStructSamplerName(
     }
 
     std::ostringstream name;
-    name << sh::kExtractedSamplerNamePrefix << index;
+    name << sh::kExtractedSamplerNamePrefix << '_' << index;
     return name.str();
 }
 
@@ -2121,6 +2121,8 @@ angle::FormatID ConvertToSRGB(angle::FormatID formatID)
             return angle::FormatID::R8G8_UNORM_SRGB;
         case angle::FormatID::R8G8B8_UNORM:
             return angle::FormatID::R8G8B8_UNORM_SRGB;
+        case angle::FormatID::R8G8B8X8_UNORM:
+            return angle::FormatID::R8G8B8X8_UNORM_SRGB;
         case angle::FormatID::R8G8B8A8_UNORM:
             return angle::FormatID::R8G8B8A8_UNORM_SRGB;
         case angle::FormatID::B8G8R8A8_UNORM:
@@ -2204,6 +2206,8 @@ angle::FormatID ConvertToLinear(angle::FormatID formatID)
             return angle::FormatID::R8G8_UNORM;
         case angle::FormatID::R8G8B8_UNORM_SRGB:
             return angle::FormatID::R8G8B8_UNORM;
+        case angle::FormatID::R8G8B8X8_UNORM_SRGB:
+            return angle::FormatID::R8G8B8X8_UNORM;
         case angle::FormatID::R8G8B8A8_UNORM_SRGB:
             return angle::FormatID::R8G8B8A8_UNORM;
         case angle::FormatID::B8G8R8A8_UNORM_SRGB:
@@ -2277,9 +2281,10 @@ angle::FormatID ConvertToLinear(angle::FormatID formatID)
     }
 }
 
-bool IsOverridableLinearFormat(angle::FormatID formatID)
+bool IsOverridableLinearOrSRGBFormat(angle::FormatID formatID)
 {
-    return ConvertToSRGB(formatID) != angle::FormatID::NONE;
+    return ConvertToSRGB(formatID) != angle::FormatID::NONE ||
+           ConvertToLinear(formatID) != angle::FormatID::NONE;
 }
 
 template <bool swizzledLuma>

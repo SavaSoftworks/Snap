@@ -477,9 +477,9 @@ vk::ImageAccess GetImageWriteAccessAndSubresource(const gl::ImageUnit &imageUnit
 
     *layerStartOut = gl::OwnerLayer(0);
     *layerCountOut = image.getLayerCount();
-    if (imageUnit.layered)
+    if (!imageUnit.layered)
     {
-        *layerStartOut = *layerStartOut + imageUnit.layered;
+        *layerStartOut = *layerStartOut + imageUnit.layer;
         *layerCountOut = 1;
     }
 
@@ -2213,9 +2213,9 @@ angle::Result ContextVk::handleDirtyEventLogImpl(CommandBufferT *commandBuffer)
     label.pLabelName    = oglCmds.c_str();
     // This is #2 from comment above
     commandBuffer->beginDebugUtilsLabelEXT(label);
-    for (uint32_t i = 0; i < mEventLog.size(); ++i)
+    for (const std::string &event : mEventLog)
     {
-        label.pLabelName = mEventLog[i].c_str();
+        label.pLabelName = event.c_str();
         // NOTE: We have to use a begin/end pair here because AGI does not promote the
         // pLabelName from an insertDebugUtilsLabelEXT() call to the Commands panel.
         // Internal bug b/169243237 is tracking this and once the insert* call shows the
@@ -2854,6 +2854,8 @@ angle::Result ContextVk::handleDirtyGraphicsVertexBuffersVertexInputDynamicState
                                                         bufferOffsets.data());
         }
     }
+    vertexArrayVk->assertEmptyBufferConsistency(mEmptyBuffer);
+
     // Mark all active vertex buffers as accessed.
     mRenderPassCommands->buffersVertexAttribRead(this, vertexArrayVk->getCurrentArrayBuffers(),
                                                  maxAttrib);
@@ -2937,6 +2939,8 @@ angle::Result ContextVk::handleDirtyGraphicsVertexBuffersVertexInputDynamicState
         mRenderPassCommandBuffer->bindVertexBuffers(0, maxAttrib, bufferHandles.data(),
                                                     bufferOffsets.data());
     }
+
+    vertexArrayVk->assertEmptyBufferConsistency(mEmptyBuffer);
 
     // Mark all active vertex buffers as accessed.
     mRenderPassCommands->buffersVertexAttribRead(this, vertexArrayVk->getCurrentArrayBuffers(),
@@ -3316,7 +3320,7 @@ angle::Result ContextVk::handleDirtyGraphicsDynamicBlendConstants(
     DirtyBits dirtyBitMask)
 {
     const gl::ColorF &color = mState.getBlendColor();
-    mRenderPassCommandBuffer->setBlendConstants(color.data());
+    mRenderPassCommandBuffer->setBlendConstants(color);
     return angle::Result::Continue;
 }
 
@@ -5746,6 +5750,7 @@ angle::Result ContextVk::syncState(const gl::Context *context,
                 invalidateDefaultAttributes(context->getActiveDefaultAttribsMask());
                 ANGLE_TRY(onVertexArrayChange(vertexArrayVk->getCurrentEnabledAttribsMask()));
                 ANGLE_TRY(onIndexBufferChange(vertexArrayVk->getCurrentElementArrayBuffer()));
+
                 updateCurrentActiveStreamingAttribsMask(context);
                 break;
             }
@@ -7193,7 +7198,8 @@ angle::Result ContextVk::initImageAllocation(vk::ImageHelper *imageHelper,
 
         if (vma::FindMemoryTypeIndexForImageInfo(
                 mRenderer->getAllocator().getHandle(), &imageHelper->getVkImageCreateInfo(), flags,
-                flags, allocateDedicatedMemory, &pendingMemoryTypeIndex) == VK_SUCCESS)
+                flags, memoryRequirements.memoryTypeBits, allocateDedicatedMemory,
+                &pendingMemoryTypeIndex) == VK_SUCCESS)
         {
             mRenderer->getMemoryAllocationTracker()->setPendingMemoryAlloc(
                 allocationType, memoryRequirements.size, pendingMemoryTypeIndex);
@@ -7396,7 +7402,7 @@ angle::Result ContextVk::updateActiveTextures(const gl::Context *context, gl::Co
         //   The new parameter, TEXTURE_SRGB_DECODE_EXT controls whether the
         //   decoding happens at sample time. It only applies to textures with an
         //   internal format that is sRGB and is ignored for all other textures.
-        ANGLE_TRY(textureVk->updateSrgbDecodeState(this, samplerState));
+        textureVk->updateSrgbDecodeState(samplerState);
 
         const vk::ImageHelper &image = textureVk->getImage();
         if (image.hasInefficientlyEmulatedImageFormat())
@@ -8671,8 +8677,8 @@ angle::Result ContextVk::onResourceAccess(const vk::CommandResources &resources)
                                   writeImage.layerStart, writeImage.layerCount,
                                   mOutsideRenderPassCommands);
         mOutsideRenderPassCommands->retainImage(mRenderer, image);
-        image->onWrite(writeImage.levelStart, writeImage.levelCount, writeImage.layerStart,
-                       writeImage.layerCount, writeImage.image.aspectFlags);
+        image->onWrite(image->toVkLevel(writeImage.levelStart), writeImage.levelCount,
+                       writeImage.layerStart, writeImage.layerCount, writeImage.image.aspectFlags);
     }
 
     for (const vk::CommandResourceBuffer &readBuffer : resources.getReadBuffers())
@@ -9222,10 +9228,9 @@ angle::Result ContextVk::finalizeImageWithTileMemory()
         params.level                           = vk::LevelIndex(0);
         params.layer                           = vk::LayerIndex(0);
         params.clearValue                      = {};
-        params.clearArea                       = gl::Box(0, 0, 0, 0, 0, 1);
+        params.clearArea = gl::Rectangle(0, 0, mImageWithTileMemory->getExtents().width,
+                                         mImageWithTileMemory->getExtents().height);
         params.aspectFlags                     = mImageWithTileMemory->getAspectFlags();
-        params.clearArea.width                 = mImageWithTileMemory->getExtents().width;
-        params.clearArea.height                = mImageWithTileMemory->getExtents().height;
         ANGLE_TRY(mUtils.clearTextureNoFlush(this, mImageWithTileMemory, params));
 
         // Since this may called from submitCommands, use no submit version to avoid
@@ -9256,17 +9261,16 @@ void ContextVk::restoreAllGraphicsState()
 
 void ContextVk::updateCurrentActiveStreamingAttribsMask(const gl::Context *context)
 {
-    VertexArrayVk *vertexArrayVk                           = getVertexArray();
-    const gl::AttributesMask prevActiveStreamingAttribMask = mCurrentActiveStreamingAttribsMask;
+    VertexArrayVk *vertexArrayVk = getVertexArray();
     const gl::AttributesMask activeAttribs =
         context->getActiveClientAttribsMask() | context->getActiveBufferedAttribsMask();
     mCurrentActiveStreamingAttribsMask =
         vertexArrayVk->getStreamingVertexAttribsMask() & activeAttribs;
 
-    // If there are previous active streaming attribute that becomes inactive, we need to set them
-    // to empty buffer since streaming will only update the active attributes.
+    // If there are streaming attributes that are inactive, we need to set them to empty buffer
+    // since streaming will only update the active attributes.
     const gl::AttributesMask inactiveAttribMask =
-        prevActiveStreamingAttribMask & ~mCurrentActiveStreamingAttribsMask;
+        vertexArrayVk->getStreamingVertexAttribsMask() & ~mCurrentActiveStreamingAttribsMask;
     if (inactiveAttribMask.any())
     {
         vertexArrayVk->resetInactiveStreamingAttribs(inactiveAttribMask, mEmptyBuffer);

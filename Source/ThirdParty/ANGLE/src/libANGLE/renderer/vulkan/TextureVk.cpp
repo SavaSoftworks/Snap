@@ -503,6 +503,24 @@ bool GetCompressionFixedRate(VkImageCompressionControlEXT *compressionInfo,
 
     return rtn;
 }
+
+vk::ImageFormatReinterpretability DecideFormatReinterpretability(VkImageCreateFlags createFlags,
+                                                                 VkImageUsageFlags usageFlags)
+{
+    // If the STORAGE usage is specified, require full format reinterpretability.  This is only
+    // possible if the MUTABLE create flag is specified.  Otherwise, if only the MUTABLE create flag
+    // is specified, the colorspace can be overriden.  Without it, the format cannot be
+    // reinterpreted.
+    if ((createFlags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) == 0)
+    {
+        return vk::ImageFormatReinterpretability::None;
+    }
+    if ((usageFlags & VK_IMAGE_USAGE_STORAGE_BIT) == 0)
+    {
+        return vk::ImageFormatReinterpretability::ColorspaceOverrides;
+    }
+    return vk::ImageFormatReinterpretability::Full;
+}
 }  // anonymous namespace
 
 // TextureVk implementation.
@@ -1146,12 +1164,21 @@ angle::Result TextureVk::ghostOnOverwrite(ContextVk *contextVk,
     }
 
     // Size check: Can only ghost the image if the area being overwritten covers the entire image.
+    // Base level check: If base level has changed, don't attempt to ghost it as
+    //                   getBaseLevelFormat() and initImage() will be wrong below, but also it's
+    //                   possible the texture has to be reallocated anyway later.
     //
     // As a targeted optimization, only limit to non-array 2D color textures.  Other texture types
     // can be very easily added if need, but need additional tests similar to those that have landed
     // in http://anglebug.com/42265356 for 2D textures.
     const gl::OwnerLevel overwriteLevel = index.getLevelIndex();
     const gl::OwnerLevel imageLevel     = mImage->getFirstAllocatedLevel();
+
+    const gl::OwnerLevel baseLevel = mState.toOwnerLevel(gl::LevelIndex(mState.getBaseLevel()));
+    if (baseLevel != imageLevel)
+    {
+        return angle::Result::Continue;
+    }
 
     const bool is2DImage = mImage->getLevelCount() == 1 && mImage->getLayerCount() == 1 &&
                            mImage->getType() == VK_IMAGE_TYPE_2D;
@@ -1841,15 +1868,17 @@ angle::Result TextureVk::copySubTextureImpl(ContextVk *contextVk,
                                                        stagingIndex, stagingExtents, stagingOffset,
                                                        &destData, dstFormatID));
 
-    // Source and dst data is tightly packed
-    GLuint srcDataRowPitch = sourceBox.width * srcTextureFormat.pixelBytes;
-    GLuint dstDataRowPitch = sourceBox.width * dstTextureFormat.pixelBytes;
+    // Source and destination data are tightly packed.
+    const size_t srcDataRowPitch =
+        static_cast<size_t>(sourceBox.width) * srcTextureFormat.pixelBytes;
+    const size_t dstDataRowPitch =
+        static_cast<size_t>(sourceBox.width) * dstTextureFormat.pixelBytes;
 
-    GLuint srcDataDepthPitch = srcDataRowPitch * sourceBox.height;
-    GLuint dstDataDepthPitch = dstDataRowPitch * sourceBox.height;
+    const size_t srcDataDepthPitch = srcDataRowPitch * static_cast<size_t>(sourceBox.height);
+    const size_t dstDataDepthPitch = dstDataRowPitch * static_cast<size_t>(sourceBox.height);
 
-    rx::PixelReadFunction pixelReadFunction   = srcTextureFormat.pixelReadFunction;
-    rx::PixelWriteFunction pixelWriteFunction = dstTextureFormat.pixelWriteFunction;
+    PixelReadFunction pixelReadFunction   = srcTextureFormat.pixelReadFunction;
+    PixelWriteFunction pixelWriteFunction = dstTextureFormat.pixelWriteFunction;
 
     // Fix up the read/write functions for the sake of luminance/alpha that are emulated with
     // formats whose channels don't correspond to the original format (alpha is emulated with red,
@@ -2141,6 +2170,7 @@ angle::Result TextureVk::copySubImageImplWithDraw(ContextVk *contextVk,
 
         params.dstOffset[0] = 0;
         params.dstOffset[1] = 0;
+        params.dstMip       = gl::OwnerLevel(0);
 
         for (vk::LayerIndex layerIndex = vk::LayerIndex(0); layerIndex < layerCount; ++layerIndex)
         {
@@ -2291,11 +2321,7 @@ angle::Result TextureVk::setStorageExternalMemory(const gl::Context *context,
     createFlags &= vk::GetMinimalImageCreateFlags(renderer, type, usageFlags) |
                    VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
 
-    // Require full format reinterpretability for textures backed by external memory objects
-    // with storage usage
-    mFormatReinterpretability = ((usageFlags & VK_IMAGE_USAGE_STORAGE_BIT) == 0)
-                                    ? vk::ImageFormatReinterpretability::ColorspaceOverrides
-                                    : vk::ImageFormatReinterpretability::Full;
+    mFormatReinterpretability = DecideFormatReinterpretability(createFlags, usageFlags);
     ANGLE_TRY(memoryObjectVk->createImage(contextVk, type, levels, internalFormat, size, offset,
                                           mImage, createFlags, usageFlags,
                                           mFormatReinterpretability, imageCreateInfoPNext));
@@ -2562,11 +2588,16 @@ void TextureVk::setImageHelper(ContextVk *contextVk,
     mPreviousEGLImageIndex = {};
 
     mOwnsImage          = selfOwned;
-    // If image is shared between other container objects, force it to renderable format since we
-    // don't know if other container object will render or not.
-    if (!mOwnsImage && !imageHelper->isBackedByExternalMemory())
+    if (!mOwnsImage)
     {
-        mRequiredFormatSupport = vk::ImageFormatSupport::Renderable;
+        // If image is shared between other container objects, force it to renderable format since
+        // we don't know if other container object will render or not.
+        if (!imageHelper->isBackedByExternalMemory())
+        {
+            mRequiredFormatSupport = vk::ImageFormatSupport::Renderable;
+        }
+        mFormatReinterpretability =
+            DecideFormatReinterpretability(imageHelper->getCreateFlags(), imageHelper->getUsage());
     }
     mImage               = imageHelper;
 
@@ -2616,10 +2647,10 @@ angle::Result TextureVk::redefineLevel(const gl::Context *context,
         ASSERT(layerIndex.get() ==
                (ownIndex.hasLayer() ? static_cast<uint32_t>(ownIndex.getLayerIndex()) : 0));
 
-        if (gl::IsArrayTextureType(index.getType()))
+        if (gl::IsArrayTextureType(index.getType()) || index.getType() == gl::TextureType::_3D)
         {
-            // A multi-layer texture is being redefined, remove all updates to this level; the
-            // number of layers may have changed.
+            // A multi-layer or 3D texture is being redefined, remove all updates to this level; the
+            // number of layers/slices may have changed.
             mImage->redefineLevels(contextVk, levelIndex, levelIndex);
         }
         else
@@ -3548,6 +3579,15 @@ angle::Result TextureVk::ensureImageInitialized(ContextVk *contextVk, ImageMipLe
         }
     }
 
+    // If context doesn't have valid queue index, it can't write and submit command buffer.
+    // Skip flushing the staged updates for now. The flush will be triggered later when used. This
+    // could only happen with eglCreateImage where the context is provided in the API instead of
+    // using current context.
+    if (!contextVk->hasActiveQueueSerialIndex())
+    {
+        return angle::Result::Continue;
+    }
+
     return flushImageStagedUpdates(contextVk);
 }
 
@@ -3571,7 +3611,8 @@ angle::Result TextureVk::flushImageStagedUpdates(ContextVk *contextVk)
                                                         : mImage->getFirstAllocatedLevel();
     const gl::OwnerLayer firstLayer =
         is3D ? gl::OwnerLayer(0) : mState.toOwnerLayer(gl::LayerIndex(0));
-    const gl::OwnerLayer layerEnd = firstLayer + (is3D ? 1 : getImageViewLayerCount());
+    const gl::OwnerLayer layerEnd =
+        firstLayer + (is3D ? mImage->getExtents().depth : getImageViewLayerCount());
 
     return mImage->flushStagedUpdates(contextVk, firstLevel, firstLevel + getImageViewLevelCount(),
                                       firstLayer, layerEnd, mRedefinedLevels);
@@ -3774,14 +3815,6 @@ angle::Result TextureVk::respecifyImageStorageIfNecessary(ContextVk *contextVk, 
         mImageUsageFlags |= VK_IMAGE_USAGE_STORAGE_BIT;
         mImageCreateFlags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
         mFormatReinterpretability = vk::ImageFormatReinterpretability::Full;
-    }
-
-    // If we're handling dirty srgb decode/override state, we may have to reallocate the image with
-    // VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT. Vulkan requires this bit to be set in order to use
-    // imageviews with a format that does not match the texture's internal format.
-    if (isSRGBOverrideEnabled())
-    {
-        mImageCreateFlags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     }
 
     // Create a new image if used as attachment for the first time. This must be called before
@@ -4043,11 +4076,6 @@ angle::Result TextureVk::syncState(const gl::Context *context,
             mState.getBaseLevelDesc().format.info->sizedInternalFormat));
         mImageView.updateSrgbDecode(imageFormat, srgbDecode);
         mImageView.updateSrgbOverride(imageFormat, mState.getSRGBOverride());
-
-        if (!renderer->getFeatures().supportsImageFormatList.enabled)
-        {
-            refreshAllImageViews = true;
-        }
     }
 
     // Initialize the image storage and flush the pixel buffer.
@@ -4507,10 +4535,11 @@ angle::Result TextureVk::initReadImageViews(ContextVk *contextVk, uint32_t level
     gl::SwizzleState formatSwizzle      = GetFormatSwizzle(intendedFormat, sized);
     gl::SwizzleState readSwizzle        = ApplySwizzle(formatSwizzle, mState.getSwizzleState());
 
-    // Use this as a proxy for the SRGB override & skip decode settings.
+    // Only attempt to create sRGB views if the intended format supports it.  For example, an RGBA4
+    // texture should ignore sRGB override even if it's implemented as RGBA8.
     bool createExtraSRGBViews =
-        (mImageCreateFlags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) != 0 &&
-        mFormatReinterpretability != vk::ImageFormatReinterpretability::None;
+        mFormatReinterpretability != vk::ImageFormatReinterpretability::None &&
+        IsOverridableLinearOrSRGBFormat(mImage->getIntendedFormatID());
 
     GLenum astcDecodePrecision = GL_NONE;
     vk::Renderer *renderer     = contextVk->getRenderer();
@@ -4982,21 +5011,6 @@ angle::Result TextureVk::refreshImageViews(ContextVk *contextVk)
     onStateChange(angle::SubjectMessage::SubjectChanged);
 
     return angle::Result::Continue;
-}
-
-angle::Result TextureVk::ensureMutable(ContextVk *contextVk)
-{
-    if ((mImageCreateFlags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) != 0)
-    {
-        return angle::Result::Continue;
-    }
-
-    mImageCreateFlags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-
-    ANGLE_TRY(respecifyImageStorage(contextVk));
-    ANGLE_TRY(ensureImageInitialized(contextVk, ImageMipLevels::EnabledLevels));
-
-    return refreshImageViews(contextVk);
 }
 
 angle::Result TextureVk::ensureRenderable(ContextVk *contextVk,

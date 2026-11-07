@@ -30,6 +30,11 @@
 #include <wtf/StdLibExtras.h>
 #include <wtf/glib/GRefPtr.h>
 
+#if ENABLE(DEVELOPER_MODE)
+#include "WPEEventInternal.h"
+#include <wtf/Vector.h>
+#endif
+
 struct WPEEventPointerButton {
     WPEModifiers modifiers { static_cast<WPEModifiers>(0) };
     unsigned button { 0 };
@@ -67,6 +72,11 @@ struct WPEEventTouch {
     uint32_t sequenceID { 0 };
     double x { 0 };
     double y { 0 };
+#if ENABLE(DEVELOPER_MODE)
+    // All the touch points of a touch event created by wpeEventTouchCreateForTesting().
+    // sequenceID, x and y hold the primary touch point.
+    std::optional<Vector<WPETouchPoint>> touchPointsForTesting;
+#endif
 };
 
 /**
@@ -558,7 +568,12 @@ WPEEvent* wpe_event_touch_new(WPEEventType type, WPEView* view, WPEInputSource s
     g_return_val_if_fail(type == WPE_EVENT_TOUCH_DOWN || type == WPE_EVENT_TOUCH_UP || type == WPE_EVENT_TOUCH_MOVE || type == WPE_EVENT_TOUCH_CANCEL, nullptr);
     g_return_val_if_fail(WPE_IS_VIEW(view), nullptr);
 
-    return new _WPEEvent { view, type, source, time, { nullptr, nullptr }, WPEEventTouch { modifiers, sequenceID, x, y }, 1 };
+    WPEEventTouch touch;
+    touch.modifiers = modifiers;
+    touch.sequenceID = sequenceID;
+    touch.x = x;
+    touch.y = y;
+    return new _WPEEvent { view, type, source, time, { nullptr, nullptr }, WTF::move(touch), 1 };
 }
 
 /**
@@ -577,3 +592,34 @@ guint32 wpe_event_touch_get_sequence_id(WPEEvent* event)
 
     return std::get<WPEEventTouch>(event->variant).sequenceID;
 }
+
+#if ENABLE(DEVELOPER_MODE)
+WPEEvent* wpeEventTouchCreateForTesting(WPEEventType type, WPEView* view, WPEInputSource source, guint32 time, WPEModifiers modifiers, Vector<WPETouchPoint>&& touchPoints, size_t primaryIndex)
+{
+    ASSERT(type == WPE_EVENT_TOUCH_DOWN || type == WPE_EVENT_TOUCH_UP || type == WPE_EVENT_TOUCH_MOVE || type == WPE_EVENT_TOUCH_CANCEL);
+    ASSERT(touchPoints.isEmpty() || primaryIndex < touchPoints.size());
+    WPEEventTouch touch;
+    touch.modifiers = modifiers;
+    if (primaryIndex < touchPoints.size()) {
+        const auto& primary = touchPoints[primaryIndex];
+        touch.sequenceID = primary.sequenceID;
+        touch.x = primary.x;
+        touch.y = primary.y;
+    }
+    touch.touchPointsForTesting = WTF::move(touchPoints);
+    return new _WPEEvent { view, type, source, time, { nullptr, nullptr }, WTF::move(touch), 1 };
+}
+
+bool wpeEventIsTouchForTesting(WPEEvent* event)
+{
+    if (!(event->type == WPE_EVENT_TOUCH_DOWN || event->type == WPE_EVENT_TOUCH_UP || event->type == WPE_EVENT_TOUCH_MOVE || event->type == WPE_EVENT_TOUCH_CANCEL))
+        return false;
+    return !!std::get<WPEEventTouch>(event->variant).touchPointsForTesting;
+}
+
+const Vector<WPETouchPoint>& wpeEventTouchPointsForTesting(WPEEvent* event)
+{
+    ASSERT(wpeEventIsTouchForTesting(event));
+    return *std::get<WPEEventTouch>(event->variant).touchPointsForTesting;
+}
+#endif

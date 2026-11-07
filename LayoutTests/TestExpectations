@@ -103,8 +103,6 @@ media/encrypted-media/encrypted-media-append-encrypted-unencrypted.html [ Skip ]
 media/media-source/media-source-append-play-corrupt-aac.html [ Skip ]
 media/media-source/media-source-mp4ttsimple.html [ Skip ]
 media/media-source/media-source-inband-cea608-track.html [ Skip ]
-# WebM generator not present in safari-7624.5-branch branch.
-media/media-source/media-source-webm-reversed-timestamps-crash.html [ Failure ]
 media/modern-media-controls/ios-inline-media-controls/touch [ Skip ]
 media/modern-media-controls/overflow-support [ Skip ]
 media/modern-media-controls/visionos-inline-media-controls [ Skip ]
@@ -488,9 +486,6 @@ imported/w3c/web-platform-tests/editing/crashtests/designMode-caret-change.html 
 imported/w3c/web-platform-tests/editing/crashtests/insertparagraph-in-listitem-in-svg-followed-by-collapsible-spaces.html [ Skip ]
 imported/w3c/web-platform-tests/selection/anonymous/details-ancestor.html [ Pass Failure ]
 imported/w3c/web-platform-tests/selection/caret/move-around-contenteditable-false.html [ Pass Failure ]
-
-# This test hits a debug assertion
-[ Debug ] imported/w3c/web-platform-tests/selection/caret/move-around-generated-content.html [ Skip ]
 
 # This crash test is a timeout.
 # These crash tests time out.
@@ -1585,8 +1580,6 @@ editing/spelling/grammar-text-effect-not-reapplied.html [ Skip ]
 # This test is somewhat heavy and better skipped for debug
 [ Debug ] fast/css/many-rules.html [ Skip ]
 
-webkit.org/b/315069 [ Debug ] fast/css/container-query-orientation-modal-dialog-crash.html [ Skip ]
-
 webkit.org/b/112521 [ Release ] webaudio/audioprocessingevent.html [ Pass Failure ]
 webkit.org/b/112521 [ Debug ] webaudio/audioprocessingevent.html [ Skip ]
 
@@ -2164,9 +2157,6 @@ webkit.org/b/316453 imported/w3c/web-platform-tests/css/css-grid/grid-lanes/subg
 webkit.org/b/316453 imported/w3c/web-platform-tests/css/css-grid/grid-lanes/subgrid/grid-subgridded-to-grid-lanes/track-sizing/column-auto-placed-subgrid-inherited-tracks-001.html [ ImageOnlyFailure ]
 webkit.org/b/316453 imported/w3c/web-platform-tests/css/css-grid/grid-lanes/subgrid/grid-subgridded-to-grid-lanes/track-sizing/column-auto-placed-subgrid-inherited-tracks-002.html [ ImageOnlyFailure ]
 webkit.org/b/316453 imported/w3c/web-platform-tests/css/css-grid/grid-lanes/subgrid/grid-subgridded-to-grid-lanes/track-sizing/column-auto-placed-subgrid-inherited-tracks-003.html [ ImageOnlyFailure ]
-webkit.org/b/316453 imported/w3c/web-platform-tests/css/css-grid/grid-lanes/subgrid/grid-subgridded-to-grid-lanes/track-sizing/row-auto-placed-subgrid-inherited-tracks-001.html [ Crash ]
-webkit.org/b/316453 imported/w3c/web-platform-tests/css/css-grid/grid-lanes/subgrid/grid-subgridded-to-grid-lanes/track-sizing/row-auto-placed-subgrid-inherited-tracks-002.html [ Crash ]
-webkit.org/b/316453 imported/w3c/web-platform-tests/css/css-grid/grid-lanes/subgrid/grid-subgridded-to-grid-lanes/track-sizing/row-auto-placed-subgrid-inherited-tracks-003.html [ Crash ]
 imported/w3c/web-platform-tests/css/css-grid/grid-lanes/subgrid/grid-subgridded-to-grid-lanes/track-sizing/column-auto-placed-subgrid-nested-subgrid-inherited-tracks-001.html [ ImageOnlyFailure ]
 imported/w3c/web-platform-tests/css/css-grid/grid-lanes/subgrid/grid-subgridded-to-grid-lanes/track-sizing/column-auto-placed-subgrid-nested-subgrid-inherited-tracks-002.html [ ImageOnlyFailure ]
 imported/w3c/web-platform-tests/css/css-grid/grid-lanes/subgrid/grid-subgridded-to-grid-lanes/track-sizing/column-auto-placed-subgrid-nested-subgrid-inherited-tracks-003.html [ ImageOnlyFailure ]
@@ -2174,9 +2164,6 @@ imported/w3c/web-platform-tests/css/css-grid/grid-lanes/subgrid/grid-subgridded-
 imported/w3c/web-platform-tests/css/css-grid/grid-lanes/subgrid/grid-subgridded-to-grid-lanes/track-sizing/column-subgrid-auto-fit-001.html [ ImageOnlyFailure ]
 imported/w3c/web-platform-tests/css/css-grid/grid-lanes/subgrid/grid-subgridded-to-grid-lanes/track-sizing/row-subgrid-auto-fill-007.html [ ImageOnlyFailure ]
 imported/w3c/web-platform-tests/css/css-grid/grid-lanes/subgrid/grid-subgridded-to-grid-lanes/track-sizing/row-subgrid-auto-fit-001.html [ ImageOnlyFailure ]
-imported/w3c/web-platform-tests/css/css-grid/grid-lanes/subgrid/grid-subgridded-to-grid-lanes/track-sizing/row-auto-placed-subgrid-nested-subgrid-inherited-tracks-001.html [ Crash ]
-imported/w3c/web-platform-tests/css/css-grid/grid-lanes/subgrid/grid-subgridded-to-grid-lanes/track-sizing/row-auto-placed-subgrid-nested-subgrid-inherited-tracks-002.html [ Crash ]
-imported/w3c/web-platform-tests/css/css-grid/grid-lanes/subgrid/grid-subgridded-to-grid-lanes/track-sizing/row-auto-placed-subgrid-nested-subgrid-inherited-tracks-003.html [ Crash ]
 imported/w3c/web-platform-tests/css/css-grid/grid-lanes/subgrid/grid-subgridded-to-grid-lanes/alignment/column-subgrid-alignment-in-subgridded-axis-002.html [ ImageOnlyFailure ]
 imported/w3c/web-platform-tests/css/css-grid/grid-lanes/subgrid/grid-subgridded-to-grid-lanes/alignment/column-subgrid-stretch-001.html [ ImageOnlyFailure ]
 imported/w3c/web-platform-tests/css/css-grid/grid-lanes/subgrid/grid-subgridded-to-grid-lanes/alignment/row-subgrid-stretch-001.html [ ImageOnlyFailure ]

@@ -170,6 +170,12 @@ struct FeaturesMtl : FeatureSetBase
         &members,
     };
 
+    FeatureInfo useBarycentricCoordinatesForHelperInvocations = {
+        "useBarycentricCoordinatesForHelperInvocations",
+        FeatureCategory::MetalWorkarounds,
+        &members,
+    };
+
     FeatureInfo preTransformTextureCubeGradDerivatives = {
         "preTransformTextureCubeGradDerivatives",
         FeatureCategory::MetalWorkarounds,
@@ -358,6 +364,12 @@ struct FeaturesMtl : FeatureSetBase
 
     FeatureInfo limitMaxVisibilityQueryOffset = {
         "limitMaxVisibilityQueryOffset",
+        FeatureCategory::MetalFeatures,
+        &members,
+    };
+
+    FeatureInfo purgeableBufferPool = {
+        "purgeableBufferPool",
         FeatureCategory::MetalFeatures,
         &members,
     };

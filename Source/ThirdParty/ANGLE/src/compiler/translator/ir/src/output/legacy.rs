@@ -1314,6 +1314,8 @@ impl<'options> Generator<'options> {
     fn id_to_append(name: &Name, id: u32) -> u32 {
         if name.source == NameSource::Temporary && !name.name.is_empty() {
             id
+        } else if let Some(suffix) = name.suffix {
+            suffix
         } else {
             SYMBOL_NAME_NO_ID
         }
@@ -1324,7 +1326,10 @@ impl<'options> Generator<'options> {
     // For global structs, an id of 0 is always used to make sure names match across shader
     // interfaces.
     fn struct_id_to_append(name: &Name, specialization: StructSpecialization, id: u32) -> u32 {
-        if name.name.is_empty() || specialization == StructSpecialization::InterfaceBlock {
+        if name.source == NameSource::Internal
+            || name.name.is_empty()
+            || specialization == StructSpecialization::InterfaceBlock
+        {
             SYMBOL_NAME_NO_ID
         } else if name.source == NameSource::Temporary {
             id
@@ -1856,12 +1861,12 @@ impl<'options> Generator<'options> {
         shader_type: ShaderType,
         is_es1: bool,
         precision: Precision,
+        precise: bool,
         decorations: &Decorations,
         built_in: Option<BuiltIn>,
         is_global: bool,
     ) -> ffi::ASTType {
         let invariant = decorations.has(Decoration::Invariant);
-        let precise = decorations.has(Decoration::Precise);
         let interpolant = decorations.has(Decoration::Interpolant);
 
         ffi::ASTType {
@@ -2029,6 +2034,7 @@ impl ast::Target for Generator<'_> {
                             ir_meta.get_shader_type(),
                             self.options.is_es1,
                             field.precision,
+                            field.precise,
                             &field.decorations,
                             None,
                             // AST marks fields as EvqGlobal
@@ -2160,6 +2166,7 @@ impl ast::Target for Generator<'_> {
             ir_meta.get_shader_type(),
             self.options.is_es1,
             variable.precision,
+            variable.precise,
             &variable.decorations,
             variable.built_in,
             is_global,
@@ -2245,6 +2252,7 @@ impl ast::Target for Generator<'_> {
                     ir_meta.get_shader_type(),
                     self.options.is_es1,
                     field.precision,
+                    field.precise,
                     &field.decorations,
                     None,
                     true,
@@ -2289,6 +2297,7 @@ impl ast::Target for Generator<'_> {
             ir_meta.get_shader_type(),
             self.options.is_es1,
             function.return_precision,
+            function.return_precise,
             &function.return_decorations,
             None,
             false,
@@ -3364,8 +3373,12 @@ impl ast::Target for Generator<'_> {
     }
     fn branch_loop_if(&mut self, block: &mut *mut TIntermBlock, condition: TypedId) {
         // The condition block of a loop ends in `if (!condition) break;`
-        // SAFETY: Pointers are obtained from C++ and passed back to it.
-        unsafe { ffi::branch_loop_if(*block, &self.get_expression(condition)) };
+        //
+        // No-op if the condition is `true`
+        if !matches!(condition.id, Id::Constant(CONSTANT_ID_TRUE)) {
+            // SAFETY: Pointers are obtained from C++ and passed back to it.
+            unsafe { ffi::branch_loop_if(*block, &self.get_expression(condition)) };
+        }
     }
     fn branch_switch(
         &mut self,

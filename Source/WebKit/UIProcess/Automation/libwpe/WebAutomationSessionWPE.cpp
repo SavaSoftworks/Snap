@@ -234,21 +234,24 @@ static void doKeyStrokeEvent(WebPageProxy &page, bool pressed, uint32_t keyVal, 
     GUniqueOutPtr<GError> error;
     auto* keymap = WPE_KEYMAP(wpe_display_get_keymap(display));
 
+    unsigned keyCode = 0;
+    auto remainingModifiers = static_cast<WPEModifiers>(modifiers);
+
     GUniqueOutPtr<WPEKeymapEntry> entries;
     guint entriesCount;
-    if (!wpe_keymap_get_entries_for_keyval(keymap, keyVal, &entries.outPtr(), &entriesCount)) {
-        LOG(Automation, "WebAutomationSession::doKeyStrokeEvent: Failed to get keymap entries for keyval %u. Ignoring event.", keyVal);
-        return;
-    }
-    unsigned keyCode = entries.get()[0].keycode;
+    if (wpe_keymap_get_entries_for_keyval(keymap, keyVal, &entries.outPtr(), &entriesCount) && entriesCount) {
+        keyCode = entries.get()[0].keycode;
 
-    WPEModifiers consumedModifiers;
-    if (!wpe_keymap_translate_keyboard_state(keymap, keyCode, static_cast<WPEModifiers>(modifiers), entries.get()[0].group, &keyVal, nullptr, nullptr, &consumedModifiers)) {
-        LOG(Automation, "WebAutomationSession::doKeyStrokeEvent: Failed to translate keyboard state for keycode %u. Ignoring event.", keyCode);
-        return;
-    }
+        if (entries.get()[0].level > 0)
+            modifiers |= WPE_MODIFIER_KEYBOARD_SHIFT;
 
-    auto remainingModifiers = static_cast<WPEModifiers>(modifiers & ~consumedModifiers);
+        WPEModifiers consumedModifiers;
+        if (wpe_keymap_translate_keyboard_state(keymap, keyCode, static_cast<WPEModifiers>(modifiers), entries.get()[0].group, &keyVal, nullptr, nullptr, &consumedModifiers))
+            remainingModifiers = static_cast<WPEModifiers>(modifiers & ~consumedModifiers);
+        else
+            LOG(Automation, "WebAutomationSession::doKeyStrokeEvent: Failed to translate keyboard state for keycode %u. Sending the keyval as requested.", keyCode);
+    } else
+        LOG(Automation, "WebAutomationSession::doKeyStrokeEvent: No keymap entry for keyval %u. Sending it without a keycode.", keyVal);
 
     GRefPtr<WPEEvent> event = adoptGRef(wpe_event_keyboard_new(pressed ? WPE_EVENT_KEYBOARD_KEY_DOWN : WPE_EVENT_KEYBOARD_KEY_UP, view, WPE_INPUT_SOURCE_KEYBOARD, 0,
     remainingModifiers, keyCode, keyVal));
@@ -532,6 +535,17 @@ void WebAutomationSession::platformSimulateTouchInteraction(WebPageProxy&page, T
         event = adoptGRef(wpe_event_touch_new(WPE_EVENT_TOUCH_MOVE, page.wpeView(), WPE_INPUT_SOURCE_TOUCHSCREEN, 0,
             static_cast<WPEModifiers>(m_currentModifiers), 0, location.x(), location.y()));
         break;
+    }
+
+    if (interaction == TouchInteraction::TouchDown) {
+        // Touches are routed against the touch event regions of the last rendering update, so make
+        // sure the effects of previous commands are rendered before starting a touch sequence.
+        page.callAfterNextPresentationUpdate([page = Ref { page }, event = WTF::move(event), completionHandler = WTF::move(completionHandler)] mutable {
+            if (auto* view = page->wpeView())
+                wpe_view_event(view, event.get());
+            completionHandler(std::nullopt);
+        });
+        return;
     }
 
     wpe_view_event(page.wpeView(), event.get());

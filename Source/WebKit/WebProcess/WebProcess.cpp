@@ -237,7 +237,7 @@
 #endif
 
 #if OS(LINUX)
-#include <wtf/linux/RealTimeThreads.h>
+#include <wtf/linux/HighPriorityThreads.h>
 #endif
 
 #if ENABLE(CONTENT_FILTERING)
@@ -443,7 +443,7 @@ void WebProcess::initializeConnection(IPC::Connection* connection)
     AuxiliaryProcess::initializeConnection(connection);
 
 // Do not call exit in background queue for GTK and WPE because we need to ensure
-// atexit handlers are called in the main thread to cleanup resources like EGL displays.
+// resources like EGL displays are released in the main thread before exiting.
 // Unless the main thread doesn't exit after 10 senconds to avoid leaking the process.
 #if PLATFORM(GTK) || PLATFORM(WPE)
     IPC::Connection::DidCloseOnConnectionWorkQueueCallback callExitCallback = crashAfter10Seconds;
@@ -958,8 +958,7 @@ void WebProcess::registerURLSchemeAsDisplayIsolated(const String& urlScheme) con
 
 void WebProcess::registerURLSchemeAsCORSEnabled(const String& urlScheme)
 {
-    if (LegacySchemeRegistry::registerURLSchemeAsCORSEnabled(urlScheme) == LegacySchemeRegistry::SchemeRegisteredForTheFirstTime::No)
-        return;
+    LegacySchemeRegistry::registerURLSchemeAsCORSEnabled(urlScheme);
     ensureNetworkProcessConnection().connection().send(Messages::NetworkConnectionToWebProcess::RegisterURLSchemesAsCORSEnabled({ urlScheme }), 0);
 }
 
@@ -1076,7 +1075,7 @@ void WebProcess::createWebPage(PageIdentifier pageID, WebPageCreationParameters&
         updateIsBroadcastChannelEnabled();
 
 #if OS(LINUX)
-        RealTimeThreads::singleton().setEnabled(hasVisibleWebPage());
+        HighPriorityThreads::singleton().setEnabled(hasVisibleWebPage());
 #endif
     } else
         page->reinitializeWebPage(WTF::move(parameters));
@@ -1106,7 +1105,7 @@ void WebProcess::removeWebPage(PageIdentifier pageID)
     updateIsBroadcastChannelEnabled();
 
 #if OS(LINUX)
-    RealTimeThreads::singleton().setEnabled(hasVisibleWebPage());
+    HighPriorityThreads::singleton().setEnabled(hasVisibleWebPage());
 #endif
 }
 
@@ -1772,7 +1771,7 @@ void WebProcess::pageActivityStateDidChange(PageIdentifier, OptionSet<WebCore::A
     if (changed & WebCore::ActivityState::IsVisible) {
         updateCPUMonitorState(CPUMonitorUpdateReason::VisibilityHasChanged);
 #if OS(LINUX)
-        RealTimeThreads::singleton().setEnabled(hasVisibleWebPage());
+        HighPriorityThreads::singleton().setEnabled(hasVisibleWebPage());
 #endif
     }
 }

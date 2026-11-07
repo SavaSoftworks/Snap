@@ -1087,9 +1087,9 @@ public:
     static InputType inputTypeForElement(const WebCore::Element&);
 #if PLATFORM(IOS_FAMILY)
     void flushPendingFocusedElementUpdateIfNeeded();
+    void focusedSelectElementDidChangeOptions(const WebCore::HTMLSelectElement&);
 #endif
     void focusedElementDidChangeInputMode(WebCore::Element&, WebCore::InputMode);
-    void focusedSelectElementDidChangeOptions(const WebCore::HTMLSelectElement&);
     void resetFocusedElementForFrame(WebFrame*);
     void updateInputContextAfterBlurringAndRefocusingElementIfNeeded(WebCore::Element&);
 
@@ -1606,6 +1606,8 @@ public:
 
 #if ENABLE(IOS_TOUCH_EVENTS)
     Expected<bool, WebCore::RemoteFrameGeometryTransformer> dispatchTouchEvent(WebCore::FrameIdentifier, const WebTouchEvent&);
+#elif ENABLE(COORDINATED_TOUCH_EVENTS)
+    bool dispatchTouchEvent(const WebTouchEvent&);
 #endif
 
     bool shouldUseCustomContentProviderForResponse(const WebCore::ResourceResponse&);
@@ -1690,6 +1692,7 @@ public:
 
 #if PLATFORM(GTK) || PLATFORM(WPE)
     void setInputMethodState(WebCore::Element*);
+    void focusedElementDidChangeReadOnly(WebCore::Element&);
 #endif
 
     void imageOrMediaDocumentSizeChanged(const WebCore::IntSize&);

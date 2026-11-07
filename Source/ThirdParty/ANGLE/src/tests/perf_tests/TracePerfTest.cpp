@@ -1162,11 +1162,6 @@ TracePerfTest::TracePerfTest(std::unique_ptr<const TracePerfParams> params)
         addExtensionPrerequisite("GL_EXT_texture_storage");
     }
 
-    if (traceNameIs("real_racing3"))
-    {
-        addExtensionPrerequisite("GL_EXT_shader_framebuffer_fetch");
-    }
-
     if (traceNameIs("blade_and_soul_revolution"))
     {
         addExtensionPrerequisite("GL_EXT_texture_buffer");
@@ -1324,6 +1319,11 @@ TracePerfTest::TracePerfTest(std::unique_ptr<const TracePerfParams> params)
         traceNameIs("my_talking_tom2") || traceNameIs("tower_of_fantasy"))
     {
         addExtensionPrerequisite("GL_EXT_sRGB_write_control");
+    }
+
+    if (traceNameIs("tiles_hop"))
+    {
+        addIntegerPrerequisite(GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS, 1024);
     }
 
     // GL_KHR_debug does not work on Android for GLES1

@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2008-2024 Apple Inc. All rights reserved.
+ * Copyright (C) 2026 Igalia S.L.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -42,7 +43,6 @@
 #include <wtf/threads/Signals.h>
 
 #if OS(LINUX)
-#include <wtf/linux/RealTimeThreads.h>
 #include <sys/resource.h>
 #endif
 
@@ -135,9 +135,9 @@ static std::optional<size_t> NODELETE stackSize(ThreadType threadType)
 #endif
 }
 
-#if PLATFORM(COCOA) || OS(LINUX)
+#if PLATFORM(COCOA)
 // uid 1 is reserved for the main thread, assigned in Thread::initializeCurrentTLS
-// when current thread is detected as main thread. ++s_uid yields >= 2 for every non-main thread.
+// when pthread_main_np() returns true. ++s_uid yields >= 2 for every non-main thread.
 std::atomic<uint32_t> ThreadLike::s_uid { 1 };
 #else
 // On platforms without a way to detect the main thread before initializeMainThread()
@@ -249,6 +249,12 @@ void Thread::entryPoint(NewThreadContext* newThreadContext)
 
         Thread::initializeCurrentThreadInternal(context->name);
 
+        function = WTF::move(context->entryPoint);
+
+        Ref thread = WTF::move(context->thread);
+        thread->initializeInThread();
+        thread->initializeSchedulingAttributes();
+
 #if OS(LINUX)
         static int helperNice = [] {
             auto value = parseInteger<int>(StringView::fromLatin1(getenv("WEBKIT_SNAP_HELPER_NICE")), 10, WTF::ParseIntegerWhitespacePolicy::Disallow);
@@ -265,11 +271,6 @@ void Thread::entryPoint(NewThreadContext* newThreadContext)
             }
         }
 #endif
-
-        function = WTF::move(context->entryPoint);
-
-        Ref thread = WTF::move(context->thread);
-        thread->initializeInThread();
 
         Thread::initializeTLS(WTF::move(thread));
 
@@ -288,7 +289,7 @@ Ref<Thread> Thread::create(ASCIILiteral name, Function<void()>&& entryPoint, Thr
 {
     WTF::initialize();
 
-    Ref thread = adoptRef(*new Thread(schedulingPolicy, Thread::IsMain::No));
+    Ref thread = adoptRef(*new Thread(qos, schedulingPolicy, Thread::IsMain::No));
 
     Ref context = adoptRef(*new NewThreadContext { name, WTF::move(entryPoint), thread.get() });
     {
@@ -400,14 +401,9 @@ void Thread::setCurrentThreadIsUserInteractive(int relativePriority)
     ASSERT(relativePriority <= 0);
     ASSERT(relativePriority >= QOS_MIN_RELATIVE_PRIORITY);
     pthread_set_qos_class_self_np(adjustedQOSClass(QOS_CLASS_USER_INTERACTIVE), relativePriority);
-#elif OS(LINUX)
-    // We don't allow to make the main thread real time. This is used by secondary processes to match the
-    // UI process, but in linux the UI process is not real time.
-    if (!isMainThread())
-        RealTimeThreads::singleton().registerThread(currentSingleton());
-    UNUSED_PARAM(relativePriority);
 #else
     UNUSED_PARAM(relativePriority);
+    setCurrentThreadQOS(QOS::UserInteractive);
 #endif
 }
 
@@ -419,7 +415,15 @@ void Thread::setCurrentThreadIsUserInitiated(int relativePriority)
     pthread_set_qos_class_self_np(adjustedQOSClass(QOS_CLASS_USER_INITIATED), relativePriority);
 #else
     UNUSED_PARAM(relativePriority);
+    setCurrentThreadQOS(QOS::UserInitiated);
 #endif
+}
+
+void Thread::setCurrentThreadQOS(QOS qos)
+{
+    Thread& thread = currentSingleton();
+    thread.m_qos = qos;
+    thread.initializeSchedulingAttributes();
 }
 
 #if HAVE(QOS_CLASSES)
@@ -450,13 +454,13 @@ auto Thread::currentThreadQOS() -> QOS
     pthread_get_qos_class_np(pthread_self(), &qos, &relativePriority);
     return toQOS(qos);
 #else
-    return QOS::Default;
+    return currentSingleton().qos();
 #endif
 }
 
 bool Thread::currentThreadIsRealtime()
 {
-    return Thread::currentSingleton().m_isRealtime;
+    return Thread::currentSingleton().isRealtime();
 }
 
 #if HAVE(QOS_CLASSES)

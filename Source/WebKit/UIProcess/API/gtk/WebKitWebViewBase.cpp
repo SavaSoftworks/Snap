@@ -413,6 +413,10 @@ static void webkitWebViewBaseDidExitFullScreen(WebKitWebViewBase*);
 static void webkitWebViewBaseRequestExitFullScreen(WebKitWebViewBase*);
 #endif
 
+#if ENABLE(TOUCH_EVENTS)
+static void webkitWebViewBaseCancelTouchSequences(WebKitWebViewBase*);
+#endif
+
 #if USE(GTK4) && defined(GTK_ACCESSIBILITY_ATSPI)
 static GtkAccessible* webkitWebViewBaseAccessibleGetFirstAccessibleChild(GtkAccessible* accessible)
 {
@@ -725,6 +729,11 @@ static void webkitWebViewBaseContainerAdd(GtkContainer* container, GtkWidget* wi
 void webkitWebViewBaseAddDialog(WebKitWebViewBase* webViewBase, GtkWidget* dialog)
 {
     WebKitWebViewBasePrivate* priv = webViewBase->priv;
+#if ENABLE(TOUCH_EVENTS)
+    // webkitWebViewBaseTouchEvent() stops handling events once the dialog is up, so the
+    // sequences that are active right now would never be taken out of the map again.
+    webkitWebViewBaseCancelTouchSequences(webViewBase);
+#endif
     priv->dialog = dialog;
     gtk_widget_set_parent(dialog, GTK_WIDGET(webViewBase));
     gtk_widget_show(dialog);
@@ -1087,6 +1096,12 @@ static void webkitWebViewBaseMap(GtkWidget* widget)
 
 static void webkitWebViewBaseUnmap(GtkWidget* widget)
 {
+#if ENABLE(TOUCH_EVENTS)
+    // GTK doesn't deliver GDK_TOUCH_END for the sequences that are still active when the
+    // widget is unmapped, so cancel them here, while the widget is still mapped and rooted.
+    webkitWebViewBaseCancelTouchSequences(WEBKIT_WEB_VIEW_BASE(widget));
+#endif
+
     GTK_WIDGET_CLASS(webkit_web_view_base_parent_class)->unmap(widget);
 
     webkitWebViewBaseUpdateVisibility(WEBKIT_WEB_VIEW_BASE(widget));
@@ -1806,9 +1821,17 @@ static void appendTouchEvent(GtkWidget* webViewBase, Vector<WebPlatformTouchPoin
     gdouble x, y;
     gdk_event_get_coords(event, &x, &y);
 #if USE(GTK4)
-    // Events in GTK4 are given in native surface coordinates
-    gtk_widget_translate_coordinates(GTK_WIDGET(gtk_widget_get_native(webViewBase)),
-        webViewBase, x, y, &x, &y);
+    // Events in GTK4 are given in native surface coordinates, which include the surface
+    // transform: the offset of the native widget within the surface that leaves room for
+    // the client-side decoration shadows. That offset is outside the widget hierarchy, so
+    // gtk_widget_translate_coordinates() doesn't account for it and it has to be removed
+    // first, just like GTK's own translate_event_coordinates() does.
+    auto* native = gtk_widget_get_native(webViewBase);
+    double surfaceTransformX = 0, surfaceTransformY = 0;
+    gtk_native_get_surface_transform(native, &surfaceTransformX, &surfaceTransformY);
+    x -= surfaceTransformX;
+    y -= surfaceTransformY;
+    gtk_widget_translate_coordinates(GTK_WIDGET(native), webViewBase, x, y, &x, &y);
 #endif
 
     gdouble xRoot, yRoot;
@@ -1849,8 +1872,28 @@ static void webkitWebViewBaseGetTouchPointsForEvent(WebKitWebViewBase* webViewBa
         appendTouchEvent(widget, touchPoints, it.value.get(), touchPointStateForEvents(it.value.get(), event));
 
     // Touch was already removed from the TouchEventsMap, add it here.
-    if (touchEnd)
-        appendTouchEvent(widget, touchPoints, event, WebPlatformTouchPoint::State::Released);
+    if (touchEnd) {
+        auto state = type == GDK_TOUCH_CANCEL ? WebPlatformTouchPoint::State::Cancelled : WebPlatformTouchPoint::State::Released;
+        appendTouchEvent(widget, touchPoints, event, state);
+    }
+}
+
+static void webkitWebViewBaseCancelTouchSequences(WebKitWebViewBase* webViewBase)
+{
+    WebKitWebViewBasePrivate* priv = webViewBase->priv;
+    if (priv->touchEvents.isEmpty())
+        return;
+
+    Vector<WebPlatformTouchPoint> touchPoints;
+    touchPoints.reserveInitialCapacity(priv->touchEvents.size());
+    GtkWidget* widget = GTK_WIDGET(webViewBase);
+    for (const auto& it : priv->touchEvents)
+        appendTouchEvent(widget, touchPoints, it.value.get(), WebPlatformTouchPoint::State::Cancelled);
+
+    priv->touchEvents.clear();
+    priv->pageGrabbedTouch = false;
+
+    priv->pageProxy->handleTouchEvent(nullptr, NativeWebTouchEvent(WebEventType::TouchCancel, { }, WTF::move(touchPoints)));
 }
 
 #if USE(GTK4)
@@ -2247,6 +2290,9 @@ static void webkitWebViewBaseTouchDragUpdate(WebKitWebViewBase* webViewBase, dou
     if (priv->isLongPressed)
         webkitWebViewBaseSynthesizeMouseEvent(webViewBase, MouseEventType::Motion, GDK_BUTTON_PRIMARY, GDK_BUTTON1_MASK, x + offsetX, y + offsetY, modifiers, 0, mousePointerEventType(), PlatformMouseEvent::IsTouch::Yes);
     else {
+        // Round offsets to avoid accumulated rounding errors of deltas.
+        offsetX = std::round(offsetX);
+        offsetY = std::round(offsetY);
         double deltaX = priv->dragOffset.x() - offsetX;
         double deltaY = priv->dragOffset.y() - offsetY;
         priv->dragOffset.set(offsetX, offsetY);
@@ -3419,6 +3465,55 @@ void webkitWebViewBaseSynthesizeWheelEvent(WebKitWebViewBase* webViewBase, const
         delta, wheelTicks, toWebKitWheelEventPhase(phase), toWebKitWheelEventPhase(momentumPhase), true));
 }
 
+#if ENABLE(TOUCH_EVENTS)
+static WebPlatformTouchPoint::State toWebPlatformTouchPointState(SyntheticTouchPoint::State state)
+{
+    switch (state) {
+    case SyntheticTouchPoint::State::Stationary:
+        return WebPlatformTouchPoint::State::Stationary;
+    case SyntheticTouchPoint::State::Pressed:
+        return WebPlatformTouchPoint::State::Pressed;
+    case SyntheticTouchPoint::State::Moved:
+        return WebPlatformTouchPoint::State::Moved;
+    case SyntheticTouchPoint::State::Released:
+        return WebPlatformTouchPoint::State::Released;
+    case SyntheticTouchPoint::State::Cancelled:
+        return WebPlatformTouchPoint::State::Cancelled;
+    }
+    RELEASE_ASSERT_NOT_REACHED();
+}
+
+void webkitWebViewBaseSynthesizeTouchEvent(WebKitWebViewBase* webViewBase, TouchEventType type, Vector<SyntheticTouchPoint>&& points, unsigned modifiers)
+{
+    WebKitWebViewBasePrivate* priv = webViewBase->priv;
+    if (priv->dialog)
+        return;
+
+    WebEventType webEventType;
+    switch (type) {
+    case TouchEventType::Start:
+        webEventType = WebEventType::TouchStart;
+        break;
+    case TouchEventType::Move:
+        webEventType = WebEventType::TouchMove;
+        break;
+    case TouchEventType::End:
+        webEventType = WebEventType::TouchEnd;
+        break;
+    case TouchEventType::Cancel:
+        webEventType = WebEventType::TouchCancel;
+        break;
+    }
+
+    auto touchPoints = points.map([widget = GTK_WIDGET(webViewBase)](const SyntheticTouchPoint& point) -> WebPlatformTouchPoint {
+        auto rootCoords = widgetRootCoords(widget, point.x, point.y);
+        return WebPlatformTouchPoint(point.id, toWebPlatformTouchPointState(point.state), DoublePoint(rootCoords.x(), rootCoords.y()), DoublePoint(point.x, point.y));
+    });
+
+    priv->pageProxy->handleTouchEvent(nullptr, NativeWebTouchEvent(webEventType, toWebKitModifiers(modifiers), WTF::move(touchPoints)));
+}
+#endif // ENABLE(TOUCH_EVENTS)
+
 void webkitWebViewBaseMakeBlank(WebKitWebViewBase* webViewBase, bool makeBlank)
 {
     WebKitWebViewBasePrivate* priv = webViewBase->priv;
@@ -3494,6 +3589,12 @@ RendererBufferDescription webkitWebViewBaseGetRendererBufferDescription(WebKitWe
 
 static SkImage* webkitWebViewBaseSnapshotFromWidget(GtkWidget* view)
 {
+    while (g_main_context_pending(nullptr))
+        g_main_context_iteration(nullptr, TRUE);
+
+    if (!gtk_widget_get_realized(view))
+        return nullptr;
+
 #if USE(GTK4)
     int width = gtk_widget_get_width(view);
     int height = gtk_widget_get_height(view);
@@ -3502,8 +3603,8 @@ static SkImage* webkitWebViewBaseSnapshotFromWidget(GtkWidget* view)
     int height = gtk_widget_get_allocated_height(view);
 #endif
 
-    while (g_main_context_pending(nullptr))
-        g_main_context_iteration(nullptr, TRUE);
+    if (width <= 0 || height <= 0)
+        return nullptr;
 
     RefPtr<cairo_surface_t> surface = adoptRef(cairo_image_surface_create(CAIRO_FORMAT_RGB24, width, height));
     RefPtr<cairo_t> cr = adoptRef(cairo_create(surface.get()));
