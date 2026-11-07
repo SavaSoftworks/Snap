@@ -98,6 +98,11 @@ private:
     void collectMatchingRulesForList(const RuleSet::RuleDataVector*, const MatchRequest&);
     void collectMatchingRulesForList(const RuleSet::RuleDataVector&, const MatchRequest&);
     void collectMatchingRulesForListSlow(const RuleSet::RuleDataVector&, const MatchRequest&);
+    bool snapCollectUARulesWithMemo(const RuleSet&);
+    void snapCollectDynamicUARule(const RuleData&, const MatchRequest&);
+#ifdef WEBKIT_SNAP_VERIFY_PATCHES
+    void snapVerifyUARuleMemoHit(const RuleSet&, size_t relationCountBefore, EnumSet<PseudoElementType> pseudoElementsBefore);
+#endif
     bool NODELETE isFirstMatchModeAndHasMatchedAnyRules() const;
     struct ScopingRootWithDistance {
         RefPtr<const ContainerNode> scopingRoot;

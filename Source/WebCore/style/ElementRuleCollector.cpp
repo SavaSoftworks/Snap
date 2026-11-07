@@ -28,6 +28,8 @@
 
 #include "config.h"
 #include "ElementRuleCollector.h"
+#include <cstdlib>
+#include <cstring>
 
 #include "CSSKeyframeRule.h"
 #include "CSSRuleList.h"
@@ -42,6 +44,7 @@
 #include "ElementRareData.h"
 #include "ElementTextDirection.h"
 #include "HTMLElement.h"
+#include "HTMLNames.h"
 #include "HTMLSlotElement.h"
 #include "SVGElement.h"
 #include "SelectorCheckerTestFunctions.h"
@@ -56,12 +59,20 @@
 #include "StyleScopeRuleSets.h"
 #include "StyleSheetContents.h"
 #include "StyledElement.h"
+#include "Supplementable.h"
 #include "UserAgentStyle.h"
 #if ENABLE(VIDEO)
 #include "UserAgentParts.h"
 #endif
+#include <array>
+#include <limits>
 #include <ranges>
+#include <wtf/HashMap.h>
+#include <wtf/Hasher.h>
+#include <wtf/MainThread.h>
+#include <wtf/NeverDestroyed.h>
 #include <wtf/SetForScope.h>
+#include <wtf/text/StringHash.h>
 
 namespace WebCore {
 namespace Style {
@@ -532,7 +543,8 @@ void ElementRuleCollector::matchUARules(const RuleSet& rules)
 {
     clearMatchedRules();
 
-    collectMatchingRules(MatchRequest(rules));
+    if (!snapCollectUARulesWithMemo(rules))
+        collectMatchingRules(MatchRequest(rules));
 
     sortAndTransferMatchedRules(DeclarationOrigin::UserAgent);
 }
@@ -909,6 +921,474 @@ static inline bool NODELETE compareRules(MatchedRule r1, MatchedRule r2)
 void ElementRuleCollector::sortMatchedRules()
 {
     std::ranges::sort(m_matchedRules, compareRules);
+}
+
+static bool snapUARuleMemoEnabled()
+{
+    static bool enabled = [] {
+        const char* value = std::getenv("WEBKIT_SNAP_DISABLE_UA_RULE_MEMO");
+        return !value || std::strcmp(value, "1");
+    }();
+    return enabled;
+}
+
+static bool snapUARuleMemoCountersEnabled()
+{
+    static bool enabled = [] {
+        const char* value = std::getenv("WEBKIT_SNAP_PATCH_COUNTERS");
+        return value && !std::strcmp(value, "1");
+    }();
+    return enabled;
+}
+
+enum class SnapUARuleMemoEvent : uint8_t { Hit,
+    Miss,
+    NonMemoizable };
+
+static void snapUARuleMemoCount(SnapUARuleMemoEvent event)
+{
+    if (!snapUARuleMemoCountersEnabled()) {
+        return;
+    }
+    static std::array<unsigned long long, 3> counts {};
+    static unsigned long long total = 0;
+    ++counts[static_cast<size_t>(event)];
+    if (++total % 4096) {
+        return;
+    }
+    WTFLogAlways("Snap UA rule memo: hits %llu misses %llu non-memoizable %llu", counts[0], counts[1], counts[2]);
+}
+
+static constexpr uint8_t snapUAShapeHTMLDocument = 1u << 0;
+static constexpr uint8_t snapUAShapeQuirksMode = 1u << 1;
+static constexpr uint8_t snapUAShapeLink = 1u << 2;
+static constexpr uint8_t snapUAShapeUserAgentShadowTree = 1u << 3;
+
+static constexpr size_t snapUAMemoMaximumAttributes = 4;
+static constexpr size_t snapUAMemoMaximumVariants = 16;
+static constexpr unsigned snapUAMemoMaximumShapes = 512;
+
+static bool snapUARuleSelectorIsStatic(const CSSSelector& firstSelector, bool& valuesMatter)
+{
+    for (auto* selector = &firstSelector; selector; selector = selector->precedingInComplexSelector()) {
+        if (selector->precedingInComplexSelector() && selector->relation() != CSSSelector::Relation::Subselector) {
+            return false;
+        }
+
+        switch (selector->match()) {
+        case CSSSelector::Match::Tag:
+        case CSSSelector::Match::Set:
+            continue;
+        case CSSSelector::Match::Exact:
+        case CSSSelector::Match::List:
+        case CSSSelector::Match::Hyphen:
+        case CSSSelector::Match::Contain:
+        case CSSSelector::Match::Begin:
+        case CSSSelector::Match::End:
+            valuesMatter = true;
+            continue;
+        default:
+            return false;
+        }
+    }
+    return true;
+}
+
+struct SnapUARuleMemoVariant {
+    Vector<AtomString, snapUAMemoMaximumAttributes> values;
+    Vector<MatchedRule, 4> staticMatches;
+};
+
+struct SnapUARuleMemoShape {
+    WTF_DEPRECATED_MAKE_STRUCT_FAST_ALLOCATED(SnapUARuleMemoShape);
+
+    AtomString localName;
+    AtomString namespaceURI;
+    AtomString userAgentPart;
+    Vector<QualifiedName, snapUAMemoMaximumAttributes> attributeNames;
+    uint8_t flags { 0 };
+    bool broken { false };
+    bool valuesMatter { false };
+    Vector<const RuleData*> staticRules;
+    Vector<const RuleData*> dynamicRules;
+    Vector<SnapUARuleMemoVariant> variants;
+};
+
+struct SnapUARuleMemo {
+    unsigned version { 0 };
+    bool initialized { false };
+    bool usable { false };
+    unsigned shapeCount { 0 };
+    HashMap<unsigned, Vector<std::unique_ptr<SnapUARuleMemoShape>>, AlreadyHashed> shapes;
+};
+
+class SnapUARuleMemoStore final : public Supplement<Document> {
+    WTF_DEPRECATED_MAKE_FAST_ALLOCATED(SnapUARuleMemoStore);
+
+public:
+    static SnapUARuleMemoStore& from(Document& document)
+    {
+        constexpr auto name = "SnapUARuleMemoStore"_s;
+        auto* store = static_cast<SnapUARuleMemoStore*>(Supplement<Document>::from(&document, name));
+        if (!store) {
+            auto owned = makeUnique<SnapUARuleMemoStore>();
+            store = owned.get();
+            Supplement<Document>::provideTo(&document, name, WTF::move(owned));
+        }
+        return *store;
+    }
+    std::array<SnapUARuleMemo, 3> memos;
+};
+
+static SnapUARuleMemo* snapUARuleMemoFor(Document& document, const RuleSet& rules)
+{
+    size_t index;
+    if (&rules == UserAgentStyle::defaultStyle) {
+        index = 0;
+    } else if (&rules == UserAgentStyle::defaultPrintStyle) {
+        index = 1;
+    } else if (&rules == UserAgentStyle::defaultQuirksStyle) {
+        index = 2;
+    } else {
+        return nullptr;
+    }
+
+    auto& memo = SnapUARuleMemoStore::from(document).memos[index];
+    if (!memo.initialized || memo.version != UserAgentStyle::defaultStyleVersion) {
+        memo.initialized = true;
+        memo.version = UserAgentStyle::defaultStyleVersion;
+        memo.shapes.clear();
+        memo.shapeCount = 0;
+
+        auto& features = rules.features();
+        auto& styleAttributeName = HTMLNames::styleAttr->localName();
+        bool referencesStyleAttribute = features.attributeLocalNamesInRules.contains(styleAttributeName) || features.attributeLowercaseLocalNamesInRules.contains(styleAttributeName);
+        memo.usable = !referencesStyleAttribute && !rules.hasContainerQueries() && !rules.hasScopeRules() && features.idsInRules.isEmpty() && features.idRules.isEmpty() && features.classRules.isEmpty();
+    }
+    return memo.usable ? &memo : nullptr;
+}
+
+static void snapUARuleMemoBuildShape(SnapUARuleMemoShape& shape, const RuleSet& rules, bool isCaseInsensitiveForHTML)
+{
+    auto visit = [&](const RuleSet::RuleDataVector* bucket) {
+        if (!bucket) {
+            return;
+        }
+        for (auto& ruleData : *bucket) {
+            if (!ruleData.isEnabled()) {
+                shape.broken = true;
+                continue;
+            }
+            if (ruleData.styleRule().properties().isEmpty()) {
+                continue;
+            }
+
+            bool valuesMatter = false;
+            bool isStatic = !ruleData.canMatchPseudoElement() && !ruleData.descendantSelectorIdentifierHashes()[0] && snapUARuleSelectorIsStatic(ruleData.selector(), valuesMatter);
+            if (isStatic) {
+                shape.staticRules.append(&ruleData);
+                shape.valuesMatter = shape.valuesMatter || valuesMatter;
+            } else {
+                shape.dynamicRules.append(&ruleData);
+            }
+        }
+    };
+
+    if ((shape.flags & snapUAShapeUserAgentShadowTree) && !shape.userAgentPart.isEmpty()) {
+        visit(rules.userAgentPartRules(shape.userAgentPart));
+    }
+    for (auto& name : shape.attributeNames) {
+        visit(rules.attributeRules(name.localName(), isCaseInsensitiveForHTML));
+    }
+    if (shape.flags & snapUAShapeLink) {
+        visit(&rules.linkPseudoClassRules());
+    }
+    visit(rules.tagRules(shape.localName, isCaseInsensitiveForHTML));
+    visit(&rules.universalRules());
+}
+
+void ElementRuleCollector::snapCollectDynamicUARule(const RuleData& ruleData, const MatchRequest& matchRequest)
+{
+    if (!ruleData.isEnabled()) [[unlikely]] {
+        return;
+    }
+    if (m_selectorMatchingState && m_selectorMatchingState->selectorFilter.fastRejectSelector(ruleData.descendantSelectorIdentifierHashes())) {
+        return;
+    }
+    unsigned specificity;
+    if (ruleMatches(ruleData, specificity, matchRequest.styleScopeOrdinal)) {
+        addMatchedRule(ruleData, specificity, std::numeric_limits<unsigned>::max(), matchRequest);
+    }
+}
+
+#ifdef WEBKIT_SNAP_VERIFY_PATCHES
+void ElementRuleCollector::snapVerifyUARuleMemoHit(
+    const RuleSet& rules,
+    size_t relationCountBefore,
+    EnumSet<PseudoElementType> pseudoElementsBefore)
+{
+    auto memoRules = m_matchedRules;
+    Relations memoRelations;
+    for (size_t i = relationCountBefore; i < m_styleRelations.size(); ++i) {
+        memoRelations.append(m_styleRelations[i]);
+    }
+    auto memoPseudoElements = m_matchedPseudoElements;
+
+    m_matchedRules.clear();
+    m_styleRelations.shrink(relationCountBefore);
+    m_matchedPseudoElements = pseudoElementsBefore;
+
+    collectMatchingRules(MatchRequest(rules));
+
+    auto stockRules = m_matchedRules;
+    std::ranges::sort(memoRules, compareRules);
+    std::ranges::sort(stockRules, compareRules);
+
+    bool equal = memoRules.size() == stockRules.size() && memoPseudoElements == m_matchedPseudoElements && memoRelations.size() == m_styleRelations.size() - relationCountBefore;
+    for (size_t i = 0; equal && i < memoRules.size(); ++i) {
+        auto& memoRule = memoRules[i];
+        auto& stockRule = stockRules[i];
+        equal = memoRule.ruleData == stockRule.ruleData && memoRule.specificity == stockRule.specificity && memoRule.scopingRootDistance == stockRule.scopingRootDistance && memoRule.styleScopeOrdinal == stockRule.styleScopeOrdinal && memoRule.cascadeLayerPriority == stockRule.cascadeLayerPriority;
+    }
+    for (size_t i = 0; equal && i < memoRelations.size(); ++i) {
+        auto& memoRelation = memoRelations[i];
+        auto& stockRelation = m_styleRelations[relationCountBefore + i];
+        equal = memoRelation.element == stockRelation.element && memoRelation.type == stockRelation.type && memoRelation.value == stockRelation.value;
+    }
+    if (!equal) {
+        WTFLogAlways(
+            "Snap UA rule memo: mismatch for <%s>, memo rules %zu stock rules %zu, memo relations %zu stock relations "
+            "%zu, using stock result",
+            element().localName().string().utf8().data(),
+            memoRules.size(),
+            stockRules.size(),
+            memoRelations.size(),
+            m_styleRelations.size() - relationCountBefore);
+        RELEASE_ASSERT_NOT_REACHED();
+    }
+}
+#endif
+
+bool ElementRuleCollector::snapCollectUARulesWithMemo(const RuleSet& rules)
+{
+    if (!snapUARuleMemoEnabled()) {
+        return false;
+    }
+    if (!isMainThread()) {
+        return false;
+    }
+
+    auto nonMemoizable = [] {
+        snapUARuleMemoCount(SnapUARuleMemoEvent::NonMemoizable);
+        return false;
+    };
+
+    if (m_mode != SelectorChecker::Mode::ResolvingStyle || m_pseudoElementRequest || m_shouldIncludeEmptyRules) {
+        return nonMemoizable();
+    }
+
+    auto& element = this->element();
+    if (!element.isHTMLElement() || element.localName().length() > 128 || element.namespaceURI().length() > 128) {
+        return nonMemoizable();
+    }
+
+    auto& document = element.document();
+    if (&element == document.documentElement()) {
+        return nonMemoizable();
+    }
+    if (matchesFocusPseudoClass(element) || matchesFocusVisiblePseudoClass(element)) {
+        return nonMemoizable();
+    }
+#if ENABLE(FULLSCREEN_API)
+    if (auto* fullscreen = document.fullscreenIfExists(); fullscreen && fullscreen->isFullscreen()) {
+        return nonMemoizable();
+    }
+#endif
+
+    auto* memo = snapUARuleMemoFor(document, rules);
+    if (!memo) {
+        return nonMemoizable();
+    }
+
+    uint8_t flags = 0;
+    AtomString userAgentPart;
+    if (auto* shadowRoot = element.containingShadowRoot();
+        shadowRoot && shadowRoot->mode() == ShadowRootMode::UserAgent) {
+#if ENABLE(VIDEO)
+        if (element.isWebVTTElement() || element.userAgentPart() == UserAgentParts::cue()) {
+            return nonMemoizable();
+        }
+#endif
+        flags |= snapUAShapeUserAgentShadowTree;
+        userAgentPart = element.userAgentPart();
+        if (userAgentPart.length() > 128) {
+            return nonMemoizable();
+        }
+    }
+
+    bool isCaseInsensitiveForHTML = document.isHTMLDocument();
+    if (isCaseInsensitiveForHTML) {
+        flags |= snapUAShapeHTMLDocument;
+    }
+    if (document.inQuirksMode()) {
+        flags |= snapUAShapeQuirksMode;
+    }
+    if (element.isLink()) {
+        flags |= snapUAShapeLink;
+    }
+
+    Vector<QualifiedName, snapUAMemoMaximumAttributes> attributeNames;
+    Vector<AtomString, snapUAMemoMaximumAttributes> attributeValues;
+    if (element.hasAttributesWithoutUpdate()) {
+        auto& features = rules.features();
+        auto& names = isCaseInsensitiveForHTML ? features.attributeLowercaseLocalNamesInRules
+                                               : features.attributeLocalNamesInRules;
+        if (!names.isEmpty()) {
+            for (auto& attribute : element.attributes()) {
+                if (!names.contains(attribute.localName())) {
+                    continue;
+                }
+                if (attributeNames.size() == snapUAMemoMaximumAttributes || attribute.value().length() > 256 || attribute.namespaceURI().length() > 128 || attribute.prefix().length() > 128) {
+                    return nonMemoizable();
+                }
+                attributeNames.append(attribute.name());
+                attributeValues.append(attribute.value());
+            }
+        }
+    }
+
+    auto& localName = element.localName();
+    auto& namespaceURI = element.namespaceURI();
+
+    Hasher hasher;
+    add(hasher, localName.impl(), namespaceURI.impl(), userAgentPart.impl(), static_cast<unsigned>(flags));
+    for (auto& name : attributeNames) {
+        add(hasher, name.localName().impl(), name.namespaceURI().impl(), name.prefix().impl());
+    }
+    unsigned hash = hasher.hash();
+    if (!hash) {
+        hash = 1;
+    }
+    hash = AlreadyHashed::avoidDeletedValue(hash);
+
+    auto shapeMatches = [&](const SnapUARuleMemoShape& candidate) {
+        if (candidate.flags != flags || candidate.localName != localName || candidate.namespaceURI != namespaceURI || candidate.userAgentPart != userAgentPart) {
+            return false;
+        }
+        if (candidate.attributeNames.size() != attributeNames.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < attributeNames.size(); ++i) {
+            if (candidate.attributeNames[i] != attributeNames[i]) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    auto findShape = [&]() -> SnapUARuleMemoShape* {
+        auto it = memo->shapes.find(hash);
+        if (it == memo->shapes.end()) {
+            return nullptr;
+        }
+        for (auto& candidate : it->value) {
+            if (shapeMatches(*candidate)) {
+                return candidate.get();
+            }
+        }
+        return nullptr;
+    };
+
+    auto findVariant = [&](SnapUARuleMemoShape& shape) -> SnapUARuleMemoVariant* {
+        for (auto& candidate : shape.variants) {
+            if (shape.valuesMatter && candidate.values != attributeValues) {
+                continue;
+            }
+            return &candidate;
+        }
+        return nullptr;
+    };
+
+    auto* shape = findShape();
+    if (shape && !shape->broken) {
+        if (auto* variant = findVariant(*shape)) {
+#ifdef WEBKIT_SNAP_VERIFY_PATCHES
+            auto relationCountBefore = m_styleRelations.size();
+            auto pseudoElementsBefore = m_matchedPseudoElements;
+#endif
+            for (auto& matchedRule : variant->staticMatches) {
+                if (matchedRule.ruleData->isEnabled()) [[likely]] {
+                    m_matchedRules.append(matchedRule);
+                }
+            }
+            if (!shape->dynamicRules.isEmpty()) {
+                MatchRequest matchRequest(rules);
+                for (auto* ruleData : shape->dynamicRules) {
+                    snapCollectDynamicUARule(*ruleData, matchRequest);
+                }
+            }
+            m_matchedPseudoElements.add(rules.universalHTMLPseudoElementTypes() & allPublicPseudoElementTypes);
+            snapUARuleMemoCount(SnapUARuleMemoEvent::Hit);
+#ifdef WEBKIT_SNAP_VERIFY_PATCHES
+            snapVerifyUARuleMemoHit(rules, relationCountBefore, pseudoElementsBefore);
+#endif
+            return true;
+        }
+    }
+
+    collectMatchingRules(MatchRequest(rules));
+
+    if (!shape) {
+        if (memo->shapeCount >= snapUAMemoMaximumShapes) {
+            memo->shapes.clear();
+            memo->shapeCount = 0;
+        }
+        auto newShape = makeUnique<SnapUARuleMemoShape>();
+        newShape->localName = localName;
+        newShape->namespaceURI = namespaceURI;
+        newShape->userAgentPart = userAgentPart;
+        newShape->flags = flags;
+        newShape->attributeNames = attributeNames;
+        snapUARuleMemoBuildShape(*newShape, rules, isCaseInsensitiveForHTML);
+        shape = newShape.get();
+        memo->shapes.add(hash, Vector<std::unique_ptr<SnapUARuleMemoShape>> {})
+            .iterator->value.append(WTF::move(newShape));
+        ++memo->shapeCount;
+    }
+
+    if (shape->broken) {
+        snapUARuleMemoCount(SnapUARuleMemoEvent::NonMemoizable);
+        return true;
+    }
+
+    snapUARuleMemoCount(SnapUARuleMemoEvent::Miss);
+
+    if (shape->variants.size() >= snapUAMemoMaximumVariants) {
+        return true;
+    }
+
+    SnapUARuleMemoVariant variant;
+    if (findVariant(*shape)) {
+        return true;
+    }
+
+    for (auto& matchedRule : m_matchedRules) {
+        if (shape->staticRules.contains(matchedRule.ruleData)) {
+            variant.staticMatches.append(matchedRule);
+            continue;
+        }
+        if (!shape->dynamicRules.contains(matchedRule.ruleData)) {
+            shape->broken = true;
+            shape->variants.clear();
+            return true;
+        }
+    }
+
+    if (shape->valuesMatter) {
+        variant.values = attributeValues;
+    }
+    shape->variants.append(WTF::move(variant));
+    return true;
 }
 
 void ElementRuleCollector::matchAllRules(bool matchAuthorAndUserStyles, bool includeSMILProperties)
