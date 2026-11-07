@@ -25,6 +25,8 @@
 
 #include "config.h"
 #include "SkiaHarfBuzzFont.h"
+#include <cstdlib>
+#include <cstring>
 
 #if USE(SKIA)
 #include "FontCache.h"
@@ -156,6 +158,13 @@ static inline hb_position_t skScalarToHarfBuzzPosition(SkScalar value)
 hb_font_t* SkiaHarfBuzzFont::scaledFont(const FontPlatformData& fontPlatformData)
 {
     float size = fontPlatformData.size();
+    static bool reuseScaledFont = [] {
+        const char* value = std::getenv("WEBKIT_SNAP_REUSE_SCALED_FONT");
+        return !value || std::strcmp(value, "0");
+    }();
+    if (reuseScaledFont && m_scaledFont == fontPlatformData.skFont() && m_isColorBitmapFont == fontPlatformData.isColorBitmapFont() && hb_font_get_ptem(m_font.get()) == size) {
+        return m_font.get();
+    }
     auto scale = skScalarToHarfBuzzPosition(size);
     hb_font_set_scale(m_font.get(), scale, scale);
     hb_font_set_ptem(m_font.get(), size);
