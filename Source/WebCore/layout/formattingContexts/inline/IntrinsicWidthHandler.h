@@ -45,7 +45,7 @@ public:
 
 private:
     enum class MayCacheLayoutResult : bool { No, Yes };
-    InlineLayoutUnit computedIntrinsicWidthForConstraint(IntrinsicWidthMode, AbstractLineBuilder&, MayCacheLayoutResult = MayCacheLayoutResult::No);
+    InlineLayoutUnit computedIntrinsicWidthForConstraint(IntrinsicWidthMode, AbstractLineBuilder&, MayCacheLayoutResult = MayCacheLayoutResult::No, unsigned* lineCount = nullptr);
     InlineLayoutUnit simplifiedMinimumWidth(const ElementBox& root) const;
     InlineLayoutUnit simplifiedMaximumWidth(MayCacheLayoutResult = MayCacheLayoutResult::No);
 
