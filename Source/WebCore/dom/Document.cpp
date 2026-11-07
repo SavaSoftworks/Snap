@@ -27,6 +27,8 @@
 
 #include "config.h"
 #include "Document.h"
+#include <cstdlib>
+#include <cstring>
 
 #include "AXIsolatedTree.h"
 #include "AXObjectCacheInlines.h"
@@ -671,6 +673,16 @@ static inline IntDegrees NODELETE currentOrientation(LocalFrame* frame)
     UNUSED_PARAM(frame);
 #endif
     return 0;
+}
+
+void Document::snapDidMutateRenderTree()
+{
+    static bool enabled = [] {
+        const char* value = std::getenv("WEBKIT_SNAP_DISABLE_FLEX_INVALIDATION_SKIP");
+        return !value || std::strcmp(value, "1");
+    }();
+    if (enabled)
+        RELEASE_ASSERT(++m_snapRenderMutationGeneration);
 }
 
 Document::Document(LocalFrame* frame, const Settings& settings, const URL& url, DocumentClasses documentClasses, OptionSet<ConstructionFlag> constructionFlags, std::optional<ScriptExecutionContextIdentifier> identifier)

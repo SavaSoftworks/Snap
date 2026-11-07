@@ -35,6 +35,7 @@
 #include <WebCore/FlexFormattingUtils.h>
 #include <WebCore/LayoutIntegrationFlexLayout.h>
 #include <WebCore/RenderBlock.h>
+#include <wtf/HashMap.h>
 #include <wtf/Range.h>
 #include <wtf/SetForScope.h>
 #include <wtf/WeakHashSet.h>
@@ -52,7 +53,13 @@ public:
     using Direction = FlowDirection;
 
     ASCIILiteral renderName() const override;
+    bool snapShouldSkipContentWidthsInvalidation(const RenderBox&, bool) const;
 
+private:
+    mutable uint64_t m_snapCrossSizeMemoGeneration { 0 };
+    mutable HashMap<const RenderBox*, bool> m_snapCrossSizeMemo;
+
+public:
     bool canDropAnonymousBlockChild() const final { return false; }
     void layoutBlock(RelayoutChildren, LayoutUnit pageLogicalHeight = 0_lu) final;
 
@@ -124,6 +131,11 @@ public:
     private:
         SetForScope<bool> m_intrinsicWidthComputation;
         std::optional<OverridingSizesScope> m_overridingScope;
+#ifdef WEBKIT_SNAP_VERIFY_PATCHES
+        CheckedPtr<RenderBox> m_snapVerifiedFlexItem;
+        LayoutUnit m_snapCachedMinContribution;
+        LayoutUnit m_snapCachedMaxContribution;
+#endif
 #if ASSERT_ENABLED
         RenderBox& m_flexItem;
         bool m_didInvalidateContentLogicalWidths { false };

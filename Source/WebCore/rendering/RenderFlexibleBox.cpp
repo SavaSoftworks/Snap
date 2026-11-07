@@ -31,8 +31,11 @@
 
 #include "config.h"
 #include "RenderFlexibleBox.h"
+#include <cstdlib>
+#include <cstring>
 
 #include "BaselineAlignment.h"
+#include "FlexFormattingContext.h"
 #include "FontBaseline.h"
 #include "HitTestResult.h"
 #include "InspectorInstrumentation.h"
@@ -46,7 +49,6 @@
 #include "RenderBoxModelObjectInlines.h"
 #include "RenderChildIterator.h"
 #include "RenderElementStyleInlines.h"
-#include "FlexFormattingContext.h"
 #include "RenderLayer.h"
 #include "RenderLayoutState.h"
 #include "RenderObjectEnums.h"
@@ -59,6 +61,7 @@
 #include "StyleComputedStyle+InitialInlines.h"
 #include "StylePrimitiveNumericTypes+Evaluation.h"
 #include "WritingMode.h"
+#include <array>
 #include <limits>
 #include <wtf/MathExtras.h>
 #include <wtf/SetForScope.h>
@@ -149,6 +152,212 @@ RenderFlexibleBox::OverridingSizesScope::~OverridingSizesScope()
 // When invalidateContentLogicalWidths is true, the flex item's preferred widths are
 // invalidated so that min/maxContentLogicalWidthContribution() will recompute them with the
 // cross-axis override in place. The destructor ASSERTs the dirty flag was consumed.
+enum class SnapFlexInvalidationReason : uint8_t {
+    Skipped,
+    Dirty,
+    CrossAxisIsInline,
+    FlexBasis,
+    ItemShape,
+    DescendantShape,
+    Budget,
+    Count
+};
+
+static constexpr unsigned snapFlexInvalidationWalkBudget = 64;
+
+static bool snapFlexInvalidationSkipEnabled()
+{
+    static bool enabled = [] {
+        const char* value = std::getenv("WEBKIT_SNAP_DISABLE_FLEX_INVALIDATION_SKIP");
+        return !value || std::strcmp(value, "1");
+    }();
+    return enabled;
+}
+
+static bool snapFlexInvalidationCountersEnabled()
+{
+    static bool enabled = [] {
+        const char* value = std::getenv("WEBKIT_SNAP_PATCH_COUNTERS");
+        return value && !std::strcmp(value, "1");
+    }();
+    return enabled;
+}
+
+static void snapFlexInvalidationCount(SnapFlexInvalidationReason reason)
+{
+    static std::array<uint64_t, static_cast<size_t>(SnapFlexInvalidationReason::Count)> counts {};
+    static uint64_t events = 0;
+    ++counts[static_cast<size_t>(reason)];
+    if (++events % 4096)
+        return;
+    WTFLogAlways("Snap flex invalidation: events %llu skipped %llu dirty %llu crossAxisIsInline %llu flexBasis %llu itemShape %llu descendantShape %llu budget %llu",
+        static_cast<unsigned long long>(events),
+        static_cast<unsigned long long>(counts[static_cast<size_t>(SnapFlexInvalidationReason::Skipped)]),
+        static_cast<unsigned long long>(counts[static_cast<size_t>(SnapFlexInvalidationReason::Dirty)]),
+        static_cast<unsigned long long>(counts[static_cast<size_t>(SnapFlexInvalidationReason::CrossAxisIsInline)]),
+        static_cast<unsigned long long>(counts[static_cast<size_t>(SnapFlexInvalidationReason::FlexBasis)]),
+        static_cast<unsigned long long>(counts[static_cast<size_t>(SnapFlexInvalidationReason::ItemShape)]),
+        static_cast<unsigned long long>(counts[static_cast<size_t>(SnapFlexInvalidationReason::DescendantShape)]),
+        static_cast<unsigned long long>(counts[static_cast<size_t>(SnapFlexInvalidationReason::Budget)]));
+}
+
+static bool snapFlexOverflowReservesNoInlineSpace(Overflow overflow)
+{
+    return overflow == Overflow::Visible || overflow == Overflow::Hidden || overflow == Overflow::Clip;
+}
+
+static bool snapFlexRendererIsCrossSizeNeutral(const RenderElement& renderer, bool isHorizontalWritingMode, bool& shouldDescend)
+{
+    shouldDescend = false;
+    const auto& styleToCheck = renderer.style();
+
+    switch (renderer.type()) {
+    case RenderObject::Type::LineBreak:
+        return true;
+    case RenderObject::Type::Inline:
+        if (styleToCheck.display().value != Style::DisplayType::InlineFlow)
+            return false;
+        shouldDescend = true;
+        return true;
+    case RenderObject::Type::BlockFlow:
+    case RenderObject::Type::ListItem:
+        break;
+    default:
+        return false;
+    }
+
+    switch (styleToCheck.display().value) {
+    case Style::DisplayType::BlockFlow:
+    case Style::DisplayType::BlockFlowRoot:
+    case Style::DisplayType::InlineFlowRoot:
+    case Style::DisplayType::BlockFlowListItem:
+        break;
+    default:
+        return false;
+    }
+
+    const auto* box = dynamicDowncast<RenderBox>(renderer);
+    if (!box)
+        return false;
+    if (box->isHorizontalWritingMode() != isHorizontalWritingMode)
+        return false;
+    if (box->isExcludedFromNormalLayout() || box->isFieldset() || box->isLegend())
+        return false;
+    if (styleToCheck.aspectRatio().hasRatio() || box->hasIntrinsicAspectRatio())
+        return false;
+    if (styleToCheck.hasUsedAppearance())
+        return false;
+
+    const auto& logicalHeight = styleToCheck.logicalHeight();
+    if (!logicalHeight.isAuto() && !logicalHeight.tryFixed())
+        return false;
+    const auto& logicalMinHeight = styleToCheck.logicalMinHeight();
+    if (!logicalMinHeight.isAuto() && !logicalMinHeight.tryFixed())
+        return false;
+    const auto& logicalMaxHeight = styleToCheck.logicalMaxHeight();
+    if (!logicalMaxHeight.isNone() && !logicalMaxHeight.tryFixed())
+        return false;
+
+    if (box->shouldInvalidateContentWidths())
+        return false;
+    if (!snapFlexOverflowReservesNoInlineSpace(styleToCheck.overflowX()) || !snapFlexOverflowReservesNoInlineSpace(styleToCheck.overflowY()))
+        return false;
+    if (!styleToCheck.scrollbarGutter().isAuto())
+        return false;
+    if (renderer.shouldApplySizeOrInlineSizeContainment())
+        return false;
+    if (styleToCheck.contentVisibility() != ContentVisibility::Visible)
+        return false;
+    if (styleToCheck.specifiesColumns())
+        return false;
+    if (!styleToCheck.lineClamp().isNone())
+        return false;
+    if (styleToCheck.maxLines().tryValue())
+        return false;
+    if (const auto* block = dynamicDowncast<RenderBlock>(renderer); block && block->hasPercentHeightDescendants())
+        return false;
+
+    shouldDescend = true;
+    return true;
+}
+
+static SnapFlexInvalidationReason snapFlexInvalidationReasonFor(const RenderBox& flexItem, bool crossAxisOverrideIsBlockAxis)
+{
+    if (flexItem.hasInvalidContentLogicalWidths())
+        return SnapFlexInvalidationReason::Dirty;
+    if (!crossAxisOverrideIsBlockAxis)
+        return SnapFlexInvalidationReason::CrossAxisIsInline;
+    if (!flexItem.style().flexBasis().isAuto())
+        return SnapFlexInvalidationReason::FlexBasis;
+
+    auto isHorizontalWritingMode = flexItem.isHorizontalWritingMode();
+    auto budget = snapFlexInvalidationWalkBudget;
+    const RenderObject* current = &flexItem;
+    while (current) {
+        if (!budget--)
+            return SnapFlexInvalidationReason::Budget;
+
+        bool shouldDescend = false;
+        bool isFlexItem = current == &flexItem;
+        if (const auto* renderer = dynamicDowncast<RenderElement>(*current)) {
+            if (isFlexItem || !renderer->isOutOfFlowPositioned()) {
+                if (!snapFlexRendererIsCrossSizeNeutral(*renderer, isHorizontalWritingMode, shouldDescend))
+                    return isFlexItem ? SnapFlexInvalidationReason::ItemShape : SnapFlexInvalidationReason::DescendantShape;
+            }
+        } else if (current->type() != RenderObject::Type::Text && current->type() != RenderObject::Type::TextFragment)
+            return SnapFlexInvalidationReason::DescendantShape;
+
+        if (shouldDescend) {
+            if (auto* child = downcast<RenderElement>(*current).firstChild()) {
+                current = child;
+                continue;
+            }
+        }
+        if (current == &flexItem)
+            return SnapFlexInvalidationReason::Skipped;
+        while (!current->nextSibling()) {
+            current = current->parent();
+            if (!current)
+                return SnapFlexInvalidationReason::DescendantShape;
+            if (current == &flexItem)
+                return SnapFlexInvalidationReason::Skipped;
+        }
+        current = current->nextSibling();
+    }
+    return SnapFlexInvalidationReason::DescendantShape;
+}
+
+bool RenderFlexibleBox::snapShouldSkipContentWidthsInvalidation(const RenderBox& flexItem, bool crossAxisOverrideIsBlockAxis) const
+{
+    if (!snapFlexInvalidationSkipEnabled())
+        return false;
+    if (flexItem.hasInvalidContentLogicalWidths() || !crossAxisOverrideIsBlockAxis) {
+        if (snapFlexInvalidationCountersEnabled()) {
+            snapFlexInvalidationCount(flexItem.hasInvalidContentLogicalWidths() ? SnapFlexInvalidationReason::Dirty : SnapFlexInvalidationReason::CrossAxisIsInline);
+        }
+        return false;
+    }
+    auto generation = document().snapRenderMutationGeneration();
+    if (m_snapCrossSizeMemoGeneration != generation) {
+        m_snapCrossSizeMemo.clear();
+        m_snapCrossSizeMemoGeneration = generation;
+    }
+    if (auto it = m_snapCrossSizeMemo.find(&flexItem); it != m_snapCrossSizeMemo.end()) {
+        if (snapFlexInvalidationCountersEnabled()) {
+            snapFlexInvalidationCount(it->value ? SnapFlexInvalidationReason::Skipped : SnapFlexInvalidationReason::DescendantShape);
+        }
+        return it->value;
+    }
+    auto reason = snapFlexInvalidationReasonFor(flexItem, crossAxisOverrideIsBlockAxis);
+    if (m_snapCrossSizeMemo.size() >= 512) {
+        m_snapCrossSizeMemo.clear();
+    }
+    m_snapCrossSizeMemo.add(&flexItem, reason == SnapFlexInvalidationReason::Skipped);
+    if (snapFlexInvalidationCountersEnabled())
+        snapFlexInvalidationCount(reason);
+    return reason == SnapFlexInvalidationReason::Skipped;
+}
+
 RenderFlexibleBox::ScopedCrossAxisOverrideForFlexItem::ScopedCrossAxisOverrideForFlexItem(const RenderFlexibleBox& flexBox, RenderBox& flexItem, InvalidateContentWidths invalidateContentWidths)
     : m_intrinsicWidthComputation(flexBox.m_inFlexItemIntrinsicWidthComputation, true)
 #if ASSERT_ENABLED
@@ -159,10 +368,22 @@ RenderFlexibleBox::ScopedCrossAxisOverrideForFlexItem::ScopedCrossAxisOverrideFo
         auto axis = FlexFormattingUtils::mainAxisIsFlexItemInlineAxis(flexBox, flexItem) ? OverridingSizesScope::Axis::Block : OverridingSizesScope::Axis::Inline;
         m_overridingScope.emplace(flexItem, axis, FlexFormattingUtils::innerCrossSizeForFlexItem(flexBox, flexItem));
         if (invalidateContentWidths == InvalidateContentWidths::Yes) {
-            flexItem.invalidateContentLogicalWidths(MarkingBehavior::MarkOnlyThis);
+            if (flexBox.snapShouldSkipContentWidthsInvalidation(flexItem, axis == OverridingSizesScope::Axis::Block)) {
+#ifdef WEBKIT_SNAP_VERIFY_PATCHES
+                m_snapVerifiedFlexItem = &flexItem;
+                m_snapCachedMinContribution = flexItem.minContentLogicalWidthContribution();
+                m_snapCachedMaxContribution = flexItem.maxContentLogicalWidthContribution();
+                flexItem.invalidateContentLogicalWidths(MarkingBehavior::MarkOnlyThis);
 #if ASSERT_ENABLED
-            m_didInvalidateContentLogicalWidths = true;
+                m_didInvalidateContentLogicalWidths = true;
 #endif
+#endif
+            } else {
+                flexItem.invalidateContentLogicalWidths(MarkingBehavior::MarkOnlyThis);
+#if ASSERT_ENABLED
+                m_didInvalidateContentLogicalWidths = true;
+#endif
+            }
         }
     } else
         m_overridingScope.emplace(flexItem, OverridingSizesScope::Axis::Both);
@@ -170,6 +391,19 @@ RenderFlexibleBox::ScopedCrossAxisOverrideForFlexItem::ScopedCrossAxisOverrideFo
 
 RenderFlexibleBox::ScopedCrossAxisOverrideForFlexItem::~ScopedCrossAxisOverrideForFlexItem()
 {
+#ifdef WEBKIT_SNAP_VERIFY_PATCHES
+    if (CheckedPtr snapFlexItem = m_snapVerifiedFlexItem) {
+        auto snapStockMinContribution = snapFlexItem->minContentLogicalWidthContribution();
+        auto snapStockMaxContribution = snapFlexItem->maxContentLogicalWidthContribution();
+        if (snapStockMinContribution != m_snapCachedMinContribution || snapStockMaxContribution != m_snapCachedMaxContribution) {
+            WTFLogAlways("Snap flex invalidation skip mismatch: %s skipped min %.2f max %.2f stock min %.2f max %.2f",
+                snapFlexItem->renderName().characters(),
+                m_snapCachedMinContribution.toFloat(), m_snapCachedMaxContribution.toFloat(),
+                snapStockMinContribution.toFloat(), snapStockMaxContribution.toFloat());
+            RELEASE_ASSERT_NOT_REACHED();
+        }
+    }
+#endif
 #if ASSERT_ENABLED
     if (m_didInvalidateContentLogicalWidths)
         ASSERT(!m_flexItem.hasInvalidContentLogicalWidths());

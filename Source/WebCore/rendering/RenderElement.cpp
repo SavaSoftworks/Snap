@@ -1078,6 +1078,7 @@ inline void RenderCounter::rendererStyleChanged(RenderElement& renderer, const S
 
 void RenderElement::styleDidChange(Style::Difference diff, const Style::ComputedStyle* oldStyle)
 {
+    document().snapDidMutateRenderTree();
     RefPtr protectedElement = element();
     if (protectedElement && protectedElement->shouldNotifyTextManipulationControllerIfDisplayed() && !isSkippedContent()) {
         protectedElement->clearShouldNotifyTextManipulationControllerIfDisplayed();

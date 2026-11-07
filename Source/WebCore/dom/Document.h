@@ -1326,6 +1326,8 @@ public:
 
     void incDOMTreeVersion() { m_domTreeVersion = ++s_globalTreeVersion; }
     uint64_t domTreeVersion() const { return m_domTreeVersion; }
+    uint64_t snapRenderMutationGeneration() const { return m_snapRenderMutationGeneration; }
+    void snapDidMutateRenderTree();
 
     WEBCORE_EXPORT String originIdentifierForPasteboard() const;
 
@@ -2352,6 +2354,7 @@ private:
     UserActionElementSet m_userActionElements;
 
     uint64_t m_domTreeVersion;
+    uint64_t m_snapRenderMutationGeneration { 1 };
     static uint64_t s_globalTreeVersion;
 
     mutable String m_uniqueIdentifier;

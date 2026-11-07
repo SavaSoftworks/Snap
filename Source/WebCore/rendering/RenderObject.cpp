@@ -323,6 +323,7 @@ void RenderObject::resetFragmentedFlowStateOnRemoval()
 
 void RenderObject::setParent(RenderElement* parent)
 {
+    document().snapDidMutateRenderTree();
     m_parent = parent;
 }
 
