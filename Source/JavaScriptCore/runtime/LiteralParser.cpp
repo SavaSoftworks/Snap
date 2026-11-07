@@ -26,6 +26,8 @@
 
 #include "config.h"
 #include "LiteralParser.h"
+#include <cstdlib>
+#include <cstring>
 
 #include "CodeBlock.h"
 #include "JSArray.h"
@@ -1548,7 +1550,15 @@ JSValue LiteralParser<CharType, reviverMode>::parseRecursively(VM& vm, uint8_t* 
 
             type = m_lexer.currentToken()->type;
             if (type == TokComma) {
-                type = m_lexer.next();
+                if constexpr (sizeof(CharType) == 2 && parserMode == StrictJSON) {
+                    static const bool useJSONKeyHint = [] {
+                        const char* value = std::getenv("WEBKIT_SNAP_JSC_JSON_KEYS");
+                        return !value || std::strcmp(value, "0");
+                    }();
+                    type = useJSONKeyHint ? m_lexer.nextMaybeIdentifier() : m_lexer.next();
+                } else {
+                    type = m_lexer.next();
+                }
                 bool isPropertyKey = type == TokString;
                 if constexpr (parserMode != StrictJSON)
                     isPropertyKey |= type == TokIdentifier;
