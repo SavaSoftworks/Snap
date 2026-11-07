@@ -196,8 +196,9 @@ GStreamerInternalVideoDecoder::GStreamerInternalVideoDecoder(const String& codec
     auto* factory = gst_element_get_factory(element.get());
     ASCIILiteral parser;
     if (codecName.startsWith("avc1"_s)) {
-        m_inputCaps = adoptGRef(gst_caps_new_simple("video/x-h264", "stream-format", G_TYPE_STRING, "avc", "alignment", G_TYPE_STRING, "au", nullptr));
-        if (auto codecData = wrapSpanData(config.description))
+        auto codecData = wrapSpanData(config.description);
+        m_inputCaps = adoptGRef(gst_caps_new_simple("video/x-h264", "stream-format", G_TYPE_STRING, codecData ? "avc" : "byte-stream", "alignment", G_TYPE_STRING, "au", nullptr));
+        if (codecData)
             gst_caps_set_simple(m_inputCaps.get(), "codec_data", GST_TYPE_BUFFER, codecData.get(), nullptr);
         if (!gst_element_factory_can_sink_all_caps(factory, m_inputCaps.get()))
             parser = "h264parse"_s;
@@ -212,14 +213,16 @@ GStreamerInternalVideoDecoder::GStreamerInternalVideoDecoder(const String& codec
         m_inputCaps = adoptGRef(gst_caps_new_empty_simple("video/x-vp9"));
         parser = "vp9parse"_s;
     } else if (codecName.startsWith("hvc1"_s)) {
-        m_inputCaps = adoptGRef(gst_caps_new_simple("video/x-h265", "stream-format", G_TYPE_STRING, "hvc1", "alignment", G_TYPE_STRING, "au", nullptr));
-        if (auto codecData = wrapSpanData(config.description))
+        auto codecData = wrapSpanData(config.description);
+        m_inputCaps = adoptGRef(gst_caps_new_simple("video/x-h265", "stream-format", G_TYPE_STRING, codecData ? "hvc1" : "byte-stream", "alignment", G_TYPE_STRING, "au", nullptr));
+        if (codecData)
             gst_caps_set_simple(m_inputCaps.get(), "codec_data", GST_TYPE_BUFFER, codecData.get(), nullptr);
         if (!gst_element_factory_can_sink_all_caps(factory, m_inputCaps.get()))
             parser = "h265parse"_s;
     } else if (codecName.startsWith("hev1"_s)) {
-        m_inputCaps = adoptGRef(gst_caps_new_simple("video/x-h265", "stream-format", G_TYPE_STRING, "hev1", "alignment", G_TYPE_STRING, "au", nullptr));
-        if (auto codecData = wrapSpanData(config.description))
+        auto codecData = wrapSpanData(config.description);
+        m_inputCaps = adoptGRef(gst_caps_new_simple("video/x-h265", "stream-format", G_TYPE_STRING, codecData ? "hev1" : "byte-stream", "alignment", G_TYPE_STRING, "au", nullptr));
+        if (codecData)
             gst_caps_set_simple(m_inputCaps.get(), "codec_data", GST_TYPE_BUFFER, codecData.get(), nullptr);
         if (!gst_element_factory_can_sink_all_caps(factory, m_inputCaps.get()))
             parser = "h265parse"_s;
