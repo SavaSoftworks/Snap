@@ -146,11 +146,13 @@ OptionSet<CoordinatedBackingStoreProxy::UpdateResult> CoordinatedBackingStorePro
     // Update the dirty tiles.
     IntRect tileDirtyRectUnion;
     unsigned dirtyTilesCount = 0;
+    uint64_t dirtyArea = 0;
     for (const auto& tile : m_tiles.values()) {
         if (!tile.isDirty())
             continue;
 
         tileDirtyRectUnion.unite(tile.dirtyRect);
+        dirtyArea += static_cast<uint64_t>(tile.dirtyRect.width()) * tile.dirtyRect.height();
         ++dirtyTilesCount;
     }
 
@@ -162,7 +164,20 @@ OptionSet<CoordinatedBackingStoreProxy::UpdateResult> CoordinatedBackingStorePro
 
 #if USE(SKIA)
         // Record only once the whole layer.
-        auto recording = paintingEngine.record(*layer.owner(), tileDirtyRectUnion, contentsOpaque, contentsScale, dirtyTilesCount);
+        static unsigned partitionRatio = [] {
+            const char* value = getenv("WEBKIT_SNAP_PAINT_PARTITION_RATIO");
+            auto ratio = value ? parseInteger<unsigned>(StringView::fromLatin1(value)) : std::optional<unsigned> { 2 };
+            return ratio && *ratio <= 64 ? *ratio : 0U;
+        }();
+        uint64_t unionArea = static_cast<uint64_t>(tileDirtyRectUnion.width()) * tileDirtyRectUnion.height();
+        bool partition = partitionRatio && dirtyTilesCount > 1 && unionArea > dirtyArea * partitionRatio;
+        RefPtr<SkiaRecordingResult> recording;
+        if (!partition) {
+            recording = paintingEngine.record(*layer.owner(), tileDirtyRectUnion, contentsOpaque, contentsScale, dirtyTilesCount);
+        }
+        if (getenv("WEBKIT_SNAP_EXPERIMENT_TRACE")) {
+            WTFLogAlways("Snap paint regions: tiles=%u union=%llu dirty=%llu partition=%d", dirtyTilesCount, static_cast<unsigned long long>(unionArea), static_cast<unsigned long long>(dirtyArea), partition);
+        }
 #endif
 
         unsigned dirtyTileIndex = 0;
@@ -174,7 +189,8 @@ OptionSet<CoordinatedBackingStoreProxy::UpdateResult> CoordinatedBackingStorePro
                 tile.rect.x(), tile.rect.y(), tile.rect.width(), tile.rect.height(), tile.dirtyRect.x(), tile.dirtyRect.y(), tile.dirtyRect.width(), tile.dirtyRect.height());
 
 #if USE(SKIA)
-            auto buffer = paintingEngine.replay(*layer.owner(), recording.copyRef(), tile.rect, tile.dirtyRect);
+            auto tileRecording = partition ? paintingEngine.record(*layer.owner(), tile.dirtyRect, contentsOpaque, contentsScale, 1) : Ref { *recording };
+            auto buffer = paintingEngine.replay(*layer.owner(), WTF::move(tileRecording), tile.rect, tile.dirtyRect);
 #else
             FloatRect scaledDirtyRect(tile.dirtyRect);
             scaledDirtyRect.scale(1 / contentsScale);
