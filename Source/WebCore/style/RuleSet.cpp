@@ -62,6 +62,7 @@ RuleSet::RuleSet() = default;
 
 RuleSet::~RuleSet()
 {
+    snapInvalidateAuthorRuleMemo();
     RELEASE_ASSERT(isMainThread());
     RELEASE_ASSERT(!m_isBuilding);
 }
@@ -147,6 +148,7 @@ void RuleSet::addRule(const StyleRule& rule, unsigned selectorIndex, unsigned se
 
 void RuleSet::addRule(RuleData&& ruleData, CascadeLayerIdentifier cascadeLayerIdentifier, ContainerQueryIdentifier containerQueryIdentifier, ScopeRuleIdentifier scopeRuleIdentifier, RuleFeatureSet::CollectionContext* featureCollectionContext)
 {
+    snapInvalidateAuthorRuleMemo();
     ASSERT(ruleData.position() == m_ruleCount);
 
     ++m_ruleCount;
@@ -653,6 +655,9 @@ RuleSet::CollectedMediaQueryChanges RuleSet::evaluateDynamicMediaQueryRules(cons
         }
     }
 
+    if (collectedChanges.requiredFullReset || !collectedChanges.changedQueryIndexes.isEmpty())
+        snapInvalidateAuthorRuleMemo();
+
     if (affectedRulePositionsAndResults.isEmpty())
         return collectedChanges;
 
@@ -672,6 +677,7 @@ static inline void shrinkMapVectorsToFit(RuleSet::AtomRuleMap& map)
 
 void RuleSet::shrinkToFit()
 {
+    snapInvalidateAuthorRuleMemo();
     shrinkMapVectorsToFit(m_idRules);
     shrinkMapVectorsToFit(m_classRules);
     shrinkMapVectorsToFit(m_attributeLocalNameRules);

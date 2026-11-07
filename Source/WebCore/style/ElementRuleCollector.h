@@ -99,6 +99,13 @@ private:
     void collectMatchingRulesForList(const RuleSet::RuleDataVector&, const MatchRequest&);
     void collectMatchingRulesForListSlow(const RuleSet::RuleDataVector&, const MatchRequest&);
     bool snapCollectUARulesWithMemo(const RuleSet&);
+    bool snapCollectAuthorRulesWithMemo(const MatchRequest&);
+    void snapCollectDynamicAuthorRule(const RuleData&, const MatchRequest&);
+    void snapVerifyAuthorRuleMemoHit(
+        const MatchRequest&,
+        size_t matchedRuleCountBefore,
+        size_t relationCountBefore,
+        EnumSet<PseudoElementType> pseudoElementsBefore);
     void snapCollectDynamicUARule(const RuleData&, const MatchRequest&);
 #ifdef WEBKIT_SNAP_VERIFY_PATCHES
     void snapVerifyUARuleMemoHit(const RuleSet&, size_t relationCountBefore, EnumSet<PseudoElementType> pseudoElementsBefore);

@@ -26,6 +26,7 @@
 #include "RuleData.h"
 #include "RuleFeature.h"
 #include "SelectorCompiler.h"
+#include "SnapAuthorRuleMemo.h"
 #include "StyleRule.h"
 #include <wtf/Forward.h>
 #include <wtf/HashMap.h>
@@ -93,6 +94,8 @@ public:
 
     void addToRuleSet(const AtomString& key, AtomRuleMap&, const RuleData&);
     void shrinkToFit();
+    SnapAuthorRuleMemo& snapAuthorRuleMemo() const { return m_snapAuthorRuleMemo; }
+    void snapInvalidateAuthorRuleMemo() const { m_snapAuthorRuleMemo.clear(); }
 
     bool hasViewportDependentMediaQueries() const { return m_hasViewportDependentMediaQueries; }
 
@@ -265,6 +268,7 @@ private:
 
     // For checking against re-entrancy.
     bool m_isBuilding { false };
+    mutable SnapAuthorRuleMemo m_snapAuthorRuleMemo;
 };
 
 inline const RuleSet::RuleDataVector* RuleSet::attributeRules(const AtomString& key, bool isHTMLName) const
