@@ -30,7 +30,9 @@
 #include "StyleChange.h"
 #include "StyleTreeResolver.h"
 #include "StyleUpdate.h"
+#include <wtf/Noncopyable.h>
 #include <wtf/Vector.h>
+#include <wtf/WeakPtr.h>
 
 namespace WebCore {
 
@@ -43,6 +45,29 @@ class Text;
 namespace Style {
 class ComputedStyle;
 }
+
+class RenderBlock;
+class RenderElement;
+
+class RenderTreeBulkTeardownScope {
+    WTF_MAKE_NONCOPYABLE(RenderTreeBulkTeardownScope);
+
+public:
+    explicit RenderTreeBulkTeardownScope(ContainerNode&);
+    ~RenderTreeBulkTeardownScope();
+
+    static bool isInProgress() { return !!s_current; }
+    static bool repaintAndMarkContainerInsteadOfRoot(const Element&, const RenderElement&);
+
+private:
+    bool coverRoot(const Element&, const RenderElement&);
+
+    static RenderTreeBulkTeardownScope* s_current;
+
+    RenderTreeBulkTeardownScope* const m_previous;
+    const ContainerNode& m_container;
+    SingleThreadWeakPtr<RenderBlock> m_repaintedContainerRenderer;
+};
 
 class RenderTreeUpdater {
 public:

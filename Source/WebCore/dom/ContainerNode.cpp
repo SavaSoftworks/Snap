@@ -172,6 +172,7 @@ ALWAYS_INLINE auto ContainerNode::removeAllChildrenWithScriptAssertion(ChildChan
 
         Ref<Document> { document() }->nodeChildrenWillBeRemoved(*this);
 
+        RenderTreeBulkTeardownScope snapBulkTeardownScope(*this);
         while (RefPtr child = m_firstChild.get()) {
             if (is<Element>(*child))
                 hadElementChild = true;

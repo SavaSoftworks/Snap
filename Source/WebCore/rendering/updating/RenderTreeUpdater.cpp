@@ -25,6 +25,8 @@
 
 #include "config.h"
 #include "RenderTreeUpdater.h"
+#include <cstdlib>
+#include <cstring>
 
 #include "AXObjectCache.h"
 #include "ComposedTreeAncestorIterator.h"
@@ -41,9 +43,12 @@
 #include "LocalFrameViewLayoutContext.h"
 #include "NodeRenderStyle.h"
 #include "PseudoElement.h"
+#include "RenderBlockFlow.h"
+#include "RenderBlockInlines.h"
 #include "RenderBoxInlines.h"
 #include "RenderDescendantIterator.h"
 #include "RenderElementInlines.h"
+#include "RenderElementStyleInlines.h"
 #include "RenderFlexibleBox.h"
 #include "RenderInline.h"
 #include "RenderLayer.h"
@@ -51,17 +56,18 @@
 #include "RenderMultiColumnFlow.h"
 #include "RenderMultiColumnSet.h"
 #include "RenderObjectInlines.h"
+#include "RenderObjectNode.h"
 #include "RenderStyleConstants.h"
 #include "RenderTreeUpdaterGeneratedContent.h"
 #include "RenderTreeUpdaterViewTransition.h"
 #include "RenderView.h"
 #include "SVGElement.h"
 #include "Settings.h"
-#include "StyleableInlines.h"
 #include "StyleComputedStyle+GettersInlines.h"
 #include "StyleComputedStyle+SettersInlines.h"
 #include "StyleResolver.h"
 #include "StyleTreeResolver.h"
+#include "StyleableInlines.h"
 #include "TextManipulationController.h"
 #include <wtf/Scope.h>
 #include <wtf/SystemTracing.h>
@@ -749,6 +755,210 @@ void RenderTreeUpdater::tearDownRenderer(Text& text)
     invalidateRebuildRootIfNeeded(text);
 }
 
+static bool snapBulkTeardownEnabled()
+{
+    static bool enabled = [] {
+        const char* value = std::getenv("WEBKIT_SNAP_DISABLE_BULK_TEARDOWN");
+        return !value || std::strcmp(value, "1");
+    }();
+    return enabled;
+}
+
+static bool snapBulkTeardownCountersEnabled()
+{
+    static bool enabled = [] {
+        const char* value = std::getenv("WEBKIT_SNAP_PATCH_COUNTERS");
+        return value && !std::strcmp(value, "1");
+    }();
+    return enabled;
+}
+
+struct SnapBulkTeardownCounters {
+    unsigned long long scopes { 0 };
+    unsigned long long roots { 0 };
+    unsigned long long batchedRoots { 0 };
+    unsigned long long containerRepaints { 0 };
+};
+
+static SnapBulkTeardownCounters& snapBulkTeardownCounters()
+{
+    static SnapBulkTeardownCounters counters;
+    return counters;
+}
+
+static void snapNoteBulkTeardownRoot(bool batched)
+{
+    auto& counters = snapBulkTeardownCounters();
+    ++counters.roots;
+    if (batched)
+        ++counters.batchedRoots;
+    if (!(counters.roots % 4096))
+        WTFLogAlways("Snap bulk teardown: scopes=%llu roots=%llu batched=%llu containerRepaints=%llu", counters.scopes, counters.roots, counters.batchedRoots, counters.containerRepaints);
+}
+
+static bool snapBulkTeardownIsUnsupportedBoxKind(const RenderBlock& renderer)
+{
+    return renderer.isAnonymous()
+        || renderer.isRenderView()
+        || renderer.isBody()
+        || renderer.isDocumentElementRenderer()
+        || renderer.isRenderTable()
+        || renderer.isRenderTableCell()
+        || renderer.isRenderTableCaption()
+        || renderer.isRenderTableSection()
+        || renderer.isRenderSVGBlock()
+        || renderer.isRenderFragmentedFlow()
+        || renderer.isRenderMultiColumnSet()
+        || renderer.isRenderMultiColumnSpannerPlaceholder()
+        || renderer.isRenderTextControl();
+}
+
+static bool snapBulkTeardownIsFragmented(const RenderBlock& renderer)
+{
+    if (renderer.fragmentedFlowState() != RenderObject::FragmentedFlowState::NotInsideFlow)
+        return true;
+    auto* blockFlow = dynamicDowncast<RenderBlockFlow>(renderer);
+    return blockFlow && blockFlow->multiColumnFlow();
+}
+
+static RenderBlock* snapBulkTeardownContainerRenderer(const ContainerNode& container)
+{
+    if (!is<Element>(container))
+        return nullptr;
+    auto* renderer = dynamicDowncast<RenderBlock>(container.renderer());
+    if (!renderer)
+        return nullptr;
+    if (renderer->renderTreeBeingDestroyed() || !renderer->everHadLayout())
+        return nullptr;
+    if (snapBulkTeardownIsUnsupportedBoxKind(*renderer) || snapBulkTeardownIsFragmented(*renderer))
+        return nullptr;
+    if (renderer->childrenInline())
+        return nullptr;
+    if (renderer->usesCompositedScrolling())
+        return nullptr;
+    if (renderer->capturedInViewTransition())
+        return nullptr;
+    if (renderer->document().activeViewTransition())
+        return nullptr;
+    if (renderer->view().frameView().layoutContext().isInLayout())
+        return nullptr;
+    if (renderer->view().printing())
+        return nullptr;
+    return renderer;
+}
+
+static bool snapBulkTeardownRootIsCovered(const RenderElement& rootRenderer, const RenderBlock& containerRenderer)
+{
+    auto* rootBlock = dynamicDowncast<RenderBlock>(rootRenderer);
+    if (!rootBlock)
+        return false;
+    if (rootBlock->parent() != &containerRenderer || rootBlock->container() != &containerRenderer)
+        return false;
+    if (!rootBlock->everHadLayout())
+        return false;
+    if (rootBlock->hasLayer() || rootBlock->isInline())
+        return false;
+    if (rootBlock->isFloating() || rootBlock->isPositioned())
+        return false;
+    if (rootBlock->style().position() != PositionType::Static)
+        return false;
+    if (snapBulkTeardownIsUnsupportedBoxKind(*rootBlock) || snapBulkTeardownIsFragmented(*rootBlock))
+        return false;
+    if (rootBlock->hasOutlineAutoAncestor() || rootBlock->capturedInViewTransition())
+        return false;
+    if (rootBlock->isWritingModeRoot() || rootBlock->shouldApplyAnyContainment())
+        return false;
+    if (rootBlock->hasReflection() || rootBlock->hasFilter())
+        return false;
+    unsigned remaining = 256;
+    for (auto* descendant = rootRenderer.firstChild(); descendant; descendant = descendant->nextInPreOrder(&rootRenderer)) {
+        if (!remaining-- || descendant->hasLayer() || descendant->isFloating() || descendant->isPositioned()) {
+            return false;
+        }
+        if (auto* element = dynamicDowncast<RenderElement>(*descendant)) {
+            if (element->hasReflection() || element->hasFilter() || element->shouldApplyAnyContainment()
+                || element->capturedInViewTransition() || element->hasOutlineAutoAncestor()) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool snapBulkTeardownVerifyCoverage(const RenderElement& rootRenderer, const RenderBlock& containerRenderer)
+{
+    auto rootStatus = rootRenderer.containerForRepaint();
+    auto containerStatus = containerRenderer.containerForRepaint();
+    if (rootStatus.renderer.get() != containerStatus.renderer.get()) {
+        if (snapBulkTeardownCountersEnabled())
+            WTFLogAlways("Snap bulk teardown verify: repaint container differs between removed root %p and its container %p, falling back to the stock root repaint", &rootRenderer, &containerRenderer);
+        return false;
+    }
+    if (containerStatus.fullRepaintIsScheduled != rootStatus.fullRepaintIsScheduled) {
+        if (snapBulkTeardownCountersEnabled())
+            WTFLogAlways("Snap bulk teardown verify: scheduled full repaint state differs between removed root %p and its container %p, falling back to the stock root repaint", &rootRenderer, &containerRenderer);
+        return false;
+    }
+    auto rootRect = rootRenderer.clippedOverflowRectForRepaint(rootStatus.renderer.get());
+    if (rootRect.isEmpty())
+        return true;
+    auto containerRect = containerRenderer.clippedOverflowRectForRepaint(containerStatus.renderer.get());
+    if (containerRect.contains(rootRect))
+        return true;
+    if (snapBulkTeardownCountersEnabled())
+        WTFLogAlways("Snap bulk teardown verify: removed root %p repaint rect (%d,%d %dx%d) is not covered by container %p repaint rect (%d,%d %dx%d), falling back to the stock root repaint", &rootRenderer, rootRect.x().toInt(), rootRect.y().toInt(), rootRect.width().toInt(), rootRect.height().toInt(), &containerRenderer, containerRect.x().toInt(), containerRect.y().toInt(), containerRect.width().toInt(), containerRect.height().toInt());
+    return false;
+}
+
+RenderTreeBulkTeardownScope* RenderTreeBulkTeardownScope::s_current = nullptr;
+
+RenderTreeBulkTeardownScope::RenderTreeBulkTeardownScope(ContainerNode& container)
+    : m_previous(s_current)
+    , m_container(container)
+{
+    s_current = this;
+    if (snapBulkTeardownCountersEnabled())
+        ++snapBulkTeardownCounters().scopes;
+}
+
+RenderTreeBulkTeardownScope::~RenderTreeBulkTeardownScope()
+{
+    s_current = m_previous;
+}
+
+bool RenderTreeBulkTeardownScope::repaintAndMarkContainerInsteadOfRoot(const Element& root, const RenderElement& rootRenderer)
+{
+    auto* scope = s_current;
+    if (!scope || !snapBulkTeardownEnabled())
+        return false;
+    bool batched = scope->coverRoot(root, rootRenderer);
+    if (snapBulkTeardownCountersEnabled())
+        snapNoteBulkTeardownRoot(batched);
+    return batched;
+}
+
+bool RenderTreeBulkTeardownScope::coverRoot(const Element& root, const RenderElement& rootRenderer)
+{
+    if (root.parentNode() != &m_container)
+        return false;
+    auto* containerRenderer = snapBulkTeardownContainerRenderer(m_container);
+    if (!containerRenderer)
+        return false;
+    if (!snapBulkTeardownRootIsCovered(rootRenderer, *containerRenderer))
+        return false;
+    if (!snapBulkTeardownVerifyCoverage(rootRenderer, *containerRenderer))
+        return false;
+    if (m_repaintedContainerRenderer.get() != containerRenderer) {
+        containerRenderer->repaint();
+        containerRenderer->setChildNeedsLayout();
+        containerRenderer->invalidateContentLogicalWidths();
+        m_repaintedContainerRenderer = containerRenderer;
+        if (snapBulkTeardownCountersEnabled())
+            ++snapBulkTeardownCounters().containerRepaints;
+    }
+    return true;
+}
+
 enum class DidRepaintAndMarkContainingBlock : bool { No, Yes };
 static std::optional<DidRepaintAndMarkContainingBlock> repaintAndMarkContainingBlockDirtyBeforeTearDown(const Element& root, auto composedTreeDescendantsIterator)
 {
@@ -796,9 +1006,12 @@ static std::optional<DidRepaintAndMarkContainingBlock> repaintAndMarkContainingB
     };
 
     if (destroyRootRenderer) {
-        repaintRoot(*destroyRootRenderer);
+        bool snapBatchedIntoContainer = RenderTreeBulkTeardownScope::repaintAndMarkContainerInsteadOfRoot(root, *destroyRootRenderer);
+        if (!snapBatchedIntoContainer)
+            repaintRoot(*destroyRootRenderer);
         repaintBackdropIfApplicable(*destroyRootRenderer);
-        markContainingBlockDirty(*destroyRootRenderer);
+        if (!snapBatchedIntoContainer)
+            markContainingBlockDirty(*destroyRootRenderer);
     }
 
     for (auto it = composedTreeDescendantsIterator.begin(), end = composedTreeDescendantsIterator.end(); it != end; ++it) {
