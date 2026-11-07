@@ -26,6 +26,9 @@
 
 #include "config.h"
 #include "YarrJIT.h"
+#include <bit>
+#include <cstdlib>
+#include <cstring>
 
 #include "AllowMacroScratchRegisterUsage.h"
 #include "CCallHelpers.h"
@@ -391,12 +394,17 @@ public:
 
         // Need exactly 2 alternatives
         auto& alternatives = disjunction.m_alternatives;
-        if (alternatives.size() != maxAlternatives)
+        static const bool mergeThreeAlternatives = [] {
+            const char* value = std::getenv("WEBKIT_SNAP_JSC_REGEXP_ALTERNATIVES");
+            return !value || std::strcmp(value, "0");
+        }();
+        if (alternatives.size() != maxAlternatives && !(mergeThreeAlternatives && alternatives.size() == 3))
             return std::nullopt;
 
         // Both alternatives must have at least 4 characters and be fixed-size
         info.minPatternLength = UINT32_MAX;
-        for (unsigned i = 0; i < maxAlternatives; ++i) {
+        std::array<Alternative, 3> prefixes {};
+        for (unsigned i = 0; i < alternatives.size(); ++i) {
             const PatternAlternative* alt = alternatives[i].get();
             if (!alt->m_hasFixedSize)
                 return std::nullopt;
@@ -445,10 +453,36 @@ public:
             if (charIndex < patternBytes)
                 return std::nullopt; // Not enough characters
 
-            info.alternatives[i].chars = chars;
-            info.alternatives[i].mask = mask;
+            prefixes[i].chars = chars & mask;
+            prefixes[i].mask = mask;
         }
 
+        if (alternatives.size() == 3) {
+            unsigned bestBits = 0;
+            unsigned first = 0;
+            unsigned second = 1;
+            uint32_t bestMask = 0;
+            for (unsigned a = 0; a < 3; ++a) {
+                for (unsigned b = a + 1; b < 3; ++b) {
+                    uint32_t mask = prefixes[a].mask & prefixes[b].mask & ~(prefixes[a].chars ^ prefixes[b].chars);
+                    unsigned bits = std::popcount(mask);
+                    if (bits > bestBits) {
+                        bestBits = bits;
+                        first = a;
+                        second = b;
+                        bestMask = mask;
+                    }
+                }
+            }
+            if (bestBits < 20) {
+                return std::nullopt;
+            }
+            info.alternatives[0] = { prefixes[first].chars & bestMask, bestMask };
+            info.alternatives[1] = prefixes[3 - first - second];
+        } else {
+            info.alternatives[0] = prefixes[0];
+            info.alternatives[1] = prefixes[1];
+        }
         info.numAlternatives = 2;
         return info;
     }
