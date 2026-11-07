@@ -28,18 +28,26 @@
 
 #if ENABLE(WPE_PLATFORM)
 
+#include "APIContextMenuClient.h"
 #include "APINavigationAction.h"
 #include "APINavigationClient.h"
 #include "APIPageConfiguration.h"
 #include "WPEWebViewPlatform.h"
+#include "WebContextMenuProxy.h"
 #include "WebFramePolicyListenerProxy.h"
 #include "WebInspectorUIProxyGLib.h"
+#include "WebKitContextMenuPrivate.h"
+#include "WebKitHitTestResultPrivate.h"
+#include "WebKitOptionMenuPrivate.h"
+#include "WebKitUserContentPrivate.h"
 #include "WebPageGroup.h"
 #include "WebPageProxy.h"
 #include "WebPreferences.h"
 #include "WebProcessPool.h"
+#include "WebUserContentControllerProxy.h"
 #include "WebsiteDataStore.h"
 #include <WebCore/CertificateInfo.h>
+#include <WebCore/Color.h>
 #include <WebCore/FloatRect.h>
 #include <WebCore/InspectorFrontendClient.h>
 #include <WebCore/NotImplemented.h>
@@ -51,6 +59,29 @@
 #include <wtf/text/WTFString.h>
 
 namespace WebKit {
+
+class EdenInspectorContextMenuClient final : public API::ContextMenuClient {
+public:
+    explicit EdenInspectorContextMenuClient(WPEView* view)
+        : m_view(view)
+    {
+    }
+
+private:
+    void getContextMenuFromProposedMenu(WebPageProxy& page, Vector<Ref<WebContextMenuItem>>&& proposedMenu, WebContextMenuListenerProxy& listener, const WebHitTestResultData& hitTest, API::Object*) final
+    {
+        auto items = WTF::map(proposedMenu, [](auto& item) { return item->data(); });
+        GRefPtr<WebKitContextMenu> menu = adoptGRef(webkitContextMenuCreate(items));
+        webkitContextMenuSetPage(menu.get(), &page);
+        if (auto* proxy = page.activeContextMenu()) {
+            webkitContextMenuSetPosition(menu.get(), proxy->menuLocation());
+        }
+        GRefPtr<WebKitHitTestResult> result = adoptGRef(webkitHitTestResultCreate(hitTest));
+        g_signal_emit_by_name(m_view, "eden-context-menu-v1", menu.get(), result.get());
+        listener.useContextMenuItems({});
+    }
+    WPEView* m_view;
+};
 
 class InspectorNavigationClient final : public API::NavigationClient {
 public:
@@ -96,12 +127,7 @@ private:
 
 static Ref<WebsiteDataStore> inspectorWebsiteDataStore()
 {
-    static constexpr auto versionedDirectory = "wpewebkit-" WPE_API_VERSION G_DIR_SEPARATOR_S "WebInspector" G_DIR_SEPARATOR_S ""_s;
-    String baseCacheDirectory = FileSystem::pathByAppendingComponent(FileSystem::userCacheDirectory(), versionedDirectory);
-    String baseDataDirectory = FileSystem::pathByAppendingComponent(FileSystem::userDataDirectory(), versionedDirectory);
-
-    auto configuration = WebsiteDataStoreConfiguration::createWithBaseDirectories(baseCacheDirectory, baseDataDirectory);
-    return WebsiteDataStore::create(WTF::move(configuration), PAL::SessionID::generatePersistentSessionID());
+    return WebsiteDataStore::createNonPersistent();
 }
 
 RefPtr<WebPageProxy> WebInspectorUIProxy::platformCreateFrontendPage()
@@ -153,6 +179,27 @@ RefPtr<WebPageProxy> WebInspectorUIProxy::platformCreateFrontendPage()
     }), this);
 
     Ref page = m_inspectorView->page();
+    if (!g_signal_lookup("eden-context-menu-v1", WPE_TYPE_VIEW)) {
+        g_signal_new("eden-context-menu-v1", WPE_TYPE_VIEW, G_SIGNAL_RUN_LAST, 0, nullptr, nullptr, nullptr, G_TYPE_NONE, 2, WEBKIT_TYPE_CONTEXT_MENU, WEBKIT_TYPE_HIT_TEST_RESULT);
+    }
+    if (!g_signal_lookup("eden-option-menu-v1", WPE_TYPE_VIEW)) {
+        g_signal_new("eden-option-menu-v1", WPE_TYPE_VIEW, G_SIGNAL_RUN_LAST, 0, nullptr, nullptr, nullptr, G_TYPE_NONE, 5, WEBKIT_TYPE_OPTION_MENU, G_TYPE_INT, G_TYPE_INT, G_TYPE_INT, G_TYPE_INT);
+    }
+    if (!g_signal_lookup("eden-inspector-style-v1", WPE_TYPE_VIEW)) {
+        g_signal_new("eden-inspector-style-v1", WPE_TYPE_VIEW, G_SIGNAL_RUN_LAST, 0, nullptr, nullptr, nullptr, G_TYPE_NONE, 1, G_TYPE_STRING);
+    }
+    g_signal_connect(wpeView, "eden-inspector-style-v1", G_CALLBACK(+[](WPEView*, const char* css, WebInspectorUIProxy* proxy) {
+        if (!proxy->m_inspectorView || !css)
+            return;
+        Ref inspectorPage = proxy->m_inspectorView->page();
+        inspectorPage->userContentController().removeAllUserStyleSheets();
+        WebKitUserStyleSheet* sheet = webkit_user_style_sheet_new(css, WEBKIT_USER_CONTENT_INJECT_TOP_FRAME, WEBKIT_USER_STYLE_LEVEL_USER, nullptr, nullptr);
+        inspectorPage->userContentController().addUserStyleSheet(webkitUserStyleSheetGetUserStyleSheet(sheet));
+        webkit_user_style_sheet_unref(sheet);
+    }),
+        this);
+    page->setBackgroundColor(WebCore::Color::transparentBlack);
+    page->setContextMenuClient(makeUnique<EdenInspectorContextMenuClient>(wpeView));
     page->setNavigationClient(makeUniqueRef<InspectorNavigationClient>(*this));
     return page;
 }
@@ -165,8 +212,10 @@ void WebInspectorUIProxy::platformCreateFrontendWindow()
 
 void WebInspectorUIProxy::platformCloseFrontendPageAndWindow()
 {
-    if (m_inspectorView)
+    if (m_inspectorView) {
         g_signal_handlers_disconnect_by_data(m_inspectorView->wpeView(), this);
+        wpe_view_closed(m_inspectorView->wpeView());
+    }
     m_inspectorView = nullptr;
     m_inspectorWindow = nullptr;
 }
@@ -223,7 +272,7 @@ void WebInspectorUIProxy::platformInspectedURLChanged(const String& url)
     if (!m_inspectorWindow)
         return;
 
-    GUniquePtr<char> title(g_strdup_printf("Web Inspector — %s", url.utf8().data()));
+    GUniquePtr<char> title(g_strdup_printf("Web Inspector (%s)", url.utf8().data()));
     wpe_toplevel_set_title(m_inspectorWindow.get(), title.get());
 }
 

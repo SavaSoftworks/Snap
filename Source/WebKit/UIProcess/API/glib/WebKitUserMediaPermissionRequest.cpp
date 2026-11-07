@@ -82,6 +82,20 @@ static void webkitUserMediaPermissionRequestAllow(WebKitPermissionRequest* reque
     auto videoDevice = !videoDeviceUIDs.isEmpty() ? videoDeviceUIDs[0] : emptyString();
     auto audioDevice = !audioDeviceUIDs.isEmpty() ? audioDeviceUIDs[0] : emptyString();
 
+    if (priv->request->requiresDisplayCapture()) {
+        auto type = g_object_get_data(G_OBJECT(request), "eden-display-window-v1") ? WebCore::CaptureDevice::DeviceType::Window : WebCore::CaptureDevice::DeviceType::Screen;
+        videoDevice = emptyString();
+        for (const auto& device : priv->request->eligibleVideoDevices()) {
+            if (device.type() == type) {
+                videoDevice = device.persistentId();
+                break;
+            }
+        }
+        if (videoDevice.isEmpty()) {
+            priv->request->deny(UserMediaPermissionRequestProxy::UserMediaAccessDenialReason::NoCaptureDevices);
+            return;
+        }
+    }
     priv->request->allow(audioDevice, videoDevice);
 }
 

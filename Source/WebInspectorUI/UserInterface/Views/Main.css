@@ -344,6 +344,8 @@ body[dir=rtl] [dir=ltr] .go-to-arrow {
     background-repeat: no-repeat;
     width: 1em;
     height: 1em;
+    font: inherit;
+    line-height: 1;
     vertical-align: -2px;
 }
 

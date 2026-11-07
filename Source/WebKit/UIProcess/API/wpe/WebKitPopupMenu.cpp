@@ -25,12 +25,15 @@
 #include "WebKitOptionMenuPrivate.h"
 #include "WebKitWebViewClient.h"
 
+#if ENABLE(WPE_PLATFORM)
+#include <wpe/wpe-platform.h>
+#endif
+
 namespace WebKit {
 using namespace WebCore;
 
 Ref<WebKitPopupMenu> WebKitPopupMenu::create(WKWPE::View& view, WebPopupMenuProxy::Client& client)
 {
-    ASSERT(view.client().isGLibBasedAPI());
     return adoptRef(*new WebKitPopupMenu(view, client));
 }
 
@@ -47,7 +50,18 @@ static void menuCloseCallback(WebKitPopupMenu* popupMenu)
 
 void WebKitPopupMenu::showPopupMenu(const IntRect& rect, TextDirection direction, double pageScaleFactor, const Vector<WebPopupItem>& items, const PlatformPopupMenuData& platformData, int32_t selectedIndex)
 {
-    GRefPtr<WebKitOptionMenu> menu = static_cast<WebKitWebViewClient&>(m_view.client()).showOptionMenu(*this, rect, items, selectedIndex);
+    GRefPtr<WebKitOptionMenu> menu;
+    if (m_view.client().isGLibBasedAPI())
+        menu = static_cast<WebKitWebViewClient&>(m_view.client()).showOptionMenu(*this, rect, items, selectedIndex);
+#if ENABLE(WPE_PLATFORM)
+    else if (auto* wpeView = m_view.wpeView()) {
+        const guint signal = g_signal_lookup("eden-option-menu-v1", WPE_TYPE_VIEW);
+        if (signal && g_signal_has_handler_pending(wpeView, signal, 0, TRUE)) {
+            menu = adoptGRef(webkitOptionMenuCreate(*this, items, selectedIndex));
+            g_signal_emit_by_name(wpeView, "eden-option-menu-v1", menu.get(), rect.x(), rect.y(), rect.width(), rect.height());
+        }
+    }
+#endif
     if (menu) {
         m_menu = WTF::move(menu);
         g_signal_connect_swapped(m_menu.get(), "close", G_CALLBACK(menuCloseCallback), this);

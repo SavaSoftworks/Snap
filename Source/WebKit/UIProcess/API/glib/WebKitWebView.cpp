@@ -24,12 +24,15 @@
 
 #include "APIContentWorld.h"
 #include "APIData.h"
+#include "APIIconLoadingClient.h"
 #include "APINavigation.h"
 #include "APIPageConfiguration.h"
 #include "APISerializedScriptValue.h"
 #include "FrameInfoData.h"
 #include "ImageOptions.h"
 #include "JavaScriptEvaluationResult.h"
+#include "NetworkProcessMessages.h"
+#include "NetworkProcessProxy.h"
 #include "NotificationService.h"
 #include "PageLoadState.h"
 #include "PlatformXRSystem.h"
@@ -40,6 +43,7 @@
 #include "WebContextMenuItem.h"
 #include "WebContextMenuItemData.h"
 #include "WebFrameProxy.h"
+#include "WebInspectorUIProxy.h"
 #include "WebKitAuthenticationRequestPrivate.h"
 #include "WebKitBackForwardListPrivate.h"
 #include "WebKitContextMenuClient.h"
@@ -96,6 +100,7 @@
 #include <wtf/glib/GRefPtr.h>
 #include <wtf/glib/GSpanExtras.h>
 #include <wtf/glib/GUniquePtr.h>
+#include <wtf/glib/GWeakPtr.h>
 #include <wtf/glib/WTFGType.h>
 #include <wtf/text/CStringView.h>
 #include <wtf/text/StringBuilder.h>
@@ -525,18 +530,10 @@ void webkitWebViewIsPlayingAudioChanged(WebKitWebView* webView)
 
 void webkitWebViewMediaCaptureStateDidChange(WebKitWebView* webView, WebCore::MediaProducer::MediaStateFlags mediaStateFlags)
 {
-    if (mediaStateFlags.isEmpty()) {
-        g_object_notify_by_pspec(G_OBJECT(webView), sObjProperties[PROP_CAMERA_CAPTURE_STATE]);
-        g_object_notify_by_pspec(G_OBJECT(webView), sObjProperties[PROP_DISPLAY_CAPTURE_STATE]);
-        g_object_notify_by_pspec(G_OBJECT(webView), sObjProperties[PROP_MICROPHONE_CAPTURE_STATE]);
-        return;
-    }
-    if (mediaStateFlags.containsAny(WebCore::MediaProducer::MicrophoneCaptureMask))
-        g_object_notify_by_pspec(G_OBJECT(webView), sObjProperties[PROP_MICROPHONE_CAPTURE_STATE]);
-    if (mediaStateFlags.containsAny(WebCore::MediaProducer::VideoCaptureMask))
-        g_object_notify_by_pspec(G_OBJECT(webView), sObjProperties[PROP_CAMERA_CAPTURE_STATE]);
-    if (mediaStateFlags.containsAny(WebCore::MediaProducer::DisplayCaptureMask))
-        g_object_notify_by_pspec(G_OBJECT(webView), sObjProperties[PROP_DISPLAY_CAPTURE_STATE]);
+    UNUSED_PARAM(mediaStateFlags);
+    g_object_notify_by_pspec(G_OBJECT(webView), sObjProperties[PROP_CAMERA_CAPTURE_STATE]);
+    g_object_notify_by_pspec(G_OBJECT(webView), sObjProperties[PROP_DISPLAY_CAPTURE_STATE]);
+    g_object_notify_by_pspec(G_OBJECT(webView), sObjProperties[PROP_MICROPHONE_CAPTURE_STATE]);
 }
 
 
@@ -928,6 +925,45 @@ static void webkitWebViewCreatePage(WebKitWebView* webView, Ref<API::PageConfigu
 #endif
 }
 
+class EdenIconLoadingClient final : public API::IconLoadingClient {
+    WTF_MAKE_TZONE_ALLOCATED_INLINE(EdenIconLoadingClient);
+
+public:
+    explicit EdenIconLoadingClient(WebKitWebView* view)
+        : m_view(view)
+    {
+    }
+
+private:
+    void getLoadDecisionForIcons(const HashMap<WebKit::CallbackID, WebCore::LinkIcon>& icons, CompletionHandler<void(HashSet<WebKit::CallbackID>&&)>&& completionHandler) final
+    {
+        m_pageURLs.clear();
+        HashSet<WebKit::CallbackID> accepted;
+        if (auto* view = m_view.get()) {
+            auto pageURL = getPage(view).pageLoadState().activeURL();
+            for (const auto& [identifier, icon] : icons) {
+                if (icon.type == WebCore::LinkIconType::Favicon && icon.url.protocolIsInHTTPFamily()) {
+                    accepted.add(identifier);
+                    m_pageURLs.add(identifier, pageURL);
+                }
+            }
+        }
+        completionHandler(WTF::move(accepted));
+    }
+    void iconLoaded(const WebKit::CallbackID& identifier, const WebCore::LinkIcon&, API::Data* data) final
+    {
+        auto pageURL = m_pageURLs.take(identifier);
+        auto* view = m_view.get();
+        if (!view || pageURL.isEmpty() || !data || data->size() > 262144 || getPage(view).pageLoadState().activeURL() != pageURL) {
+            return;
+        }
+        GRefPtr<GBytes> bytes = adoptGRef(g_bytes_new(data->span().data(), data->size()));
+        g_signal_emit_by_name(view, "eden-favicon-v1", bytes.get());
+    }
+    GWeakPtr<WebKitWebView> m_view;
+    HashMap<WebKit::CallbackID, WTF::URL> m_pageURLs;
+};
+
 static void webkitWebViewConstructed(GObject* object)
 {
     G_OBJECT_CLASS(webkit_web_view_parent_class)->constructed(object);
@@ -1034,7 +1070,7 @@ static void webkitWebViewConstructed(GObject* object)
     attachFormClientToView(webView);
 
 #if PLATFORM(GTK) || ENABLE(2022_GLIB_API)
-    attachIconLoadingClientToView(webView);
+    getPage(webView).setIconLoadingClient(makeUnique<EdenIconLoadingClient>(webView));
 #endif
 
 #if PLATFORM(GTK)
@@ -1325,8 +1361,41 @@ static gboolean webkitWebViewAccumulatorObjectHandled(GSignalInvocationHint*, GV
     return !object;
 }
 
+static gint64 edenRendererProcessID(WebKitWebView* view)
+{
+    auto& page = getPage(view);
+    return page.hasRunningProcess() ? page.legacyMainFrameProcessID() : 0;
+}
+
+static void edenShowPageSource(WebKitWebView* view)
+{
+    auto& page = getPage(view);
+    if (auto* frame = page.mainFrame()) {
+        if (auto* inspector = page.inspector())
+            inspector->showMainResourceForFrame(frame->frameID());
+    }
+}
+
+static void edenFlushNetworkSession(WebKitNetworkSession* session, GAsyncReadyCallback callback, gpointer userData)
+{
+    GRefPtr<GTask> task = adoptGRef(g_task_new(session, nullptr, callback, userData));
+    Ref store = webkitWebsiteDataManagerGetDataStore(webkit_network_session_get_website_data_manager(session));
+    store->syncLocalStorage([store, task = WTF::move(task)]() mutable {
+        Ref networkProcess = store->networkProcess();
+        networkProcess->sendWithAsyncReply(Messages::NetworkProcess::FlushCookies(store->sessionID()), [store, task = WTF::move(task)]() mutable {
+            g_task_return_boolean(task.get(), TRUE);
+        });
+    });
+}
+
 static void webkit_web_view_class_init(WebKitWebViewClass* webViewClass)
 {
+    g_type_set_qdata(WEBKIT_TYPE_WEB_VIEW, g_quark_from_static_string("eden-renderer-process-id-v1"), reinterpret_cast<gpointer>(edenRendererProcessID));
+    g_type_set_qdata(WEBKIT_TYPE_WEB_VIEW, g_quark_from_static_string("eden-show-page-source-v1"), reinterpret_cast<gpointer>(edenShowPageSource));
+    g_type_set_qdata(WEBKIT_TYPE_WEB_VIEW, g_quark_from_static_string("eden-embedding-api-v1"), GINT_TO_POINTER(1));
+    g_type_set_qdata(WEBKIT_TYPE_NETWORK_SESSION, g_quark_from_static_string("eden-flush-storage-v1"), reinterpret_cast<gpointer>(edenFlushNetworkSession));
+    g_signal_new("eden-favicon-v1", G_TYPE_FROM_CLASS(webViewClass), G_SIGNAL_RUN_LAST, 0, nullptr, nullptr, nullptr, G_TYPE_NONE, 1, G_TYPE_BYTES);
+    g_signal_new("eden-focus-v1", G_TYPE_FROM_CLASS(webViewClass), G_SIGNAL_RUN_LAST, 0, nullptr, nullptr, nullptr, G_TYPE_NONE, 1, G_TYPE_INT);
     GObjectClass* gObjectClass = G_OBJECT_CLASS(webViewClass);
 
     gObjectClass->constructed = webkitWebViewConstructed;
@@ -5980,9 +6049,9 @@ void webkit_web_view_set_microphone_capture_state(WebKitWebView* webView, WebKit
 WebKitMediaCaptureState webkit_web_view_get_display_capture_state(WebKitWebView* webView)
 {
     auto state = getPage(webView).reportedMediaState();
-    if (state & WebCore::MediaProducer::MediaState::HasActiveScreenCaptureDevice)
+    if (state.containsAny({ WebCore::MediaProducer::MediaState::HasActiveScreenCaptureDevice, WebCore::MediaProducer::MediaState::HasActiveWindowCaptureDevice }))
         return WEBKIT_MEDIA_CAPTURE_STATE_ACTIVE;
-    if (state & WebCore::MediaProducer::MediaState::HasMutedScreenCaptureDevice)
+    if (state.containsAny({ WebCore::MediaProducer::MediaState::HasMutedScreenCaptureDevice, WebCore::MediaProducer::MediaState::HasMutedWindowCaptureDevice }))
         return WEBKIT_MEDIA_CAPTURE_STATE_MUTED;
     return WEBKIT_MEDIA_CAPTURE_STATE_NONE;
 }

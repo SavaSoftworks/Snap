@@ -32,6 +32,7 @@
 #include "WebProcessPool.h"
 #include <WebCore/SystemSettings.h>
 #include <WebCore/Theme.h>
+#include <glib.h>
 
 namespace WebKit {
 using namespace WebCore;
@@ -121,6 +122,21 @@ WebCore::InterfaceContrastPreference SystemSettingsManagerProxy::interfaceContra
 void SystemSettingsManagerProxy::updateFontProperties(const String& fontName, WebCore::SystemSettingsState& changedState)
 {
     changedState.fontName = fontName;
+    String family = fontName;
+    double points = 10;
+    if (auto index = fontName.reverseFind(' '); index != notFound) {
+        auto sizeText = fontName.substring(index + 1).utf8();
+        char* end = nullptr;
+        double parsed = g_ascii_strtod(sizeText.data(), &end);
+        if (end != sizeText.data() && parsed > 0) {
+            points = parsed;
+            family = fontName.left(index);
+        }
+    }
+    if (family.endsWith(','))
+        family = family.left(family.length() - 1);
+    changedState.fontFamily = family;
+    changedState.fontSize = static_cast<float>(points * (xftDPI() / 1024.0) / 72.0);
 }
 #endif
 

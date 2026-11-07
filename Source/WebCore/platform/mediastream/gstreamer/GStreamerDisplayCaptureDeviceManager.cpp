@@ -54,6 +54,9 @@ void GStreamerDisplayCaptureDeviceManager::computeCaptureDevices(CompletionHandl
     CaptureDevice screenCaptureDevice(createVersion4UUIDString(), CaptureDevice::DeviceType::Screen, "Capture Screen"_s);
     screenCaptureDevice.setEnabled(true);
     m_devices.append(WTF::move(screenCaptureDevice));
+    CaptureDevice windowCaptureDevice(createVersion4UUIDString(), CaptureDevice::DeviceType::Window, "Capture Window"_s);
+    windowCaptureDevice.setEnabled(true);
+    m_devices.append(WTF::move(windowCaptureDevice));
     callback();
 }
 
@@ -76,7 +79,7 @@ CaptureSourceOrError GStreamerDisplayCaptureDeviceManager::createDisplayCaptureS
         return CaptureSourceOrError({ { }, MediaAccessDenialReason::PermissionDenied });
 
     // FIXME: Maybe check this depending on device.type().
-    auto outputType = GStreamerDisplayCaptureDeviceManager::PipeWireOutputType::Monitor | GStreamerDisplayCaptureDeviceManager::PipeWireOutputType::Window;
+    auto outputType = device.type() == CaptureDevice::DeviceType::Window ? GStreamerDisplayCaptureDeviceManager::PipeWireOutputType::Window : GStreamerDisplayCaptureDeviceManager::PipeWireOutputType::Monitor;
 
     GVariantBuilder options;
     g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);

@@ -20,8 +20,10 @@
 #include "config.h"
 #include "WebKitUIClient.h"
 
+#include "APISecurityOrigin.h"
 #include "APIUIClient.h"
 #include "DrawingAreaProxy.h"
+#include "FrameInfoData.h"
 #include "GeolocationPermissionRequestProxy.h"
 #include "NotificationPermissionRequest.h"
 #include "WebKitDeviceInfoPermissionRequestPrivate.h"
@@ -85,28 +87,32 @@ private:
         webkitWebViewClosePage(m_webView);
     }
 
-    void runJavaScriptAlert(WebPageProxy& page, const String& message, WebFrameProxy*, WebKit::FrameInfoData&&, Function<void()>&& completionHandler) final
+    void runJavaScriptAlert(WebPageProxy& page, const String& message, WebFrameProxy*, WebKit::FrameInfoData&& frameInfo, Function<void()>&& completionHandler) final
     {
         page.makeViewBlankIfUnpaintedSinceLastLoadCommit();
+        g_object_set_data_full(G_OBJECT(m_webView), "eden-dialog-origin-v1", g_strdup(frameInfo.securityOrigin.toString().utf8().data()), g_free);
         webkitWebViewRunJavaScriptAlert(m_webView, message.utf8(), WTF::move(completionHandler));
     }
 
-    void runJavaScriptConfirm(WebPageProxy& page, const String& message, WebFrameProxy*, WebKit::FrameInfoData&&, Function<void(bool)>&& completionHandler) final
+    void runJavaScriptConfirm(WebPageProxy& page, const String& message, WebFrameProxy*, WebKit::FrameInfoData&& frameInfo, Function<void(bool)>&& completionHandler) final
     {
         page.makeViewBlankIfUnpaintedSinceLastLoadCommit();
+        g_object_set_data_full(G_OBJECT(m_webView), "eden-dialog-origin-v1", g_strdup(frameInfo.securityOrigin.toString().utf8().data()), g_free);
         webkitWebViewRunJavaScriptConfirm(m_webView, message.utf8(), WTF::move(completionHandler));
     }
 
-    void runJavaScriptPrompt(WebPageProxy& page, const String& message, const String& defaultValue, WebFrameProxy*, WebKit::FrameInfoData&&, Function<void(const String&)>&& completionHandler) final
+    void runJavaScriptPrompt(WebPageProxy& page, const String& message, const String& defaultValue, WebFrameProxy*, WebKit::FrameInfoData&& frameInfo, Function<void(const String&)>&& completionHandler) final
     {
         page.makeViewBlankIfUnpaintedSinceLastLoadCommit();
+        g_object_set_data_full(G_OBJECT(m_webView), "eden-dialog-origin-v1", g_strdup(frameInfo.securityOrigin.toString().utf8().data()), g_free);
         webkitWebViewRunJavaScriptPrompt(m_webView, message.utf8(), defaultValue.utf8(), WTF::move(completionHandler));
     }
 
     bool canRunBeforeUnloadConfirmPanel() const final { return true; }
 
-    void runBeforeUnloadConfirmPanel(WebPageProxy&, String&& message, WebFrameProxy*, WebKit::FrameInfoData&&, Function<void(bool)>&& completionHandler) final
+    void runBeforeUnloadConfirmPanel(WebPageProxy&, String&& message, WebFrameProxy*, WebKit::FrameInfoData&& frameInfo, Function<void(bool)>&& completionHandler) final
     {
+        g_object_set_data_full(G_OBJECT(m_webView), "eden-dialog-origin-v1", g_strdup(frameInfo.securityOrigin.toString().utf8().data()), g_free);
         webkitWebViewRunJavaScriptBeforeUnloadConfirm(m_webView, message.utf8(), WTF::move(completionHandler));
     }
 
@@ -280,27 +286,31 @@ private:
         return true;
     }
 
-    void decidePolicyForGeolocationPermissionRequest(WebPageProxy&, WebFrameProxy&, const WebKit::FrameInfoData&, Function<void(bool)>& completionHandler) final
+    void decidePolicyForGeolocationPermissionRequest(WebPageProxy&, WebFrameProxy&, const WebKit::FrameInfoData& frameInfo, Function<void(bool)>& completionHandler) final
     {
         GRefPtr<WebKitGeolocationPermissionRequest> geolocationPermissionRequest = adoptGRef(webkitGeolocationPermissionRequestCreate(GeolocationPermissionRequest::create(std::exchange(completionHandler, nullptr)).ptr()));
+        g_object_set_data_full(G_OBJECT(geolocationPermissionRequest.get()), "eden-permission-origin-v1", g_strdup(frameInfo.securityOrigin.toString().utf8().data()), g_free);
         webkitWebViewMakePermissionRequest(m_webView, WEBKIT_PERMISSION_REQUEST(geolocationPermissionRequest.get()));
     }
 
-    void decidePolicyForMediaKeySystemPermissionRequest(WebPageProxy&, API::SecurityOrigin&, const WTF::String& keySystem, CompletionHandler<void(bool)>&& completionHandler) final
+    void decidePolicyForMediaKeySystemPermissionRequest(WebPageProxy&, API::SecurityOrigin& origin, const WTF::String& keySystem, CompletionHandler<void(bool)>&& completionHandler) final
     {
         auto permissionRequest = adoptGRef(webkitMediaKeySystemPermissionRequestCreate(MediaKeySystemPermissionRequest::create(keySystem, WTF::move(completionHandler))));
+        g_object_set_data_full(G_OBJECT(permissionRequest.get()), "eden-permission-origin-v1", g_strdup(origin.securityOrigin().toString().utf8().data()), g_free);
         webkitWebViewMakePermissionRequest(m_webView, WEBKIT_PERMISSION_REQUEST(permissionRequest.get()));
     }
 
     void decidePolicyForUserMediaPermissionRequest(WebPageProxy&, WebFrameProxy&, API::SecurityOrigin& userMediaDocumentOrigin, API::SecurityOrigin& topLevelDocumentOrigin, UserMediaPermissionRequestProxy& permissionRequest) final
     {
         GRefPtr<WebKitUserMediaPermissionRequest> userMediaPermissionRequest = adoptGRef(webkitUserMediaPermissionRequestCreate(permissionRequest, userMediaDocumentOrigin, topLevelDocumentOrigin));
+        g_object_set_data_full(G_OBJECT(userMediaPermissionRequest.get()), "eden-permission-origin-v1", g_strdup(userMediaDocumentOrigin.securityOrigin().toString().utf8().data()), g_free);
         webkitWebViewMakePermissionRequest(m_webView, WEBKIT_PERMISSION_REQUEST(userMediaPermissionRequest.get()));
     }
 
-    void decidePolicyForNotificationPermissionRequest(WebPageProxy&, API::SecurityOrigin&, CompletionHandler<void(bool allowed)>&& completionHandler) final
+    void decidePolicyForNotificationPermissionRequest(WebPageProxy&, API::SecurityOrigin& origin, CompletionHandler<void(bool allowed)>&& completionHandler) final
     {
         GRefPtr<WebKitNotificationPermissionRequest> notificationPermissionRequest = adoptGRef(webkitNotificationPermissionRequestCreate(NotificationPermissionRequest::create(WTF::move(completionHandler)).ptr()));
+        g_object_set_data_full(G_OBJECT(notificationPermissionRequest.get()), "eden-permission-origin-v1", g_strdup(origin.securityOrigin().toString().utf8().data()), g_free);
         webkitWebViewMakePermissionRequest(m_webView, WEBKIT_PERMISSION_REQUEST(notificationPermissionRequest.get()));
     }
 
@@ -310,6 +320,17 @@ private:
         webkitWebViewMakePermissionRequest(m_webView, WEBKIT_PERMISSION_REQUEST(websiteDataAccessPermissionRequest.get()));
     }
 
+#if PLATFORM(WPE)
+    bool takeFocus(WebPageProxy*, WKFocusDirection direction) final
+    {
+        g_signal_emit_by_name(m_webView, "eden-focus-v1", direction == kWKFocusDirectionBackward ? -1 : 1);
+        return true;
+    }
+    void focus(WebPageProxy*) final
+    {
+        g_signal_emit_by_name(m_webView, "eden-focus-v1", 0);
+    }
+#endif
 #if PLATFORM(GTK)
     bool takeFocus(WebPageProxy* page, WKFocusDirection direction) final
     {

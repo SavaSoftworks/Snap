@@ -26,6 +26,8 @@
 #include <seccomp.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <wtf/FileSystem.h>
 #include <wtf/NeverDestroyed.h>
 #include <wtf/UUID.h>
@@ -170,21 +172,16 @@ static void createBwrapInfo(GSubprocessLauncher* launcher, Vector<CString>& args
 
 static int createFlatpakInfo(const char* instanceID)
 {
-    static NeverDestroyed<GUniquePtr<char>> data;
-    static size_t size;
+    GUniquePtr<GKeyFile> keyFile(g_key_file_new());
+    g_key_file_set_string(keyFile.get(), "Application", "name", WTF::applicationID().data());
+    g_key_file_set_string(keyFile.get(), "Instance", "instance-id", instanceID);
 
-    if (!data.get()) {
-        GUniquePtr<GKeyFile> keyFile(g_key_file_new());
-        g_key_file_set_string(keyFile.get(), "Application", "name", WTF::applicationID().data());
-        g_key_file_set_string(keyFile.get(), "Instance", "instance-id", instanceID);
+    if (remoteInspectorEnabled())
+        g_key_file_set_string(keyFile.get(), "Context", "shared", "network;");
 
-        if (remoteInspectorEnabled())
-            g_key_file_set_string(keyFile.get(), "Context", "shared", "network;");
-
-        data->reset(g_key_file_to_data(keyFile.get(), &size, nullptr));
-    }
-
-    return createSealedMemFdWithData("flatpak-info", data->get(), size);
+    size_t size;
+    GUniquePtr<char> data(g_key_file_to_data(keyFile.get(), &size, nullptr));
+    return createSealedMemFdWithData("flatpak-info", data.get(), size);
 }
 
 enum class BindFlags {
@@ -512,6 +509,13 @@ static void bindV4l(Vector<CString>& args)
             continue;
 
         CString path = FileSystem::pathByAppendingComponent("/dev"_s, fileName).utf8();
+        struct stat deviceStatus;
+        if (!stat(path.data(), &deviceStatus) && S_ISCHR(deviceStatus.st_mode)) {
+            CString udevEntry = makeString("/run/udev/data/c"_s, major(deviceStatus.st_rdev), ':', minor(deviceStatus.st_rdev)).utf8();
+            args.append(CString("--ro-bind-try"));
+            args.append(udevEntry);
+            args.append(udevEntry);
+        }
         args.appendList<CString>({
             "--dev-bind-try", path, path,
         });
@@ -735,6 +739,11 @@ static bool shouldUnshareNetwork(ProcessLauncher::ProcessType processType, Vecto
     // host services must not use abstract sockets.
     if (processType == ProcessLauncher::ProcessType::DBusProxy)
         return false;
+
+#if USE(GSTREAMER_WEBRTC)
+    if (processType == ProcessLauncher::ProcessType::Web && !g_getenv("EDEN_WEBKIT_ISOLATE_WEB_PROCESS_NETWORK"))
+        return false;
+#endif
 
 #if PLATFORM(GTK)
     // Also, the web process needs access to host networking if the X server is running over TCP or

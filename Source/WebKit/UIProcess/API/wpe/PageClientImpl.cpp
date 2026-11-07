@@ -313,8 +313,13 @@ void PageClientImpl::wheelEventWasNotHandledByWebCore(const NativeWebWheelEvent&
 
 RefPtr<WebPopupMenuProxy> PageClientImpl::createPopupMenuProxy(WebPageProxy& page)
 {
+#if ENABLE(WPE_PLATFORM)
+    if (!m_view.client().isGLibBasedAPI() && !m_view.wpeView())
+        return nullptr;
+#else
     if (!m_view.client().isGLibBasedAPI())
         return nullptr;
+#endif
     return WebKitPopupMenu::create(m_view, page.popupMenuClient());
 }
 
