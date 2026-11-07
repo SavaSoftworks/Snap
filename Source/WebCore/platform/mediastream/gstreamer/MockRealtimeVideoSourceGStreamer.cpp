@@ -158,10 +158,8 @@ void MockRealtimeVideoSourceGStreamer::setSizeFrameRateAndZoom(const VideoPreset
 {
     MockRealtimeVideoSource::setSizeFrameRateAndZoom(constraints);
 
-    if (!constraints.width || !constraints.height)
-        return;
-
-    m_capturer->setSize({ *constraints.width, *constraints.height });
+    if (!size().isEmpty())
+        m_capturer->setSize(size());
 }
 
 } // namespace WebCore

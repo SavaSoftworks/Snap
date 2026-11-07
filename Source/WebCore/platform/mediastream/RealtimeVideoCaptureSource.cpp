@@ -433,7 +433,7 @@ void RealtimeVideoCaptureSource::setSizeFrameRateAndZoom(const VideoPresetConstr
         return;
 
     m_currentPreset = match->encodingPreset;
-    auto newSize = match->encodingPreset->size();
+    auto newSize = match->requestedSize.isEmpty() ? match->encodingPreset->size() : match->requestedSize;
 
     applyFrameRateAndZoomWithPreset(match->requestedFrameRate, match->requestedZoom, WTF::move(match->encodingPreset));
     setSize(newSize);

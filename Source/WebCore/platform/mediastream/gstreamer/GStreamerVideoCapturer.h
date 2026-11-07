@@ -26,10 +26,48 @@
 
 #include "GStreamerCapturer.h"
 #include "IntSize.h"
+#include <wtf/Function.h>
+#include <wtf/Lock.h>
+#include <wtf/ThreadSafeRefCounted.h>
+#include <wtf/Vector.h>
 
 namespace WebCore {
 
 class VideoFrameGStreamer;
+
+class PipeWireFrameGate final : public ThreadSafeRefCounted<PipeWireFrameGate> {
+public:
+    static Ref<PipeWireFrameGate> create() { return adoptRef(*new PipeWireFrameGate); }
+
+    void release(GRefPtr<GstBuffer>&& buffer)
+    {
+        if (m_closeLock.tryLock()) {
+            Locker locker { AdoptLock, m_closeLock };
+            buffer = nullptr;
+            return;
+        }
+        Locker locker { m_pendingLock };
+        m_pending.append(WTF::move(buffer));
+    }
+
+    void close(NOESCAPE const Function<void()>& closeSource)
+    {
+        Locker locker { m_closeLock };
+        closeSource();
+        Vector<GRefPtr<GstBuffer>> pending;
+        {
+            Locker pendingLocker { m_pendingLock };
+            pending = std::exchange(m_pending, {});
+        }
+    }
+
+private:
+    PipeWireFrameGate() = default;
+
+    Lock m_closeLock;
+    Lock m_pendingLock;
+    Vector<GRefPtr<GstBuffer>> m_pending WTF_GUARDED_BY_LOCK(m_pendingLock);
+};
 
 class GStreamerVideoCapturer final : public GStreamerCapturer {
     friend class GStreamerVideoCaptureSource;
@@ -49,6 +87,7 @@ public:
 
 private:
     void handleSample(GRefPtr<GstSample>&&);
+    void updateDisplayFrameSize(const IntSize&, const GRefPtr<GstSample>&);
     bool setSize(const IntSize&);
     const IntSize& size() const LIFETIME_BOUND { return m_size; }
 
@@ -61,6 +100,10 @@ private:
 
     std::pair<GStreamerCapturer::SinkSignalsHolder, SinkVideoFrameCallback> m_sinkVideoFrameCallback;
     IntSize m_size;
+    IntSize m_displaySourceSize;
+    IntSize m_displayFrameSize;
+    RefPtr<PipeWireFrameGate> m_frameGate;
+    GRefPtr<GstElement> m_aspectRatioCrop;
 };
 
 } // namespace WebCore
