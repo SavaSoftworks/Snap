@@ -4745,10 +4745,16 @@ WeakPtr<WebGLRenderingContextBase> WebGLRenderingContextBase::createRefForContex
 
 void WebGLRenderingContextBase::stop()
 {
-    if (!isContextLost()) {
-        forceLostContext(SyntheticLostContext);
-        destroyGraphicsContextGL();
+    if (isContextLost())
+        return;
+    m_contextLostState = ContextLostState { SyntheticLostContext };
+    m_contextLostState->errors.add(GCGLErrorCode::ContextLost);
+    {
+        Locker locker { objectGraphLock() };
+        detachAndRemoveAllObjects();
     }
+    loseExtensions(SyntheticLostContext);
+    destroyGraphicsContextGL();
 }
 
 void WebGLRenderingContextBase::suspend(ReasonForSuspension)
