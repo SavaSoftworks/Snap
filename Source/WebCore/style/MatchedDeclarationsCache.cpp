@@ -29,6 +29,8 @@
 
 #include "config.h"
 #include "MatchedDeclarationsCache.h"
+#include <cstdlib>
+#include <cstring>
 
 #include "CSSFontSelector.h"
 #include "DocumentInlines.h"
@@ -39,6 +41,8 @@
 #include "StyleLengthResolution.h"
 #include "StyleResolver.h"
 #include "StyleScope.h"
+#include <array>
+#include <utility>
 #include <wtf/TZoneMallocInlines.h>
 #include <wtf/text/StringHash.h>
 
@@ -46,6 +50,109 @@ namespace WebCore {
 namespace Style {
 
 WTF_MAKE_TZONE_ALLOCATED_IMPL(MatchedDeclarationsCache);
+
+static bool snapMatchedDeclarationsCountersEnabled()
+{
+    static bool enabled = [] {
+        const char* value = std::getenv("WEBKIT_SNAP_PATCH_COUNTERS");
+        return value && !std::strcmp(value, "1");
+    }();
+    return enabled;
+}
+
+enum class SnapMatchedDeclarationsRejection : uint8_t {
+    DocumentElement,
+    PseudoElementNameArgument,
+    AttrContent,
+    Zoom,
+    WritingMode,
+    Direction,
+    ContainerDependent,
+    TreeCountingFunctions,
+    AnchorFunctions,
+    StyleFontNotCurrent,
+    ParentFontNotCurrent,
+    RandomCachingKeyMap,
+    Count
+};
+
+static constexpr size_t snapMatchedDeclarationsRejectionCount = static_cast<size_t>(SnapMatchedDeclarationsRejection::Count);
+
+struct SnapMatchedDeclarationsCounters {
+    unsigned long long lookups { 0 };
+    unsigned long long nonCacheableMatchResult { 0 };
+    unsigned long long nothingCacheable { 0 };
+    unsigned long long noBucket { 0 };
+    unsigned long long declarationsUnequal { 0 };
+    unsigned long long inheritedCustomPropertiesUnequal { 0 };
+    unsigned long long noMatchingEntry { 0 };
+    unsigned long long fullHits { 0 };
+    unsigned long long partialHits { 0 };
+    unsigned long long unusableAfterHighPriority { 0 };
+    unsigned long long additions { 0 };
+    unsigned long long bucketFull { 0 };
+    unsigned long long evictions { 0 };
+    std::array<unsigned long long, snapMatchedDeclarationsRejectionCount> rejectedOnFind {};
+    std::array<unsigned long long, snapMatchedDeclarationsRejectionCount> rejectedOnAdd {};
+};
+
+static SnapMatchedDeclarationsCounters& snapMatchedDeclarationsCounters()
+{
+    static thread_local SnapMatchedDeclarationsCounters counters;
+    return counters;
+}
+
+static thread_local SnapMatchedDeclarationsRejection snapMatchedDeclarationsLastRejection = SnapMatchedDeclarationsRejection::Count;
+
+static bool snapMatchedDeclarationsReject(SnapMatchedDeclarationsRejection rejection)
+{
+    if (snapMatchedDeclarationsCountersEnabled())
+        snapMatchedDeclarationsLastRejection = rejection;
+    return false;
+}
+
+static void snapMatchedDeclarationsLogRejections(const char* phase, const std::array<unsigned long long, snapMatchedDeclarationsRejectionCount>& rejections)
+{
+    WTFLogAlways("Snap matched declarations: rejected on %s: document-element %llu pseudo-name-argument %llu attr-content %llu zoom %llu writing-mode %llu direction %llu container-dependent %llu tree-counting %llu anchor-functions %llu style-font-not-current %llu parent-font-not-current %llu random-caching-key %llu",
+        phase, rejections[0], rejections[1], rejections[2], rejections[3], rejections[4], rejections[5], rejections[6], rejections[7], rejections[8], rejections[9], rejections[10], rejections[11]);
+}
+
+static void snapMatchedDeclarationsCountLookup()
+{
+    auto& counters = snapMatchedDeclarationsCounters();
+    if (++counters.lookups % 4096)
+        return;
+    WTFLogAlways("Snap matched declarations: lookups %llu full-hits %llu partial-hits %llu non-cacheable-match-result %llu nothing-cacheable %llu no-bucket %llu declarations-unequal %llu inherited-custom-properties-unequal %llu no-matching-entry %llu unusable-after-high-priority %llu additions %llu bucket-full %llu evictions %llu",
+        counters.lookups, counters.fullHits, counters.partialHits, counters.nonCacheableMatchResult, counters.nothingCacheable, counters.noBucket, counters.declarationsUnequal, counters.inheritedCustomPropertiesUnequal, counters.noMatchingEntry, counters.unusableAfterHighPriority, counters.additions, counters.bucketFull, counters.evictions);
+    snapMatchedDeclarationsLogRejections("find", counters.rejectedOnFind);
+    snapMatchedDeclarationsLogRejections("add", counters.rejectedOnAdd);
+}
+
+void MatchedDeclarationsCache::snapCountRejection(bool whileAdding)
+{
+    if (!snapMatchedDeclarationsCountersEnabled())
+        return;
+    auto rejection = std::exchange(snapMatchedDeclarationsLastRejection, SnapMatchedDeclarationsRejection::Count);
+    if (rejection == SnapMatchedDeclarationsRejection::Count)
+        return;
+    auto& counters = snapMatchedDeclarationsCounters();
+    ++(whileAdding ? counters.rejectedOnAdd : counters.rejectedOnFind)[static_cast<size_t>(rejection)];
+}
+
+void MatchedDeclarationsCache::snapRemoveUnusableEntry(unsigned hash, const Entry& unusableEntry)
+{
+    if (snapMatchedDeclarationsCountersEnabled())
+        ++snapMatchedDeclarationsCounters().unusableAfterHighPriority;
+
+    auto it = m_entries.find(hash);
+    if (it == m_entries.end())
+        return;
+    it->value.removeFirstMatching([&](auto& entry) {
+        return &entry == &unusableEntry;
+    });
+    if (it->value.isEmpty())
+        m_entries.remove(it);
+}
 
 MatchedDeclarationsCache::MatchedDeclarationsCache(const Resolver& owner)
     : m_owner(owner)
@@ -70,37 +177,38 @@ bool MatchedDeclarationsCache::isCacheable(const Element& element, const Style::
     // FIXME: Writing mode and direction properties modify state when applying to document element by calling
     // Document::setWritingMode/DirectionSetOnDocumentElement. We can't skip the applying by caching.
     if (&element == element.document().documentElement())
-        return false;
+        return snapMatchedDeclarationsReject(SnapMatchedDeclarationsRejection::DocumentElement);
     // FIXME: Without the following early return we hit the final assert in
     // Element::resolvePseudoElementStyle(). Making matchedPseudoElements
     // PseudoElementIdentifier-aware might be a possible solution.
     if (!style.pseudoElementNameArgument().isNull())
-        return false;
+        return snapMatchedDeclarationsReject(SnapMatchedDeclarationsRejection::PseudoElementNameArgument);
     // content:attr() value depends on the element it is being applied to.
     if (style.hasAttrContent() || (style.pseudoElementType() && parentStyle.hasAttrContent()))
-        return false;
+        return snapMatchedDeclarationsReject(SnapMatchedDeclarationsRejection::AttrContent);
     if (style.zoom() != Style::ComputedStyle::initialZoom())
-        return false;
-    if (style.writingMode().computedWritingMode() != Style::ComputedStyle::initialWritingMode()
-        || style.writingMode().computedTextDirection() != Style::ComputedStyle::initialDirection())
-        return false;
+        return snapMatchedDeclarationsReject(SnapMatchedDeclarationsRejection::Zoom);
+    if (style.writingMode().computedWritingMode() != Style::ComputedStyle::initialWritingMode())
+        return snapMatchedDeclarationsReject(SnapMatchedDeclarationsRejection::WritingMode);
+    if (style.writingMode().computedTextDirection() != Style::ComputedStyle::initialDirection())
+        return snapMatchedDeclarationsReject(SnapMatchedDeclarationsRejection::Direction);
     if (style.isContainerDependent())
-        return false;
+        return snapMatchedDeclarationsReject(SnapMatchedDeclarationsRejection::ContainerDependent);
     if (style.useTreeCountingFunctions())
-        return false;
+        return snapMatchedDeclarationsReject(SnapMatchedDeclarationsRejection::TreeCountingFunctions);
     if (style.usesAnchorFunctions())
-        return false;
+        return snapMatchedDeclarationsReject(SnapMatchedDeclarationsRejection::AnchorFunctions);
 
     // Getting computed style after a font environment change but before full style resolution may involve styles with non-current fonts.
     // Avoid caching them.
     SUPPRESS_UNCOUNTED_ARG Ref fontSelector = element.document().fontSelector();
     if (!style.fontCascade().isCurrent(fontSelector.get()))
-        return false;
+        return snapMatchedDeclarationsReject(SnapMatchedDeclarationsRejection::StyleFontNotCurrent);
     if (!parentStyle.fontCascade().isCurrent(fontSelector.get()))
-        return false;
+        return snapMatchedDeclarationsReject(SnapMatchedDeclarationsRejection::ParentFontNotCurrent);
 
     if (element.hasRandomCachingKeyMap())
-        return false;
+        return snapMatchedDeclarationsReject(SnapMatchedDeclarationsRejection::RandomCachingKeyMap);
 
     // FIXME: counter-style: we might need to resolve cache like for fontSelector here (rdar://103018993).
 
@@ -138,27 +246,54 @@ unsigned MatchedDeclarationsCache::computeHash(const MatchResult& matchResult, c
 
 std::optional<MatchedDeclarationsCache::Result> MatchedDeclarationsCache::find(unsigned hash, const MatchResult& matchResult, const Style::CustomPropertyData& inheritedCustomProperties, const Style::ComputedStyle& parentStyle)
 {
-    if (!hash)
+    bool snapCounting = snapMatchedDeclarationsCountersEnabled();
+    if (snapCounting)
+        snapMatchedDeclarationsCountLookup();
+
+    if (!hash) {
+        if (snapCounting) {
+            auto& snapCounters = snapMatchedDeclarationsCounters();
+            ++(matchResult.isCompletelyNonCacheable ? snapCounters.nonCacheableMatchResult : snapCounters.nothingCacheable);
+        }
         return std::nullopt;
+    }
 
     auto it = m_entries.find(hash);
-    if (it == m_entries.end())
+    if (it == m_entries.end()) {
+        if (snapCounting)
+            ++snapMatchedDeclarationsCounters().noBucket;
         return std::nullopt;
+    }
 
     const Entry* partiallyMatchingEntry = nullptr;
     for (auto& entry : it->value) {
         SUPPRESS_UNCOUNTED_ARG if (!matchResult.cacheablePropertiesEqual(*entry.matchResult))
+        {
+            if (snapCounting)
+                ++snapMatchedDeclarationsCounters().declarationsUnequal;
             continue;
+        }
 
-        if (&entry.parentRenderStyle->inheritedCustomProperties() != &inheritedCustomProperties)
+        if (&entry.parentRenderStyle->inheritedCustomProperties() != &inheritedCustomProperties) {
+            if (snapCounting)
+                ++snapMatchedDeclarationsCounters().inheritedCustomPropertiesUnequal;
             continue;
+        }
 
-        if (parentStyle.inheritedEqual(*entry.parentRenderStyle))
+        if (parentStyle.inheritedEqual(*entry.parentRenderStyle)) {
+            if (snapCounting)
+                ++snapMatchedDeclarationsCounters().fullHits;
             return std::make_optional(Result { .entry = entry, .inheritedEqual = true });
+        }
         partiallyMatchingEntry = &entry;
     }
-    if (partiallyMatchingEntry)
+    if (partiallyMatchingEntry) {
+        if (snapCounting)
+            ++snapMatchedDeclarationsCounters().partialHits;
         return std::make_optional(Result { .entry = *partiallyMatchingEntry, .inheritedEqual = false });
+    }
+    if (snapCounting)
+        ++snapMatchedDeclarationsCounters().noMatchingEntry;
     return std::nullopt;
 }
 
@@ -179,8 +314,13 @@ void MatchedDeclarationsCache::add(const Style::ComputedStyle& style, const Styl
         newBucket.reserveCapacity(maxEntriesPerHash);
         return newBucket;
     });
-    if (addResult.iterator->value.size() < maxEntriesPerHash)
+    bool snapCounting = snapMatchedDeclarationsCountersEnabled();
+    if (addResult.iterator->value.size() < maxEntriesPerHash) {
         addResult.iterator->value.append(Entry { &matchResult, Style::ComputedStyle::clonePtr(style), Style::ComputedStyle::clonePtr(parentStyle) });
+        if (snapCounting)
+            ++snapMatchedDeclarationsCounters().additions;
+    } else if (snapCounting)
+        ++snapMatchedDeclarationsCounters().bucketFull;
 
     // Protect against unlimited growth.
 #if PLATFORM(WPE)
@@ -188,8 +328,11 @@ void MatchedDeclarationsCache::add(const Style::ComputedStyle& style, const Styl
 #else
     constexpr size_t maximumSize = 16 * 1024;
 #endif
-    if (m_entries.size() > maximumSize)
+    if (m_entries.size() > maximumSize) {
         m_entries.remove(m_entries.random());
+        if (snapCounting)
+            ++snapMatchedDeclarationsCounters().evictions;
+    }
 }
 
 void MatchedDeclarationsCache::remove(unsigned hash)

@@ -695,6 +695,8 @@ void Resolver::applyMatchedProperties(State& state, const MatchResult& matchResu
     auto cacheResult = m_matchedDeclarationsCache.find(cacheHash, matchResult, parentStyle.inheritedCustomProperties(), parentStyle);
 
     auto hasUsableEntry = cacheResult && MatchedDeclarationsCache::isCacheable(element.get(), style, parentStyle);
+    if (cacheResult && !hasUsableEntry)
+        MatchedDeclarationsCache::snapCountRejection(false);
     if (hasUsableEntry) {
         auto& cacheEntry = cacheResult->entry;
         bool inheritedEqual = cacheResult->inheritedEqual;
@@ -739,7 +741,7 @@ void Resolver::applyMatchedProperties(State& state, const MatchResult& matchResu
 
     if (hasUsableEntry && !cacheResult->entry.isUsableAfterHighPriorityProperties(style)) {
         // High-priority properties may affect resolution of other properties. Kick out the existing cache entry and try again.
-        m_matchedDeclarationsCache.remove(cacheHash);
+        m_matchedDeclarationsCache.snapRemoveUnusableEntry(cacheHash, cacheResult->entry);
         applyMatchedProperties(state, matchResult, PropertyCascade::normalProperties());
         return;
     }
@@ -749,8 +751,12 @@ void Resolver::applyMatchedProperties(State& state, const MatchResult& matchResu
 
     setGlobalStateAfterApplyingProperties(builder.state());
 
-    if (((cacheHash && !cacheResult) || (cacheResult && !cacheResult->inheritedEqual)) && MatchedDeclarationsCache::isCacheable(element, style, parentStyle))
-        m_matchedDeclarationsCache.add(style, parentStyle, cacheHash, matchResult);
+    if ((cacheHash && !cacheResult) || (cacheResult && !cacheResult->inheritedEqual)) {
+        if (MatchedDeclarationsCache::isCacheable(element, style, parentStyle))
+            m_matchedDeclarationsCache.add(style, parentStyle, cacheHash, matchResult);
+        else
+            MatchedDeclarationsCache::snapCountRejection(true);
+    }
 }
 
 void Resolver::setGlobalStateAfterApplyingProperties(const BuilderState& builderState)

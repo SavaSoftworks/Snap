@@ -63,6 +63,8 @@ public:
     std::optional<Result> find(unsigned hash, const MatchResult&, const Style::CustomPropertyData& inheritedCustomProperties, const Style::ComputedStyle&);
     void add(const Style::ComputedStyle&, const Style::ComputedStyle& parentStyle,  unsigned hash, const MatchResult&);
     void remove(unsigned hash);
+    void snapRemoveUnusableEntry(unsigned hash, const Entry&);
+    static void snapCountRejection(bool whileAdding);
 
     // Every N additions to the matched declaration cache trigger a sweep where entries holding
     // the last reference to a style declaration are garbage collected.
