@@ -3523,8 +3523,10 @@ void MediaPlayerPrivateGStreamer::setPlaybackFlags(bool isMediaStream)
     flags = flags & ~hasNativeVideo;
     flags = flags & ~hasSoftwareColorBalance;
 
-    if (isMediaStream)
+    if (isMediaStream) {
         flags = flags & ~getGstPlayFlag("buffering");
+        flags = flags & ~getGstPlayFlag("deinterlace");
+    }
 
     unsigned additionalFlags = GStreamerQuirksManager::singleton().getAdditionalPlaybinFlags();
     hasText &= additionalFlags;
@@ -3684,7 +3686,8 @@ void MediaPlayerPrivateGStreamer::createGSTPlayBin(const URL& url)
             g_object_set(m_pipeline.get(), "audio-filter", scale, nullptr);
     }
 
-    managePlayerSuspend();
+    if (!isMediaStream)
+        managePlayerSuspend();
 #if ENABLE(MEDIA_TELEMETRY)
     MediaTelemetryReport::singleton().reportDrmInfo(getDrm());
     MediaTelemetryReport::singleton().reportPlaybackState(MediaTelemetryReport::AVPipelineState::Create);
@@ -4498,6 +4501,10 @@ GstElement* MediaPlayerPrivateGStreamer::createVideoSink()
     auto exit = makeScopeExit([this] {
         if (!m_videoSink || isMediaStreamPlayer())
             return;
+#if ENABLE(MEDIA_STREAM)
+        if (m_streamPrivate)
+            return;
+#endif
 
         GstElement* sink = m_videoSink.get();
         while (GST_IS_BIN(sink)) {

@@ -103,6 +103,7 @@ static void webkitMediaStreamSrcCharacteristicsChanged(WebKitMediaStreamSrc*);
 
 class WebKitMediaStreamObserver : public MediaStreamPrivateObserver, public RefCounted<WebKitMediaStreamObserver> {
     WTF_MAKE_TZONE_ALLOCATED_INLINE(WebKitMediaStreamObserver);
+
 public:
     static Ref<WebKitMediaStreamObserver> create(GstElement* src)
     {
@@ -146,15 +147,15 @@ private:
 
 static void webkitMediaStreamSrcEnsureStreamCollectionPosted(WebKitMediaStreamSrc*, bool isEmpty = false);
 
-
 class InternalSource final : public MediaStreamTrackPrivateObserver,
-    public ThreadSafeRefCountedAndCanMakeThreadSafeWeakPtr<InternalSource>,
-    public RealtimeMediaSourceObserver,
-    public RealtimeMediaSource::AudioSampleObserver,
-    public RealtimeMediaSource::VideoFrameObserver,
-    public CanMakeCheckedPtr<InternalSource> {
+                             public ThreadSafeRefCountedAndCanMakeThreadSafeWeakPtr<InternalSource>,
+                             public RealtimeMediaSourceObserver,
+                             public RealtimeMediaSource::AudioSampleObserver,
+                             public RealtimeMediaSource::VideoFrameObserver,
+                             public CanMakeCheckedPtr<InternalSource> {
     WTF_MAKE_TZONE_ALLOCATED_INLINE(InternalSource);
     WTF_OVERRIDE_DELETE_FOR_CHECKED_PTR(InternalSource);
+
 public:
     static Ref<InternalSource> create(GstElement* parent, MediaStreamTrackPrivate& track, const String& padName, bool consumerIsVideoPlayer)
     {
@@ -429,7 +430,6 @@ public:
         {
             Locker locker { m_eosLock };
             m_eosPending = true;
-            m_eosCondition.waitFor(m_eosLock, 50_ms);
         }
     }
 
@@ -539,7 +539,6 @@ public:
         assertIsHeld(m_eosLock);
         m_eosPending = false;
         m_isEnded = true;
-        m_eosCondition.notifyAll();
     }
 
     bool eosPending() const
@@ -777,7 +776,8 @@ private:
             GST_DEBUG_OBJECT(self->m_src.get(), "Pushing tags for %" GST_PTR_FORMAT, self->m_stream.get());
             gst_pad_push_event(pad.get(), gst_event_new_tag(gst_stream_get_tags(self->m_stream.get())));
             self->m_hasPushedInitialTags = true;
-        }), this);
+        }),
+            this);
     }
 
     void updateStats(const GRefPtr<GstSample>& sample)
@@ -862,7 +862,6 @@ private:
     VideoFrame::Rotation m_videoRotation { VideoFrame::Rotation::None };
     bool m_videoMirrored { false };
     bool m_isEnded { false };
-    Condition m_eosCondition;
     Lock m_eosLock;
     bool m_eosPending WTF_GUARDED_BY_LOCK(m_eosLock) { false };
     std::optional<int> m_webrtcSourceClientId;
@@ -1098,7 +1097,7 @@ static void webkitMediaStreamSrcUriHandlerInit(gpointer gIface, gpointer)
     iface->set_uri = webkitMediaStreamSrcUriSetUri;
 }
 
-#define doInit \
+#define doInit                                                                       \
     G_IMPLEMENT_INTERFACE(GST_TYPE_URI_HANDLER, webkitMediaStreamSrcUriHandlerInit); \
     GST_DEBUG_CATEGORY_INIT(webkitMediaStreamSrcDebug, "webkitmediastreamsrc", 0, "mediastreamsrc element");
 
@@ -1230,8 +1229,7 @@ static void webkit_media_stream_src_class_init(WebKitMediaStreamSrcClass* klass)
     gobjectClass->get_property = webkitMediaStreamSrcGetProperty;
     gobjectClass->set_property = webkitMediaStreamSrcSetProperty;
 
-    g_object_class_install_property(gobjectClass, WEBKIT_MEDIASTREAM_SRC_PROP_IS_LIVE, g_param_spec_boolean("is-live", nullptr, nullptr,
-        TRUE, static_cast<GParamFlags>(G_PARAM_READABLE | G_PARAM_STATIC_STRINGS)));
+    g_object_class_install_property(gobjectClass, WEBKIT_MEDIASTREAM_SRC_PROP_IS_LIVE, g_param_spec_boolean("is-live", nullptr, nullptr, TRUE, static_cast<GParamFlags>(G_PARAM_READABLE | G_PARAM_STATIC_STRINGS)));
 
     gstElementClass->change_state = GST_DEBUG_FUNCPTR(webkitMediaStreamSrcChangeState);
 
