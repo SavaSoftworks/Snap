@@ -23,6 +23,8 @@
 
 #include "config.h"
 #include "RenderTextControlSingleLine.h"
+#include <cstdlib>
+#include <cstring>
 
 #include "CSSFontSelector.h"
 #include "CSSValueKeywords.h"
@@ -46,11 +48,15 @@
 #include "RenderLayerScrollableArea.h"
 #include "RenderObjectInlines.h"
 #include "RenderScrollbar.h"
+#include "RenderText.h"
 #include "RenderTheme.h"
 #include "RenderView.h"
+#include "StyleComputedStyle+GettersInlines.h"
+#include "StyleComputedStyle+InitialInlines.h"
 #include "StyleComputedStyle+SettersInlines.h"
 #include "StyleResolver.h"
 #include "TextControlInnerElements.h"
+#include "TextUtil.h"
 #include <wtf/StackStats.h>
 #include <wtf/TZoneMallocInlines.h>
 
@@ -72,6 +78,163 @@ RenderTextControlSingleLine::~RenderTextControlSingleLine() = default;
 inline HTMLElement* RenderTextControlSingleLine::innerSpinButtonElement() const
 {
     return protect(inputElement())->innerSpinButtonElement();
+}
+
+static bool snapTextControlSinglePassEnabled()
+{
+    static bool enabled = [] {
+        const char* value = std::getenv("WEBKIT_SNAP_DISABLE_TEXT_CONTROL_SINGLE_PASS");
+        return !value || std::strcmp(value, "1");
+    }();
+    return enabled;
+}
+
+static bool snapTextControlCountersEnabled()
+{
+    static bool enabled = [] {
+        const char* value = std::getenv("WEBKIT_SNAP_PATCH_COUNTERS");
+        return value && !std::strcmp(value, "1");
+    }();
+    return enabled;
+}
+
+struct SnapTextControlCounters {
+    unsigned long long layouts { 0 };
+    unsigned long long secondPasses { 0 };
+    unsigned long long presets { 0 };
+    unsigned long long presetSecondPasses { 0 };
+};
+
+static SnapTextControlCounters& snapTextControlCounters()
+{
+    static SnapTextControlCounters counters;
+    return counters;
+}
+
+static void snapNoteTextControlLayout(bool secondPass, bool preset)
+{
+    auto& counters = snapTextControlCounters();
+    ++counters.layouts;
+    if (secondPass)
+        ++counters.secondPasses;
+    if (preset) {
+        ++counters.presets;
+        if (secondPass)
+            ++counters.presetSecondPasses;
+    }
+    if (!(counters.layouts % 4096))
+        WTFLogAlways("Snap text control: layouts=%llu secondPasses=%llu presets=%llu presetSecondPasses=%llu", counters.layouts, counters.secondPasses, counters.presets, counters.presetSecondPasses);
+}
+
+static RenderBox* snapSoleInFlowChildBox(const RenderBox& parent)
+{
+    RenderBox* found = nullptr;
+    for (auto* child = parent.firstChild(); child; child = child->nextSibling()) {
+        if (child->isOutOfFlowPositioned())
+            continue;
+        auto* box = dynamicDowncast<RenderBox>(*child);
+        if (!box || box->isFloating() || box->isInline() || found)
+            return nullptr;
+        found = box;
+    }
+    return found;
+}
+
+static bool snapBoxAddsNoBlockExtent(const RenderBox& box)
+{
+    return box.borderAndPaddingLogicalHeight() == 0_lu
+        && box.marginLogicalHeight() == 0_lu
+        && box.style().logicalHeight().isAuto()
+        && box.style().logicalMinHeight().isAuto()
+        && box.style().logicalMaxHeight().isNone()
+        && !box.scrollbarLogicalHeight()
+        && !box.isWritingModeRoot();
+}
+
+static std::optional<LayoutUnit> snapSingleLineHeightUpperBound(const RenderBox& innerTextRenderer)
+{
+    const auto& style = innerTextRenderer.style();
+    if (!innerTextRenderer.isHorizontalWritingMode() || !innerTextRenderer.document().inNoQuirksMode()
+        || !style.lineHeight().isNormal()
+        || style.lineBoxContain() != Style::ComputedStyle::initialLineBoxContain()
+        || !style.textEmphasisStyle().isNone() || style.textBoxTrim() != Style::ComputedStyle::initialTextBoxTrim()
+        || style.textBoxEdge() != Style::ComputedStyle::initialTextBoxEdge()) {
+        return {};
+    }
+    auto& primary = style.fontCascade().primaryFont();
+    if (primary.hasVerticalGlyphs()) {
+        return {};
+    }
+    float ascent = 0;
+    float descent = 0;
+    auto includeFont = [&](const Font& font) {
+        auto& metrics = font.fontMetrics();
+        auto leading = std::max(0.f, (metrics.lineSpacing() - metrics.ascent() - metrics.descent()) / 2);
+        ascent = std::max(ascent, metrics.ascent() + leading);
+        descent = std::max(descent, metrics.descent() + leading);
+    };
+    includeFont(primary);
+    unsigned remaining = 4096;
+    for (auto* child = innerTextRenderer.firstChild(); child; child = child->nextSibling()) {
+        auto* text = dynamicDowncast<RenderText>(*child);
+        if (!text || text->text().length() > remaining) {
+            return {};
+        }
+        remaining -= text->text().length();
+        auto fonts = Layout::TextUtil::fallbackFontsForText(text->text(), style, Layout::TextUtil::IncludeHyphen::No);
+        for (Ref font : fonts) {
+            if (font->hasVerticalGlyphs()) {
+                return {};
+            }
+            includeFont(font.get());
+        }
+    }
+    auto height = innerTextRenderer.lineHeight();
+    height = std::max(height, LayoutUnit::fromFloatCeil(ascent) + LayoutUnit::fromFloatCeil(descent));
+    return height + innerTextRenderer.borderAndPaddingLogicalHeight();
+}
+
+static std::optional<LayoutUnit> snapNaturalContainerLogicalHeightForSinglePass(const RenderTextControlSingleLine& control, const RenderBox& innerTextRenderer, const RenderBox* innerBlockRenderer, const RenderBox& containerRenderer, bool hasAutofillStrongPasswordButton)
+{
+    if (!snapTextControlSinglePassEnabled() || hasAutofillStrongPasswordButton)
+        return {};
+    if (control.style().fieldSizing() == FieldSizing::Content)
+        return {};
+    if (control.isOutOfFlowPositioned() || control.scrollbarLogicalHeight() || control.isWritingModeRoot())
+        return {};
+    auto* controlParent = control.parent();
+    if (!controlParent || controlParent->isFlexibleBoxIncludingDeprecated() || controlParent->isRenderGrid())
+        return {};
+    if (!control.style().logicalHeight().tryFixed())
+        return {};
+    if (!control.style().logicalMinHeight().isAuto() || !control.style().logicalMaxHeight().isNone())
+        return {};
+    if (containerRenderer.style().usedZoomForLength().value != 1)
+        return {};
+    if (!snapBoxAddsNoBlockExtent(containerRenderer))
+        return {};
+    auto* soleContainerChild = snapSoleInFlowChildBox(containerRenderer);
+    if (!soleContainerChild)
+        return {};
+    if (innerBlockRenderer) {
+        if (soleContainerChild != innerBlockRenderer || !snapBoxAddsNoBlockExtent(*innerBlockRenderer))
+            return {};
+        if (snapSoleInFlowChildBox(*innerBlockRenderer) != &innerTextRenderer)
+            return {};
+    } else if (soleContainerChild != &innerTextRenderer)
+        return {};
+    if (!innerTextRenderer.style().logicalHeight().isAuto()
+        || !innerTextRenderer.style().logicalMinHeight().isAuto()
+        || !innerTextRenderer.style().logicalMaxHeight().isNone()
+        || innerTextRenderer.scrollbarLogicalHeight()
+        || innerTextRenderer.isWritingModeRoot()
+        || innerTextRenderer.style().textWrapMode() != TextWrapMode::NoWrap)
+        return {};
+    auto heightUpperBound = snapSingleLineHeightUpperBound(innerTextRenderer);
+    if (!heightUpperBound) {
+        return {};
+    }
+    return *heightUpperBound + innerTextRenderer.marginLogicalHeight();
 }
 
 static void resetOverriddenHeight(RenderBox* box, const RenderObject* ancestor)
@@ -119,6 +282,20 @@ void RenderTextControlSingleLine::layout()
     LayoutSize oldInnerTextSize;
     if (innerTextRenderer)
         oldInnerTextSize = innerTextRenderer->borderBoxSize();
+
+    std::optional<LayoutUnit> snapPresetContainerLogicalHeight;
+    if (innerTextRenderer && containerRenderer) {
+        if (auto snapNaturalContainerLogicalHeight = snapNaturalContainerLogicalHeightForSinglePass(*this, *innerTextRenderer, innerBlockRenderer, *containerRenderer, inputElement().hasAutofillStrongPasswordButton())) {
+            auto snapPredictedContentBoxLogicalHeight = computeLogicalHeight(logicalHeight(), logicalTop()).extent - borderAndPaddingLogicalHeight();
+            if (snapPredictedContentBoxLogicalHeight > *snapNaturalContainerLogicalHeight + 1_lu)
+                snapPresetContainerLogicalHeight = snapPredictedContentBoxLogicalHeight;
+        }
+    }
+    if (snapPresetContainerLogicalHeight) {
+        containerRenderer->mutableStyle().setLogicalHeight(Style::PreferredSize::Fixed { *snapPresetContainerLogicalHeight });
+        for (RenderObject* renderer = containerRenderer; renderer != this; renderer = renderer->parent())
+            renderer->setNeedsLayout(MarkingBehavior::MarkOnlyThis);
+    }
 
     {
         auto scope = LayoutScope { *this };
@@ -191,7 +368,14 @@ void RenderTextControlSingleLine::layout()
     }
 
     // If we need another layout pass, we have changed one of children's height so we need to relayout them.
-    if (needsLayout()) {
+    bool snapNeedsSecondPass = needsLayout();
+    if (snapTextControlCountersEnabled())
+        snapNoteTextControlLayout(snapNeedsSecondPass, !!snapPresetContainerLogicalHeight);
+#ifdef WEBKIT_SNAP_VERIFY_PATCHES
+    if (snapPresetContainerLogicalHeight && *snapPresetContainerLogicalHeight != contentBoxLogicalHeight())
+        WTFLogAlways("Snap text control: predicted content box %d does not match the laid out content box %d, the stock container fixup runs a second pass", snapPresetContainerLogicalHeight->toInt(), contentBoxLogicalHeight().toInt());
+#endif
+    if (snapNeedsSecondPass) {
         auto scope = LayoutScope { *this };
         RenderBlockFlow::layoutBlock(RelayoutChildren::Yes);
     }

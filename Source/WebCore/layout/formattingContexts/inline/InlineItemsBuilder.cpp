@@ -25,11 +25,13 @@
 
 #include "config.h"
 #include "InlineItemsBuilder.h"
+#include <cstdlib>
+#include <cstring>
 
 #include "FontCascade.h"
 #include "FontCascadeFonts.h"
-#include "InlineFormattingUtils.h"
 #include "FontCascadeInlines.h"
+#include "InlineFormattingUtils.h"
 #include "InlineSoftLineBreakItem.h"
 #include "RenderObjectInlines.h"
 #include "StyleComputedStyle+GettersInlines.h"
@@ -39,12 +41,103 @@
 #include "UnicodeBidi.h"
 #include "platform/text/TextSpacing.h"
 #include <wtf/BitVector.h>
+#include <wtf/HashSet.h>
+#include <wtf/Hasher.h>
+#include <wtf/NeverDestroyed.h>
 #include <wtf/Scope.h>
+#include <wtf/text/StringHash.h>
 #include <wtf/text/TextBreakIterator.h>
 #include <wtf/unicode/CharacterNames.h>
 
 namespace WebCore {
 namespace Layout {
+
+static bool snapBreakingPositionCacheCountersEnabled()
+{
+    static bool enabled = [] {
+        const char* value = std::getenv("WEBKIT_SNAP_PATCH_COUNTERS");
+        return value && !std::strcmp(value, "1");
+    }();
+    return enabled;
+}
+
+struct SnapBreakingPositionCacheCounters {
+    unsigned long long populations { 0 };
+    unsigned long long teardownPopulations { 0 };
+    unsigned long long teardownPopulationsSkipped { 0 };
+    unsigned long long taggedEntries { 0 };
+    unsigned long long lookups { 0 };
+    unsigned long long hits { 0 };
+    unsigned long long taggedLookups { 0 };
+    unsigned long long taggedHits { 0 };
+};
+
+static SnapBreakingPositionCacheCounters& snapBreakingPositionCacheCounters()
+{
+    static SnapBreakingPositionCacheCounters counters;
+    return counters;
+}
+
+static HashSet<uint64_t>& snapTeardownPopulatedTexts()
+{
+    static NeverDestroyed<HashSet<uint64_t>> texts;
+    return texts.get();
+}
+
+static void snapReportBreakingPositionCacheCounters()
+{
+    auto& counters = snapBreakingPositionCacheCounters();
+    WTFLogAlways("Snap teardown break cache: populations=%llu teardown=%llu skipped=%llu tagged=%llu lookups=%llu hits=%llu taggedLookups=%llu taggedHits=%llu", counters.populations, counters.teardownPopulations, counters.teardownPopulationsSkipped, counters.taggedEntries, counters.lookups, counters.hits, counters.taggedLookups, counters.taggedHits);
+}
+
+static void snapNoteBreakingPositionCachePopulation(InlineItemsBuilder::BreakingPositionCacheMode mode)
+{
+    auto& counters = snapBreakingPositionCacheCounters();
+    ++counters.populations;
+    if (mode != InlineItemsBuilder::BreakingPositionCacheMode::Populate)
+        ++counters.teardownPopulations;
+    if (mode == InlineItemsBuilder::BreakingPositionCacheMode::SkipInsideBulkTeardown || mode == InlineItemsBuilder::BreakingPositionCacheMode::RecordSkippedInsideBulkTeardown)
+        ++counters.teardownPopulationsSkipped;
+    if (!(counters.populations % 4096))
+        snapReportBreakingPositionCacheCounters();
+}
+
+static uint64_t snapBreakingPositionCacheFingerprint(const TextBreakingPositionCache::Key& key)
+{
+    return (static_cast<uint64_t>(WTF::computeHash(key)) << 32) | WTF::computeHash(0x9e3779b9u, key);
+}
+
+static void snapTagTeardownBreakingPositionEntry(const TextBreakingPositionCache::Key& key)
+{
+    auto& texts = snapTeardownPopulatedTexts();
+    const auto& text = std::get<0>(key);
+    if (text.length() > 256)
+        return;
+    if (texts.size() >= 4096)
+        texts.clear();
+    if (texts.add(snapBreakingPositionCacheFingerprint(key)).isNewEntry)
+        ++snapBreakingPositionCacheCounters().taggedEntries;
+}
+
+static void snapForgetTeardownBreakingPositionEntry(const TextBreakingPositionCache::Key& key)
+{
+    snapTeardownPopulatedTexts().remove(snapBreakingPositionCacheFingerprint(key));
+}
+
+static void snapNoteBreakingPositionCacheLookup(const TextBreakingPositionCache::Key& key, bool hit)
+{
+    auto& counters = snapBreakingPositionCacheCounters();
+    ++counters.lookups;
+    if (hit)
+        ++counters.hits;
+    if (snapTeardownPopulatedTexts().contains(snapBreakingPositionCacheFingerprint(key))) {
+        ++counters.taggedLookups;
+        if (hit)
+            ++counters.taggedHits;
+    }
+    if (!(counters.lookups % 65536))
+        snapReportBreakingPositionCacheCounters();
+}
 
 struct WhitespaceContent {
     size_t length { 0 };
@@ -966,7 +1059,10 @@ void InlineItemsBuilder::computeInlineTextItemWidthsAndTextSpacing(InlineItemLis
 bool InlineItemsBuilder::buildInlineItemListForTextFromBreakingPositionsCache(const InlineTextBox& inlineTextBox, InlineItemList& inlineItemList)
 {
     auto& text = inlineTextBox.content();
-    auto* breakingPositions = TextBreakingPositionCache::singleton().get({ text, { inlineTextBox.style() }, m_securityOrigin.data() });
+    TextBreakingPositionCache::Key cacheKey { text, { inlineTextBox.style() }, m_securityOrigin.data() };
+    auto* breakingPositions = TextBreakingPositionCache::singleton().get(cacheKey);
+    if (snapBreakingPositionCacheCountersEnabled())
+        snapNoteBreakingPositionCacheLookup(cacheKey, !!breakingPositions);
     if (!breakingPositions)
         return false;
 
@@ -1193,8 +1289,14 @@ void InlineItemsBuilder::handleInlineLevelBox(const Box& layoutBox, InlineItemLi
     ASSERT_NOT_REACHED();
 }
 
-void InlineItemsBuilder::populateBreakingPositionCache(const InlineItemList& inlineItemList, const Document& document)
+void InlineItemsBuilder::populateBreakingPositionCache(const InlineItemList& inlineItemList, const Document& document, BreakingPositionCacheMode mode)
 {
+    if (snapBreakingPositionCacheCountersEnabled())
+        snapNoteBreakingPositionCachePopulation(mode);
+    if (mode == BreakingPositionCacheMode::SkipInsideBulkTeardown)
+        return;
+    bool snapRecordOnly = mode == BreakingPositionCacheMode::RecordSkippedInsideBulkTeardown;
+    bool snapTagEntries = snapRecordOnly || mode == BreakingPositionCacheMode::PopulateInsideBulkTeardown;
     if (inlineItemList.size() < TextBreakingPositionCache::minimumRequiredContentBreaks)
         return;
 
@@ -1234,7 +1336,8 @@ void InlineItemsBuilder::populateBreakingPositionCache(const InlineItemList& inl
         }
 
         TextBreakingPositionContext context { inlineTextBox->style() };
-        if (breakingPositionCache.get({ inlineTextBox->content(), context, securityOrigin->data() })) {
+        TextBreakingPositionCache::Key cacheKey { inlineTextBox->content(), context, securityOrigin->data() };
+        if (breakingPositionCache.get(cacheKey)) {
             // Cache is already populated.
             index += span.size();
             continue;
@@ -1255,8 +1358,14 @@ void InlineItemsBuilder::populateBreakingPositionCache(const InlineItemList& inl
         }
 
         ASSERT(!breakingPositionList.isEmpty());
-        if (breakingPositionList.size() >= TextBreakingPositionCache::minimumRequiredContentBreaks)
-            breakingPositionCache.set({ inlineTextBox->content(), context, securityOrigin->data() }, WTF::move(breakingPositionList));
+        if (breakingPositionList.size() >= TextBreakingPositionCache::minimumRequiredContentBreaks) {
+            if (snapTagEntries)
+                snapTagTeardownBreakingPositionEntry(cacheKey);
+            else if (snapBreakingPositionCacheCountersEnabled())
+                snapForgetTeardownBreakingPositionEntry(cacheKey);
+            if (!snapRecordOnly)
+                breakingPositionCache.set(cacheKey, WTF::move(breakingPositionList));
+        }
         index += span.size();
     }
 }

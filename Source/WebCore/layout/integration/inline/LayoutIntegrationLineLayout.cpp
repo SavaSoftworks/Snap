@@ -25,6 +25,8 @@
 
 #include "config.h"
 #include "LayoutIntegrationLineLayout.h"
+#include <cstdlib>
+#include <cstring>
 
 #include "BlockFormattingState.h"
 #include "BlockLayoutState.h"
@@ -36,8 +38,8 @@
 #include "HitTestRequest.h"
 #include "HitTestResult.h"
 #include "InlineContentCache.h"
-#include "InlineDisplayBoxInlines.h"
 #include "InlineDamage.h"
+#include "InlineDisplayBoxInlines.h"
 #include "InlineFormattingContext.h"
 #include "InlineInvalidation.h"
 #include "InlineItemsBuilder.h"
@@ -63,6 +65,7 @@
 #include "RenderLayoutState.h"
 #include "RenderLineBreak.h"
 #include "RenderObjectInlines.h"
+#include "RenderTreeUpdater.h"
 #include "RenderView.h"
 #include "SVGTextFragment.h"
 #include "Settings.h"
@@ -207,6 +210,35 @@ LineLayout::LineLayout(RenderBlockFlow& flow)
 {
 }
 
+static bool snapTeardownBreakCacheSkipEnabled()
+{
+    static bool enabled = [] {
+        const char* value = std::getenv("WEBKIT_SNAP_DISABLE_TEARDOWN_BREAK_CACHE_SKIP");
+        return !value || std::strcmp(value, "1");
+    }();
+    return enabled;
+}
+
+static bool snapLineLayoutCountersEnabled()
+{
+    static bool enabled = [] {
+        const char* value = std::getenv("WEBKIT_SNAP_PATCH_COUNTERS");
+        return value && !std::strcmp(value, "1");
+    }();
+    return enabled;
+}
+
+static Layout::InlineItemsBuilder::BreakingPositionCacheMode snapBreakingPositionCacheMode()
+{
+    using Mode = Layout::InlineItemsBuilder::BreakingPositionCacheMode;
+    if (!RenderTreeBulkTeardownScope::isInProgress())
+        return Mode::Populate;
+    bool shouldSkip = snapTeardownBreakCacheSkipEnabled();
+    if (!shouldSkip)
+        return snapLineLayoutCountersEnabled() ? Mode::PopulateInsideBulkTeardown : Mode::Populate;
+    return snapLineLayoutCountersEnabled() ? Mode::RecordSkippedInsideBulkTeardown : Mode::SkipInsideBulkTeardown;
+}
+
 LineLayout::~LineLayout()
 {
     CheckedRef rootRenderer = flow();
@@ -217,7 +249,7 @@ LineLayout::~LineLayout()
         return !m_inlineContentCache.inlineItems().isPopulatedFromCache();
     };
     if (shouldPopulateBreakingPositionCache())
-        Layout::InlineItemsBuilder::populateBreakingPositionCache(m_inlineContentCache.inlineItems().content(), protect(rootRenderer->document()));
+        Layout::InlineItemsBuilder::populateBreakingPositionCache(m_inlineContentCache.inlineItems().content(), protect(rootRenderer->document()), snapBreakingPositionCacheMode());
 
     auto prepareAndDetachInlineContent = [&] {
         if (!m_inlineContent)

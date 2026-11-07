@@ -47,7 +47,11 @@ public:
     InlineItemsBuilder(InlineContentCache&, const ElementBox& root, const SecurityOrigin&);
     void build(InlineItemPosition startPosition);
 
-    static void populateBreakingPositionCache(const InlineItemList&, const Document&);
+    enum class BreakingPositionCacheMode : uint8_t { Populate,
+        PopulateInsideBulkTeardown,
+        SkipInsideBulkTeardown,
+        RecordSkippedInsideBulkTeardown };
+    static void populateBreakingPositionCache(const InlineItemList&, const Document&, BreakingPositionCacheMode = BreakingPositionCacheMode::Populate);
 
 private:
     void collectInlineItems(InlineItemList&, InlineItemPosition startPosition);
