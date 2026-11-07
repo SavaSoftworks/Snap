@@ -82,6 +82,7 @@
 #include <WebCore/FloatPoint.h>
 #include <WebCore/FloatSize.h>
 #include <WebCore/JSDOMExceptionHandling.h>
+#include <WebCore/ResourceRequest.h>
 #include <WebCore/RunJavaScriptParameters.h>
 #include <WebCore/SharedBuffer.h>
 #include <WebCore/URLSoup.h>
@@ -6146,3 +6147,16 @@ WebKitImageList* webkit_web_view_get_page_icons(WebKitWebView* webView)
     return webView->priv->pageIcons.get();
 }
 #endif
+
+void webkit_web_view_preconnect_to_uri(WebKitWebView* view, const gchar* uri)
+{
+    g_return_if_fail(WEBKIT_IS_WEB_VIEW(view));
+    g_return_if_fail(uri);
+    URL url({}, String::fromUTF8(uri));
+    if (!url.isValid() || !url.protocolIs("https"_s) || url.host().isEmpty() || !url.user().isEmpty() || !url.password().isEmpty()) {
+        return;
+    }
+    url.setPath("/"_s);
+    url.removeQueryAndFragmentIdentifier();
+    getPage(view).preconnectTo(WebCore::ResourceRequest { WTF::move(url) });
+}

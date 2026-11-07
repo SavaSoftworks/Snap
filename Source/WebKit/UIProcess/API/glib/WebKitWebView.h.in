@@ -1143,6 +1143,9 @@ webkit_web_view_leave_immersive_mode                 (WebKitWebView             
 #endif // USE(GTK4)
 #endif // PLATFORM(GTK)
 
+WEBKIT_API void
+webkit_web_view_preconnect_to_uri(WebKitWebView*, const gchar*);
+
 G_END_DECLS
 
 #endif
