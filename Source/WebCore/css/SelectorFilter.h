@@ -70,11 +70,13 @@ private:
     static void collectSelectorHashes(CollectedSelectorHashes&, const CSSSelector& rightmostSelector, IncludeRightmost);
     static Hashes chooseSelectorHashesForFilter(const CollectedSelectorHashes&);
 
+    static constexpr size_t parentFrameInlineHashCapacity = 10;
+
     struct ParentStackFrame {
         ParentStackFrame() : element(0) { }
         ParentStackFrame(Element* element) : element(element) { }
         Element* element;
-        Vector<unsigned, 4> identifierHashes;
+        Vector<unsigned, parentFrameInlineHashCapacity> identifierHashes;
     };
     Vector<ParentStackFrame, 20> m_parentStack;
 

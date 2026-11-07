@@ -46,7 +46,8 @@ static bool NODELETE isExcludedAttribute(const AtomString& name)
     return name == HTMLNames::classAttr->localName() || name == HTMLNames::idAttr->localName() || name == HTMLNames::styleAttr->localName();
 }
 
-void SelectorFilter::collectElementIdentifierHashes(const Element& element, Vector<unsigned, 4>& identifierHashes)
+template<size_t inlineCapacity>
+static void collectIdentifierHashesInto(const Element& element, Vector<unsigned, inlineCapacity>& identifierHashes)
 {
     identifierHashes.append(element.localNameLowercase().impl()->existingHash() * TagNameSalt);
 
@@ -68,6 +69,11 @@ void SelectorFilter::collectElementIdentifierHashes(const Element& element, Vect
             identifierHashes.append(attributeName.impl()->existingHash() * AttributeSalt);
         }
     }
+}
+
+void SelectorFilter::collectElementIdentifierHashes(const Element& element, Vector<unsigned, 4>& identifierHashes)
+{
+    collectIdentifierHashesInto(element, identifierHashes);
 }
 
 bool SelectorFilter::parentStackIsConsistent(const ContainerNode* parentNode) const
@@ -96,7 +102,7 @@ void SelectorFilter::pushParent(Element* parent)
     ParentStackFrame& parentFrame = m_parentStack.last();
     // Mix tags, class names and ids into some sort of weird bouillabaisse.
     // The filter is used for fast rejection of child and descendant selectors.
-    collectElementIdentifierHashes(*parent, parentFrame.identifierHashes);
+    collectIdentifierHashesInto(*parent, parentFrame.identifierHashes);
     size_t count = parentFrame.identifierHashes.size();
     for (size_t i = 0; i < count; ++i)
         m_ancestorIdentifierFilter.add(parentFrame.identifierHashes[i]);

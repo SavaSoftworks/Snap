@@ -1125,6 +1125,7 @@ set(WebCore_PRIVATE_FRAMEWORK_HEADERS
     css/MediaQueryParserContext.h
     css/MutableStyleProperties.h
     css/PropertySetCSSDescriptors.h
+    css/SelectorFilter.h
     css/ShorthandSerializer.h
     css/StyleProperties.h
     css/StylePropertiesInlines.h

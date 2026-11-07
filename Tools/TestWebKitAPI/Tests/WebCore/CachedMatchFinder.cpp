@@ -28,13 +28,19 @@
 #include "SnapRemovalAggregateFixture.h"
 #include "TestPageHarness.h"
 #include <WebCore/AsyncNodeDeletionQueueInlines.h>
+#include <WebCore/CSSParserContext.h>
+#include <WebCore/CSSSelectorList.h>
 #include <WebCore/ContainerNodeInlines.h>
 #include <WebCore/GarbageCollectionController.h>
 #include <WebCore/HTMLBodyElement.h>
 #include <WebCore/HTMLNames.h>
 #include <WebCore/HTMLOListElement.h>
 #include <WebCore/RenderListItem.h>
+#include <WebCore/SelectorFilter.h>
 #include <WebCore/ShadowRootInit.h>
+#include <WebCore/StyleRule.h>
+#include <WebCore/StyleSheetContents.h>
+#include <wtf/text/StringBuilder.h>
 
 #include <WebCore/CSSPropertyNames.h>
 #include <WebCore/CSSValueKeywords.h>
@@ -268,6 +274,248 @@ TEST(RemovalAggregate, SmallShadowTreeKeepsDeferredDeletionChoice)
     EXPECT_EQ(tree.elements.size(), destructionCount);
 }
 #endif
+
+static String snapSelectorFilterFixture()
+{
+    StringBuilder builder;
+    builder.append(
+        "<div id='root' class='outer' data-Mixed='x'>"
+        "<section id='wide' class='c0 c1 c2 c3 c4 c5 c6 c7 c8 c9 c10 c11' data-one='1' data-two='2' title='wide'>"_s);
+    for (unsigned depth = 0; depth < 30; ++depth) {
+        builder.append("<div id='deep"_s, depth, "' class='level"_s, depth % 3, "' data-depth='"_s, depth, "'>"_s);
+    }
+    builder.append("<span id='leaf'></span>"_s);
+    for (unsigned depth = 0; depth < 30; ++depth) {
+        builder.append("</div>"_s);
+    }
+    builder.append(
+        "</section>"
+        "<div id='dup' class='same'><div id='dup-child' class='same'><span id='dup-leaf'></span></div></div>"
+        "<svg id='vector' viewBox='0 0 10 10' preserveAspectRatio='none'>"
+        "<g id='group' class='shape'><rect id='shape' width='4' height='4'></rect></g></svg></div>"_s);
+    return builder.toString();
+}
+
+static Vector<unsigned> snapElementIdentifierHashes(const Element& element)
+{
+    Vector<unsigned, 4> collected;
+    SelectorFilter::collectElementIdentifierHashes(element, collected);
+    Vector<unsigned> hashes;
+    hashes.appendVector(collected);
+    return hashes;
+}
+
+static Vector<Ref<Element>> snapAncestorChain(Element& element)
+{
+    Vector<Ref<Element>> chain;
+    for (RefPtr ancestor = &element; ancestor; ancestor = ancestor->parentElement()) {
+        chain.insert(0, *ancestor);
+    }
+    return chain;
+}
+
+static bool snapFilterMayContain(const SelectorFilter& filter, unsigned hash)
+{
+    return !filter.fastRejectSelector(SelectorFilter::Hashes { hash, 0, 0, 0 });
+}
+
+static SelectorFilter::Hashes snapSelectorHashes(Document& document, const String& selector)
+{
+    auto sheet = StyleSheetContents::create(CSSParserContext { document });
+    EXPECT_TRUE(sheet->parseString(makeString(selector, " { color: green; }"_s)));
+    EXPECT_EQ(1u, sheet->ruleCount());
+    RefPtr rule = sheet->ruleCount() ? dynamicDowncast<StyleRule>(sheet->ruleAt(0)) : nullptr;
+    EXPECT_TRUE(rule);
+    if (!rule) {
+        return {};
+    }
+    return SelectorFilter::collectHashes(rule->selectorList().first());
+}
+
+static Vector<unsigned> snapSelectorFilterProbeHashes(TestPageHarness& testPage)
+{
+    Vector<unsigned> probes;
+    for (auto& identifier : { "root"_s, "wide"_s, "dup"_s, "dup-child"_s, "vector"_s, "group"_s, "shape"_s }) {
+        RefPtr element = testPage.getElementById(identifier);
+        EXPECT_TRUE(element);
+        if (element) {
+            probes.appendVector(snapElementIdentifierHashes(*element));
+        }
+    }
+    for (unsigned depth = 0; depth < 30; ++depth) {
+        RefPtr element = testPage.getElementById(makeString("deep"_s, depth));
+        EXPECT_TRUE(element);
+        if (element) {
+            probes.appendVector(snapElementIdentifierHashes(*element));
+        }
+    }
+    for (unsigned value = 1; value <= 64; ++value) {
+        probes.append(value * 2654435761u);
+    }
+    return probes;
+}
+
+TEST(SelectorFilterStorage, ElementHashOrderMatchesSelectorHashes)
+{
+    auto testPage = TestPageHarness::create();
+    testPage.loadHTML(snapSelectorFilterFixture());
+    RefPtr wide = testPage.getElementById("wide"_s);
+    ASSERT_TRUE(wide);
+    auto& document = testPage.document();
+
+    auto hashes = snapElementIdentifierHashes(*wide);
+    ASSERT_EQ(17u, hashes.size());
+    EXPECT_EQ(snapSelectorHashes(document, "section *"_s)[0], hashes[0]);
+    EXPECT_EQ(snapSelectorHashes(document, "#wide *"_s)[0], hashes[1]);
+    for (unsigned index = 0; index < 12; ++index) {
+        EXPECT_EQ(snapSelectorHashes(document, makeString(".c"_s, index, " *"_s))[0], hashes[2 + index]);
+    }
+    EXPECT_EQ(snapSelectorHashes(document, "[data-one] *"_s)[0], hashes[14]);
+    EXPECT_EQ(snapSelectorHashes(document, "[data-two] *"_s)[0], hashes[15]);
+    EXPECT_EQ(snapSelectorHashes(document, "[title] *"_s)[0], hashes[16]);
+}
+
+TEST(SelectorFilterStorage, OverflowingParentFrameKeepsEveryHash)
+{
+    auto testPage = TestPageHarness::create();
+    testPage.loadHTML(snapSelectorFilterFixture());
+    RefPtr wide = testPage.getElementById("wide"_s);
+    ASSERT_TRUE(wide);
+    auto& document = testPage.document();
+    auto wideHashes = snapElementIdentifierHashes(*wide);
+    EXPECT_GT(wideHashes.size(), 10u);
+
+    SelectorFilter filter;
+    filter.pushParentInitializingIfNeeded(*wide);
+    EXPECT_TRUE(filter.parentStackIsConsistent(wide.get()));
+    Vector<unsigned> ancestorHashes;
+    for (auto& ancestor : snapAncestorChain(*wide)) {
+        ancestorHashes.appendVector(snapElementIdentifierHashes(ancestor));
+    }
+    for (auto hash : ancestorHashes) {
+        EXPECT_TRUE(snapFilterMayContain(filter, hash));
+    }
+    EXPECT_FALSE(filter.fastRejectSelector(snapSelectorHashes(document, "section.c11[data-two] span"_s)));
+    EXPECT_FALSE(filter.fastRejectSelector(snapSelectorHashes(document, "#wide.c0.c10[TITLE] > div"_s)));
+    EXPECT_FALSE(filter.fastRejectSelector(snapSelectorHashes(document, ".c9.c10.c11[data-one] div"_s)));
+
+    filter.popParentsUntil(nullptr);
+    EXPECT_TRUE(filter.parentStackIsEmpty());
+    for (auto hash : ancestorHashes) {
+        EXPECT_FALSE(snapFilterMayContain(filter, hash));
+    }
+    EXPECT_TRUE(filter.fastRejectSelector(snapSelectorHashes(document, "section.c11[data-two] span"_s)));
+}
+
+TEST(SelectorFilterStorage, DeepParentStackMatchesFreshFiltersAfterPops)
+{
+    auto testPage = TestPageHarness::create();
+    testPage.loadHTML(snapSelectorFilterFixture());
+    auto& document = testPage.document();
+    RefPtr deepest = testPage.getElementById("deep29"_s);
+    RefPtr middle = testPage.getElementById("deep9"_s);
+    ASSERT_TRUE(deepest);
+    ASSERT_TRUE(middle);
+    auto chain = snapAncestorChain(*deepest);
+    ASSERT_GT(chain.size(), 20u);
+    auto probes = snapSelectorFilterProbeHashes(testPage);
+
+    SelectorFilter incremental;
+    incremental.pushParentInitializingIfNeeded(chain[0]);
+    for (size_t index = 1; index < chain.size(); ++index) {
+        incremental.pushParent(chain[index].ptr());
+    }
+    EXPECT_TRUE(incremental.parentStackIsConsistent(deepest.get()));
+    SelectorFilter initialized;
+    initialized.pushParentInitializingIfNeeded(*deepest);
+    EXPECT_TRUE(initialized.parentStackIsConsistent(deepest.get()));
+    for (auto hash : probes) {
+        EXPECT_EQ(snapFilterMayContain(initialized, hash), snapFilterMayContain(incremental, hash));
+    }
+    for (auto& ancestor : chain) {
+        for (auto hash : snapElementIdentifierHashes(ancestor)) {
+            EXPECT_TRUE(snapFilterMayContain(incremental, hash));
+        }
+    }
+    EXPECT_FALSE(incremental.fastRejectSelector(snapSelectorHashes(document, "#deep0 .level2[data-depth] span"_s)));
+    EXPECT_FALSE(incremental.fastRejectSelector(snapSelectorHashes(document, "#deep29.level2 > span"_s)));
+
+    incremental.popParentsUntil(middle.get());
+    EXPECT_TRUE(incremental.parentStackIsConsistent(middle.get()));
+    SelectorFilter fresh;
+    fresh.pushParentInitializingIfNeeded(*middle);
+    for (auto hash : probes) {
+        EXPECT_EQ(snapFilterMayContain(fresh, hash), snapFilterMayContain(incremental, hash));
+    }
+    EXPECT_FALSE(incremental.fastRejectSelector(snapSelectorHashes(document, "#deep9.level0 span"_s)));
+
+    incremental.popParentsUntil(nullptr);
+    initialized.popParentsUntil(nullptr);
+    EXPECT_TRUE(incremental.parentStackIsEmpty());
+    EXPECT_TRUE(initialized.parentStackIsEmpty());
+    for (auto hash : probes) {
+        EXPECT_FALSE(snapFilterMayContain(incremental, hash));
+        EXPECT_FALSE(snapFilterMayContain(initialized, hash));
+    }
+}
+
+TEST(SelectorFilterStorage, DuplicateAncestorHashesSurviveChildPop)
+{
+    auto testPage = TestPageHarness::create();
+    testPage.loadHTML(snapSelectorFilterFixture());
+    auto& document = testPage.document();
+    RefPtr duplicate = testPage.getElementById("dup"_s);
+    RefPtr duplicateChild = testPage.getElementById("dup-child"_s);
+    ASSERT_TRUE(duplicate);
+    ASSERT_TRUE(duplicateChild);
+    auto sameClass = snapSelectorHashes(document, ".same *"_s)[0];
+    auto divTag = snapSelectorHashes(document, "div *"_s)[0];
+    auto probes = snapSelectorFilterProbeHashes(testPage);
+
+    SelectorFilter filter;
+    filter.pushParentInitializingIfNeeded(*duplicate);
+    filter.pushParent(duplicateChild.get());
+    EXPECT_TRUE(snapFilterMayContain(filter, sameClass));
+    EXPECT_TRUE(snapFilterMayContain(filter, divTag));
+    filter.popParent();
+    EXPECT_TRUE(filter.parentStackIsConsistent(duplicate.get()));
+    EXPECT_TRUE(snapFilterMayContain(filter, sameClass));
+    EXPECT_TRUE(snapFilterMayContain(filter, divTag));
+    EXPECT_FALSE(filter.fastRejectSelector(snapSelectorHashes(document, "#dup.same span"_s)));
+
+    SelectorFilter fresh;
+    fresh.pushParentInitializingIfNeeded(*duplicate);
+    for (auto hash : probes) {
+        EXPECT_EQ(snapFilterMayContain(fresh, hash), snapFilterMayContain(filter, hash));
+    }
+}
+
+TEST(SelectorFilterStorage, SvgAndHtmlAttributeCasingMatchesSelectors)
+{
+    auto testPage = TestPageHarness::create();
+    testPage.loadHTML(snapSelectorFilterFixture());
+    auto& document = testPage.document();
+    RefPtr vector = testPage.getElementById("vector"_s);
+    RefPtr group = testPage.getElementById("group"_s);
+    RefPtr root = testPage.getElementById("root"_s);
+    ASSERT_TRUE(vector);
+    ASSERT_TRUE(group);
+    ASSERT_TRUE(root);
+
+    auto viewBox = snapSelectorHashes(document, "[viewBox] *"_s)[0];
+    EXPECT_EQ(viewBox, snapSelectorHashes(document, "[viewbox] *"_s)[0]);
+    EXPECT_TRUE(snapElementIdentifierHashes(*vector).contains(viewBox));
+    auto mixed = snapSelectorHashes(document, "[DATA-MIXED] *"_s)[0];
+    EXPECT_TRUE(snapElementIdentifierHashes(*root).contains(mixed));
+
+    SelectorFilter filter;
+    filter.pushParentInitializingIfNeeded(*group);
+    EXPECT_FALSE(filter.fastRejectSelector(snapSelectorHashes(document, "svg[viewBox] rect"_s)));
+    EXPECT_FALSE(filter.fastRejectSelector(snapSelectorHashes(document, "svg[viewbox][preserveAspectRatio] g.shape > rect"_s)));
+    EXPECT_FALSE(filter.fastRejectSelector(snapSelectorHashes(document, "div.outer[data-mixed] rect"_s)));
+    filter.popParentsUntil(nullptr);
+    EXPECT_TRUE(filter.fastRejectSelector(snapSelectorHashes(document, "svg[viewBox] rect"_s)));
+}
 
 TEST(CachedMatchFinder, CountMatchesFindsMatches)
 {
