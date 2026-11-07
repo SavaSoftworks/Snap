@@ -41,6 +41,9 @@ namespace WebCore {
 
 void teardownGStreamerCaptureDeviceManagers();
 
+class GStreamerDeviceMonitorStartup;
+struct StartedGStreamerDeviceMonitor;
+
 class GStreamerCaptureDeviceManager : public CaptureDeviceManager, public RealtimeMediaSourceCenterObserver {
     WTF_MAKE_NONCOPYABLE(GStreamerCaptureDeviceManager)
 public:
@@ -50,6 +53,7 @@ public:
 
     const Vector<CaptureDevice>& speakerDevices();
     const Vector<CaptureDevice>& captureDevices() final;
+    void computeCaptureDevices(CompletionHandler<void()>&&) override;
     virtual const OptionSet<CaptureDevice::DeviceType> deviceTypes() const = 0;
 
     // RealtimeMediaSourceCenterObserver interface.
@@ -72,6 +76,9 @@ private:
     void updateDevice(GRefPtr<GstDevice>&& newDevice, GRefPtr<GstDevice>&& oldDevice);
     void stopMonitor();
     void refreshCaptureDevices();
+    void startMonitorAsynchronously();
+    void finishMonitorStartup(GStreamerDeviceMonitorStartup&);
+    void adoptDeviceMonitor(StartedGStreamerDeviceMonitor&&);
 
     std::optional<GStreamerCaptureDevice> captureDeviceFromGstDevice(GRefPtr<GstDevice>&&);
 
@@ -81,6 +88,8 @@ private:
     bool m_isTearingDown { false };
     Vector<CaptureDevice> m_speakerDevices;
     RefPtr<GStreamerCapturer> m_defaultCapturer;
+    RefPtr<GStreamerDeviceMonitorStartup> m_monitorStartup;
+    Vector<CompletionHandler<void()>> m_pendingComputeCallbacks;
 };
 
 class GStreamerAudioCaptureDeviceManager final : public GStreamerCaptureDeviceManager {

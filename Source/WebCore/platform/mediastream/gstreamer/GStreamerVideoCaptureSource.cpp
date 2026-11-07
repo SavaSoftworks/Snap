@@ -69,7 +69,13 @@ GStreamerVideoCaptureDeviceManager::GStreamerVideoCaptureDeviceManager()
 void GStreamerVideoCaptureDeviceManager::computeCaptureDevices(CompletionHandler<void()>&& callback)
 {
     m_devices.clear();
-    m_pipewireCaptureDeviceManager->computeCaptureDevices(WTF::move(callback));
+    m_pipewireCaptureDeviceManager->computeCaptureDevices([this, callback = WTF::move(callback)]() mutable {
+        if (!m_devices.isEmpty()) {
+            callback();
+            return;
+        }
+        GStreamerCaptureDeviceManager::computeCaptureDevices(WTF::move(callback));
+    });
 }
 
 CaptureSourceOrError GStreamerVideoCaptureDeviceManager::createVideoCaptureSource(const CaptureDevice& device, MediaDeviceHashSalts&& hashSalts, const MediaConstraints* constraints)

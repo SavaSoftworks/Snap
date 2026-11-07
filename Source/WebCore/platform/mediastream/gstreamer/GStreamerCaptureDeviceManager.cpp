@@ -26,6 +26,13 @@
 
 #include "GStreamerCommon.h"
 #include "GStreamerMockDeviceProvider.h"
+#include "MockRealtimeMediaSourceCenter.h"
+#include <wtf/Condition.h>
+#include <wtf/Lock.h>
+#include <wtf/MainThread.h>
+#include <wtf/NeverDestroyed.h>
+#include <wtf/ThreadSafeRefCounted.h>
+#include <wtf/WorkQueue.h>
 #include <wtf/glib/GMallocString.h>
 #include <wtf/glib/GSpanExtras.h>
 #include <wtf/glib/GUniquePtr.h>
@@ -56,6 +63,88 @@ static gint sortDevices(gconstpointer a, gconstpointer b)
     }
 
     return aIsDefault > bIsDefault ? -1 : 1;
+}
+
+struct StartedGStreamerDeviceMonitor {
+    GRefPtr<GstDeviceMonitor> monitor;
+    Vector<GRefPtr<GstDevice>> devices;
+};
+
+class GStreamerDeviceMonitorStartup final : public ThreadSafeRefCounted<GStreamerDeviceMonitorStartup> {
+public:
+    static Ref<GStreamerDeviceMonitorStartup> create() { return adoptRef(*new GStreamerDeviceMonitorStartup); }
+
+    void finish(StartedGStreamerDeviceMonitor&& started)
+    {
+        Locker locker { m_lock };
+        m_started = WTF::move(started);
+        m_finished = true;
+        m_condition.notifyAll();
+    }
+
+    std::optional<StartedGStreamerDeviceMonitor> take(bool waitForStartup)
+    {
+        Locker locker { m_lock };
+        while (waitForStartup && !m_finished)
+            m_condition.wait(m_lock);
+        return std::exchange(m_started, std::nullopt);
+    }
+
+private:
+    GStreamerDeviceMonitorStartup() = default;
+
+    Lock m_lock;
+    Condition m_condition;
+    bool m_finished WTF_GUARDED_BY_LOCK(m_lock) { false };
+    std::optional<StartedGStreamerDeviceMonitor> m_started WTF_GUARDED_BY_LOCK(m_lock);
+};
+
+static WorkQueue& deviceMonitorQueue()
+{
+    static NeverDestroyed<Ref<WorkQueue>> queue(WorkQueue::create("GStreamer device monitor"_s));
+    return queue.get();
+}
+
+static StartedGStreamerDeviceMonitor startDeviceMonitorAndCollectDevices(OptionSet<CaptureDevice::DeviceType> types)
+{
+    StartedGStreamerDeviceMonitor started;
+    GRefPtr monitor = adoptGRef(gst_device_monitor_new());
+    if (types.contains(CaptureDevice::DeviceType::Camera))
+        gst_device_monitor_add_filter(monitor.get(), "Video/Source", nullptr);
+    if (types.contains(CaptureDevice::DeviceType::Microphone)) {
+        GRefPtr caps = adoptGRef(gst_caps_new_empty_simple("audio/x-raw"));
+        gst_device_monitor_add_filter(monitor.get(), "Audio/Source", caps.get());
+    }
+    if (types.contains(CaptureDevice::DeviceType::Speaker) || types.contains(CaptureDevice::DeviceType::SystemAudio)) {
+        GRefPtr caps = adoptGRef(gst_caps_new_empty_simple("audio/x-raw"));
+        gst_device_monitor_add_filter(monitor.get(), "Audio/Sink", caps.get());
+    }
+
+    if (!gst_device_monitor_start(monitor.get())) {
+        GST_WARNING_OBJECT(monitor.get(), "Could not start device monitor");
+        return started;
+    }
+
+    GRefPtr bus = adoptGRef(gst_device_monitor_get_bus(monitor.get()));
+#if GST_CHECK_VERSION(1, 28, 0)
+    static constexpr GstClockTime maximumProviderStartup = 5 * GST_SECOND;
+    if (GRefPtr message = adoptGRef(gst_bus_timed_pop_filtered(bus.get(), maximumProviderStartup, GST_MESSAGE_DEVICE_MONITOR_STARTED)))
+        GST_DEBUG_OBJECT(monitor.get(), "Device provider(s) successfully started");
+    else
+        GST_WARNING_OBJECT(monitor.get(), "Device provider(s) did not report startup in time, using the devices found so far");
+#endif
+
+    GList* devices = g_list_sort(gst_device_monitor_get_devices(monitor.get()), sortDevices);
+    while (devices) {
+        started.devices.append(adoptGRef(GST_DEVICE_CAST(devices->data)));
+        devices = g_list_delete_link(devices, devices);
+    }
+
+    gst_bus_set_flushing(bus.get(), TRUE);
+    gst_bus_set_flushing(bus.get(), FALSE);
+
+    started.monitor = WTF::move(monitor);
+    return started;
 }
 
 GStreamerAudioCaptureDeviceManager& GStreamerAudioCaptureDeviceManager::singleton()
@@ -118,6 +207,7 @@ void GStreamerCaptureDeviceManager::teardown()
 
 void GStreamerCaptureDeviceManager::stopMonitor()
 {
+    m_monitorStartup = nullptr;
     if (!m_deviceMonitor)
         return;
 
@@ -133,6 +223,7 @@ void GStreamerCaptureDeviceManager::devicesChanged()
     stopMonitor();
     m_gstreamerDevices.clear();
     m_devices.clear();
+    m_speakerDevices.clear();
 }
 
 void GStreamerCaptureDeviceManager::deviceWillBeRemoved(const String& persistentId)
@@ -309,45 +400,70 @@ void GStreamerCaptureDeviceManager::updateDevice(GRefPtr<GstDevice>&& gstDevice,
     addDevice(WTF::move(gstDevice));
 }
 
+void GStreamerCaptureDeviceManager::computeCaptureDevices(CompletionHandler<void()>&& callback)
+{
+    if (m_deviceMonitor || m_isTearingDown || MockRealtimeMediaSourceCenter::mockRealtimeMediaSourceCenterEnabled()) {
+        callback();
+        return;
+    }
+
+    m_pendingComputeCallbacks.append(WTF::move(callback));
+    if (!m_monitorStartup)
+        startMonitorAsynchronously();
+}
+
+void GStreamerCaptureDeviceManager::startMonitorAsynchronously()
+{
+    Ref startup = GStreamerDeviceMonitorStartup::create();
+    m_monitorStartup = startup.copyRef();
+    deviceMonitorQueue().dispatch([this, startup = WTF::move(startup), types = deviceTypes()]() mutable {
+        startup->finish(startDeviceMonitorAndCollectDevices(types));
+        callOnMainThread([this, startup = WTF::move(startup)]() mutable {
+            finishMonitorStartup(startup.get());
+        });
+    });
+}
+
+void GStreamerCaptureDeviceManager::finishMonitorStartup(GStreamerDeviceMonitorStartup& startup)
+{
+    auto started = startup.take(false);
+    if (&startup == m_monitorStartup.get()) {
+        m_monitorStartup = nullptr;
+        if (started)
+            adoptDeviceMonitor(WTF::move(*started));
+    } else {
+        if (started && started->monitor)
+            gst_device_monitor_stop(started->monitor.get());
+        if (m_monitorStartup)
+            return;
+        if (!m_deviceMonitor && !m_isTearingDown && !m_pendingComputeCallbacks.isEmpty()) {
+            startMonitorAsynchronously();
+            return;
+        }
+    }
+
+    for (auto& callback : std::exchange(m_pendingComputeCallbacks, {}))
+        callback();
+}
+
 void GStreamerCaptureDeviceManager::refreshCaptureDevices()
 {
     GST_DEBUG_OBJECT(m_deviceMonitor.get(), "Refreshing capture devices");
     m_devices.clear();
     m_gstreamerDevices.clear();
+    m_speakerDevices.clear();
     if (m_isTearingDown)
         return;
 
-    bool monitorBus = false;
     if (!m_deviceMonitor) {
-        m_deviceMonitor = adoptGRef(gst_device_monitor_new());
-
-        auto types = deviceTypes();
-        if (types.contains(CaptureDevice::DeviceType::Camera))
-            gst_device_monitor_add_filter(m_deviceMonitor.get(), "Video/Source", nullptr);
-        if (types.contains(CaptureDevice::DeviceType::Microphone)) {
-            GRefPtr caps = adoptGRef(gst_caps_new_empty_simple("audio/x-raw"));
-            gst_device_monitor_add_filter(m_deviceMonitor.get(), "Audio/Source", caps.get());
-        }
-        if (types.contains(CaptureDevice::DeviceType::Speaker) || types.contains(CaptureDevice::DeviceType::SystemAudio)) {
-            GRefPtr caps = adoptGRef(gst_caps_new_empty_simple("audio/x-raw"));
-            gst_device_monitor_add_filter(m_deviceMonitor.get(), "Audio/Sink", caps.get());
-        }
-
-        if (!gst_device_monitor_start(m_deviceMonitor.get())) {
-            GST_WARNING_OBJECT(m_deviceMonitor.get(), "Could not start device monitor");
-            m_deviceMonitor = nullptr;
-            return;
-        }
-
-#if GST_CHECK_VERSION(1, 28, 0)
-        {
-            GRefPtr bus = adoptGRef(gst_device_monitor_get_bus(m_deviceMonitor.get()));
-            [[maybe_unused]] GRefPtr message = adoptGRef(gst_bus_timed_pop_filtered(bus.get(), GST_CLOCK_TIME_NONE, GST_MESSAGE_DEVICE_MONITOR_STARTED));
-            GST_DEBUG_OBJECT(m_deviceMonitor.get(), "Device provider(s) successfully started");
-        }
-#endif
-
-        monitorBus = true;
+        std::optional<StartedGStreamerDeviceMonitor> started;
+        if (RefPtr startup = std::exchange(m_monitorStartup, nullptr))
+            started = startup->take(true);
+        else
+            started = startDeviceMonitorAndCollectDevices(deviceTypes());
+        if (started)
+            adoptDeviceMonitor(WTF::move(*started));
+        return;
     }
 
     GList* devices = g_list_sort(gst_device_monitor_get_devices(m_deviceMonitor.get()), sortDevices);
@@ -355,15 +471,26 @@ void GStreamerCaptureDeviceManager::refreshCaptureDevices()
         addDevice(adoptGRef(GST_DEVICE_CAST(devices->data)));
         devices = g_list_delete_link(devices, devices);
     }
+}
 
-    if (!monitorBus)
+void GStreamerCaptureDeviceManager::adoptDeviceMonitor(StartedGStreamerDeviceMonitor&& started)
+{
+    if (!started.monitor)
         return;
 
-    GRefPtr bus = adoptGRef(gst_device_monitor_get_bus(m_deviceMonitor.get()));
+    if (m_isTearingDown) {
+        gst_device_monitor_stop(started.monitor.get());
+        return;
+    }
 
-    // Flush out device-added messages queued during initial probe of the device providers.
-    gst_bus_set_flushing(bus.get(), TRUE);
-    gst_bus_set_flushing(bus.get(), FALSE);
+    m_devices.clear();
+    m_gstreamerDevices.clear();
+    m_speakerDevices.clear();
+    m_deviceMonitor = WTF::move(started.monitor);
+    for (auto& device : started.devices)
+        addDevice(WTF::move(device));
+
+    GRefPtr bus = adoptGRef(gst_device_monitor_get_bus(m_deviceMonitor.get()));
 
     // Monitor the bus for future device messages.
     gst_bus_add_watch(bus.get(), reinterpret_cast<GstBusFunc>(+[](GstBus*, GstMessage* message, GStreamerCaptureDeviceManager* manager) -> gboolean {
