@@ -24,6 +24,8 @@
 
 #include "config.h"
 #include "JSGlobalObjectFunctions.h"
+#include <cstdlib>
+#include <cstring>
 
 #include "CallFrame.h"
 #include "GlobalObjectMethodTable.h"
@@ -898,6 +900,14 @@ JSC_DEFINE_HOST_FUNCTION(globalFuncCopyDataProperties, (JSGlobalObject* globalOb
 
     auto sourceStructure = source->structure();
     if (canPerformFastPropertyEnumerationForCopyDataProperties(sourceStructure)) [[likely]] {
+        static const bool cloneRest = [] {
+            const char* value = std::getenv("WEBKIT_SNAP_JSC_REST_CLONE");
+            return !value || std::strcmp(value, "0");
+        }();
+        if (cloneRest && (!excludedSet || excludedSet->isEmpty()) && objectCloneFast(vm, target, source)) {
+            return JSValue::encode(target);
+        }
+
         EnsureStillAliveScope sourceStructureScope(sourceStructure);
         Vector<UniquedStringImpl*, 8> properties; // sourceStructure ensures the lifetimes of these strings.
         MarkedArgumentBuffer values;
