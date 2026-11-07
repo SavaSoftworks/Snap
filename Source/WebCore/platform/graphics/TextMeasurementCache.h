@@ -27,6 +27,9 @@
 
 #include <WebCore/TextRun.h>
 #include <WebCore/TextSpacing.h>
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <wtf/Forward.h>
 #include <wtf/HashFunctions.h>
 #include <wtf/HashSet.h>
@@ -51,6 +54,15 @@ struct TextShapingContext {
 };
 
 namespace TextMeasurementCacheDefaults {
+inline bool snapLengthBoundedKeysEnabled()
+{
+    static const bool enabled = [] {
+        const char* value = std::getenv("WEBKIT_SNAP_TEXT_CACHE_KEYS");
+        return !value || std::strcmp(value, "0");
+    }();
+    return enabled;
+}
+
 static constexpr int minInterval = -3; // A cache hit pays for about 3 cache misses.
 static constexpr int maxInterval = 20; // Sampling at this interval has almost no overhead.
 static constexpr unsigned maxSize = 500000; // Just enough to guard against pathological growth.
@@ -97,7 +109,20 @@ private:
         // Empty and deleted values have lengths that are not equal to any valid length.
         static constexpr bool safeToCompareToHashTableEmptyOrDeletedValue = true;
 
-        friend bool operator==(const SmallStringKey&, const SmallStringKey&) = default;
+        friend bool operator==(const SmallStringKey& left, const SmallStringKey& right)
+        {
+            if constexpr (s_capacity > 255)
+                return left.m_characters == right.m_characters && left.m_hashAndLength == right.m_hashAndLength;
+            if (!TextMeasurementCacheDefaults::snapLengthBoundedKeysEnabled())
+                return left.m_characters == right.m_characters && left.m_hashAndLength == right.m_hashAndLength;
+            if (left.m_hashAndLength != right.m_hashAndLength)
+                return false;
+            bool result = std::ranges::equal(std::span { left.m_characters }.first(left.length()), std::span { right.m_characters }.first(right.length()));
+#ifdef WEBKIT_SNAP_VERIFY_PATCHES
+            RELEASE_ASSERT(result == (left.m_characters == right.m_characters));
+#endif
+            return result;
+        }
 
     private:
         static constexpr unsigned s_capacity = MaxTextLength;
